@@ -1,0 +1,11 @@
+# Name,   Type, SubType, Offset,  Size,   Flags
+# 8MB Flash layout for ESP32-S3-DevKitC-1 N8R8.
+# 0x83 is reserved for future LittleFS use; OTA partitions are kept for rollback.
+nvs,      data, nvs,     0x9000,  64K,
+otadata,  data, ota,     0x19000, 8K,
+phy_init, data, phy,     0x21000, 4K,
+ota_0,    app,  ota_0,   0x30000, 2304K,
+ota_1,    app,  ota_1,           , 2304K,
+assets,   data, 0x83,            , 1536K,
+cache,    data, 0x83,            , 704K,
+coredump, data, coredump,        , 64K,

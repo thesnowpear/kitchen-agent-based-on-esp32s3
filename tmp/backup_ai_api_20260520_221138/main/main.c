@@ -1,0 +1,72 @@
+// 冰箱小精灵主控启动入口。
+// 这里只做系统初始化编排：NVS、诊断、网络和 USB JSON 协议；具体 Wi-Fi/串口逻辑放在组件中维护。
+// 硬件注意：默认启用独立屏幕测试时会跳过 Wi-Fi/USB，只初始化屏幕 QSPI 测试 GPIO，降低首次接线风险。
+
+#include "esp_log.h"
+
+#if CONFIG_FRIDGE_SCREEN_TEST
+#include "fridge_display_test.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#else
+#include "esp_err.h"
+#include "nvs_flash.h"
+#include "fridge_diagnostics.h"
+#include "fridge_network.h"
+#include "fridge_usb_protocol.h"
+#endif
+
+static const char *TAG = "fridge_main";
+
+#if CONFIG_FRIDGE_SCREEN_TEST
+static void display_test_task(void *arg)
+{
+    (void)arg;
+    // 独立屏幕测试任务：长期循环刷测试图案，避免阻塞 ESP-IDF 的 main_task 导致系统看门狗复位。
+    fridge_display_test_run();
+}
+#endif
+
+#if !CONFIG_FRIDGE_SCREEN_TEST
+static void nvs_init_safe(void)
+{
+    // 初始化 NVS，用于保存 Wi-Fi SSID/密码。
+    // 注意：NVS 写入发生在 Flash 中，后续要避免高频写入；本项目只在用户更新配网时写入。
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+}
+#endif
+
+void app_main(void)
+{
+#if CONFIG_FRIDGE_SCREEN_TEST
+    // 独立屏幕测试模式：创建后台任务运行 QSPI 点亮和彩色图案，避免 Wi-Fi 发射峰值干扰首次硬件排查。
+    ESP_LOGW(TAG, "CONFIG_FRIDGE_SCREEN_TEST is enabled");
+    BaseType_t ok = xTaskCreate(display_test_task, "display_test", 8192, NULL, 5, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "create display_test task failed");
+    }
+#else
+    // 正常主控模式：初始化 NVS、诊断、Wi-Fi 和 USB 配网控制台。
+    // 注意：此路径会启动 Wi-Fi，真实硬件调试时需确认 5V/USB 供电足够稳定。
+    nvs_init_safe();
+    fridge_diagnostics_init();
+
+    ESP_ERROR_CHECK(fridge_network_init());
+    esp_err_t saved_ret = fridge_network_connect_saved();
+    if (saved_ret == ESP_OK) {
+        ESP_LOGI(TAG, "saved Wi-Fi connected");
+    } else if (saved_ret == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "no saved Wi-Fi credential, waiting for USB provisioning");
+    } else {
+        ESP_LOGW(TAG, "saved Wi-Fi connect failed: %s", esp_err_to_name(saved_ret));
+    }
+
+    ESP_ERROR_CHECK(fridge_usb_protocol_start());
+    ESP_LOGI(TAG, "USB provisioning console is ready");
+#endif
+}
