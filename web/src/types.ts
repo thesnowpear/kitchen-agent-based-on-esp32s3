@@ -43,6 +43,12 @@ export type DeviceCommand =
   | "select_ai_profile"
   | "delete_ai_profile"
   | "test_ai_chat"
+  | "ai_assistant_chat"
+  | "get_ai_context_preview"
+  | "test_ai_task"
+  | "get_memory_summary"
+  | "set_memory_summary"
+  | "clear_memory_summary"
   | "get_pins"
   | "get_sensors"
   | "get_diagnostics"
@@ -126,6 +132,66 @@ export interface AIChatResponse {
   latencyMs: number;
   status: string;
   httpStatus?: number;
+}
+
+export type ProjectAITaskType =
+  | "chat_assist"
+  | "recognize_ingredients"
+  | "inventory_parse"
+  | "recipe_generate"
+  | "shopping_list_generate"
+  | "reminder_explain"
+  | "voice_intent_parse";
+
+export interface ProjectAITaskRequest {
+  taskType: ProjectAITaskType;
+  userText: string;
+  includeInventory: boolean;
+  includeMemory: boolean;
+  includeReminders: boolean;
+  includePreferences: boolean;
+}
+
+export interface AIAssistantHistoryItem {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AIAssistantChatRequest extends ProjectAITaskRequest {
+  message: string;
+  history: AIAssistantHistoryItem[];
+}
+
+export interface AIAssistantChatResponse extends AIChatResponse {
+  taskType: ProjectAITaskType;
+  contextInjected: boolean;
+  localSnapshotVersion: number;
+  needsConfirmation: boolean;
+}
+
+export interface AIContextPreview {
+  taskType: ProjectAITaskType;
+  localSnapshotVersion: number;
+  needsConfirmation: boolean;
+  context: unknown;
+}
+
+export interface ProjectAITaskResponse {
+  taskType: ProjectAITaskType;
+  confidence: number;
+  needsConfirmation: boolean;
+  safetyNote: string;
+  result: unknown;
+}
+
+export interface MemorySummary {
+  schema_version?: number;
+  memory_policy?: string;
+  family_size?: number;
+  taste?: string[];
+  avoid?: string[];
+  allergies?: string[];
+  recent_summary?: string[];
 }
 
 export interface WifiNetwork {

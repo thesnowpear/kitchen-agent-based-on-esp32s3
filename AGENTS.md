@@ -1,6 +1,7 @@
 # AGENTS.md
 总提示：如果在开发一个新功能，允许先从github上找已经成熟的开源项目，把源码拉到项目example文件夹，以供参考。
 允许自动使用插件和skills
+已安装 `esp32-firmware-engineer` skill；在本项目中，凡是涉及 `ESP32`、`ESP-IDF`、`FreeRTOS`、外设驱动、分区表、OTA、串口日志、崩溃排查、LVGL 显示集成、构建/烧录/监视器工作流等任务，允许自动调用该 skill。
 
 ## 项目概览
 
@@ -97,8 +98,9 @@
 
 - ESP32-S3 是交互、状态与媒体采集中心，负责确定性、低延迟、本地可用的功能。
 - OV3660 摄像头直接接入主控，主控负责拍照、帧缓冲/JPEG 管理、上传任务和状态机联动。
-- 云端负责真实 AI 能力，包括图片识别、语义解析、菜谱生成和跨设备同步。
-- AI 服务通过云端 `AI Adapter` 封装，设备端不得直接保存第三方大模型 API Key。
+- 首版 AI 能力采用设备直连 OpenAI-compatible API：ESP32-S3 通过 HTTPS 直接访问用户配置的 API Base URL、模型和 API Key。
+- API Key 在开发/Demo 阶段允许保存在设备 NVS 中，串口响应和日志不得回显明文；后续如进入公开部署或量产，应评估 NVS 加密和设备端 Key 轮换。
+- 远程服务在首版中不是 AI 必需链路；如后续需要跨设备同步、远程库存管理、日志分析和 OTA 运维，应作为独立扩展，不改变 AI 直连主链路。
 - 库存、提醒和位置数据要支持本地缓存，断网时仍能展示基础信息。
 - 首版不新增 TF/SD 卡，主控不长期保存图片原图；离线时只缓存拍照任务状态、错误码和必要元数据，网络恢复后重试上传或提示用户重新拍照。
 - 人体存在毫米波雷达只作为靠近/有人上下文，不得单独作为开门判断依据；开门判断仍以光照突变和 IMU 姿态变化为主。
@@ -158,7 +160,7 @@ static esp_err_t display_bus_init(void)
 
 ```c
 // 开门状态机：融合光照突变、IMU 姿态变化和毫米波雷达靠近事件。
-// 该路径必须本地快速完成，不能等待云端 AI，避免用户开门时 UI 卡顿。
+// 该路径必须本地快速完成，不能等待 AI API，避免用户开门时 UI 卡顿。
 static void fridge_state_update(const sensor_event_t *event)
 {
     ...
@@ -202,9 +204,9 @@ static void fridge_state_update(const sensor_event_t *event)
 4. 点亮屏幕和触摸，使用低时钟起步，再逐步提升。
 5. 接入 LVGL 局部刷新和行缓冲。
 6. 接入传感器并实现开门状态机。
-7. 接入 Wi-Fi、MQTT、本地缓存和离线队列。
+7. 接入 Wi-Fi、HTTPS AI API、本地缓存和离线队列。
 8. 接入 OV3660 摄像头，从低分辨率和低时钟起步，完成拍照、帧缓冲/JPEG 管理和 HTTPS 上传。
-9. 接入云端 AI Adapter、库存确认、菜谱推荐和 OTA。
+9. 接入设备直连 AI API、库存确认、菜谱推荐和 OTA。
 10. 最后做长稳测试和硬件温升/供电检查。
 
 ## 测试要求
@@ -220,6 +222,42 @@ static void fridge_state_update(const sensor_event_t *event)
 - Flash/LittleFS 写入后断电重启数据不损坏。
 
 建议记录关键测试结果到后续测试文档，尤其是接线版本、GPIO 表、供电方式和异常日志。
+
+## 本项目 ESP-IDF 构建、烧录与串口调试经验
+
+当前开发机的 ESP-IDF 6.0.1 安装在 `D:\esp-IDF\.espressif\v6.0.1\esp-idf`，工具链和 Python 虚拟环境实际位于 `D:\esp-IDF\.espressif`。在 PowerShell 中构建或烧录前，不要直接运行 `idf.py`，也不要只 dot-source `export.ps1` 后重试；必须先临时指定 `IDF_TOOLS_PATH`，否则 `export.ps1` 会默认去 `C:\Users\123\.espressif` 查找 Python 环境并失败。
+
+推荐构建命令：
+
+```powershell
+$env:IDF_TOOLS_PATH='D:\esp-IDF\.espressif'
+. D:\esp-IDF\.espressif\v6.0.1\esp-idf\export.ps1
+idf.py build
+```
+
+推荐烧录命令：
+
+```powershell
+$env:IDF_TOOLS_PATH='D:\esp-IDF\.espressif'
+. D:\esp-IDF\.espressif\v6.0.1\esp-idf\export.ps1
+idf.py -p COM16 flash
+```
+
+已验证的硬件串口：
+
+- 当前 ESP32-S3-DevKitC-1 N8R8 开发板连接在 `COM16`。
+- 后续在本项目运行时，允许 AI 直接连接 `COM16` 做构建后烧录、串口日志采集、Web Serial JSON Lines 命令调试和真实硬件回归测试。
+- 打开串口或烧录后开发板可能复位一次，这是正常现象；调试脚本应等待 Wi-Fi/SNTP 稳定后再发网络或 AI 请求。
+- 串口可能被浏览器 Web Serial、ESP-IDF monitor、VS Code Serial Monitor 或其他串口助手占用；如果打开失败，先关闭占用端口的程序，不要反复重试烧录。
+
+串口协议调试经验：
+
+- 固件 USB 协议使用 `115200` 波特率、JSON Lines，一行一个请求，一行一个响应。
+- 日志和 JSON 响应会混在同一串口输出中；调试脚本必须按行读取，只把以 `{` 开头并包含目标 `request_id` 的行当作响应。
+- Web 面板和调试脚本发送中文时优先发送 UTF-8；如果工具把中文转成 `\uXXXX`，固件应能正确解码，但调试时仍要检查模型实际看到的用户问题是否完整。
+- AI 请求可能耗时 10 秒以上，`ai_assistant_chat`、`test_ai_chat`、`scan_wifi`、`set_network` 等命令需要较长超时，建议至少 `90-130` 秒。
+- API Key 不得写入日志、串口响应或调试输出；调试 AI 只记录 HTTP 状态、响应长度、耗时、任务类型和 history 条数。
+- 真实 API 二轮对话回归至少验证：第一轮无 history 返回 `HTTP 200`，第二轮带最近 user/assistant history 仍返回 `HTTP 200`，并确认模型没有看到被截断或乱码的问题。
 
 ## 给后续 AI/协作者的提醒
 

@@ -14,6 +14,7 @@
 #include "fridge_ai_client.h"
 #include "fridge_diagnostics.h"
 #include "fridge_network.h"
+#include "fridge_storage.h"
 #include "fridge_usb_protocol.h"
 #endif
 
@@ -56,6 +57,7 @@ void app_main(void)
     // 注意：此路径会启动 Wi-Fi，真实硬件调试时需确认 5V/USB 供电足够稳定。
     nvs_init_safe();
     fridge_diagnostics_init();
+    ESP_ERROR_CHECK(fridge_storage_init());
 
     ESP_ERROR_CHECK(fridge_network_init());
     ESP_ERROR_CHECK(fridge_ai_client_init());

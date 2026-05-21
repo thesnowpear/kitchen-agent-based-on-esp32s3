@@ -632,6 +632,13 @@ th {
   align-items: start;
 }
 
+.ai-assistant-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+  gap: 16px;
+  align-items: start;
+}
+
 .ai-profile-bar {
   display: grid;
   gap: 10px;
@@ -639,6 +646,10 @@ th {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
+}
+
+.compact-card {
+  padding: 12px;
 }
 
 .ai-profile-head {
@@ -684,7 +695,8 @@ th {
 
 .ai-config-main,
 .ai-config-side,
-.ai-chat-panel {
+.ai-chat-panel,
+.project-ai-card {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
@@ -711,6 +723,86 @@ th {
   display: grid;
   gap: 14px;
   padding: 16px;
+}
+
+.assistant-chat .ai-chat-stream {
+  min-height: 480px;
+  max-height: 620px;
+}
+
+.project-ai-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.project-ai-grid.wide {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.project-ai-card {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+  padding: 16px;
+}
+
+.project-ai-card h3 {
+  margin: 0;
+}
+
+.context-toggle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.context-toggle-grid label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: #f8fbfb;
+  font-size: 13px;
+}
+
+.context-toggle-grid input {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.compact-head {
+  align-items: center;
+}
+
+.json-preview {
+  margin: 0;
+  min-height: 170px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 14px;
+  border-radius: 8px;
+  color: #d8fff2;
+  background: #10272d;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.json-preview.tall {
+  min-height: 320px;
+}
+
+.json-editor {
+  min-height: 220px;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+  color: #d8fff2;
+  background: #10272d;
 }
 
 .ai-chat-head {
@@ -1009,6 +1101,16 @@ label {
   font-size: 13px;
 }
 
+.form-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.form-hint.danger {
+  color: #b42318;
+}
+
 input,
 textarea,
 select {
@@ -1259,6 +1361,9 @@ textarea {
   .usb-layout,
   .wifi-console,
   .ai-config-grid,
+  .ai-assistant-grid,
+  .project-ai-grid,
+  .project-ai-grid.wide,
   .ai-chat-input,
   .form-grid {
     grid-template-columns: 1fr;

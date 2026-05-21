@@ -10,7 +10,7 @@
 完成时间：2026-05-17 21:08:38 +08:00
 
 - 完成项目架构文档 `doc/项目架构与工作流设计.md`。
-- 明确了主控 `ESP32-S3`、独立 `ESP32-CAM`、云端 AI Adapter、小程序/移动端的整体分层架构。
+- 早期明确了主控 `ESP32-S3`、独立 `ESP32-CAM`、服务端与移动端的整体分层架构；该记录已被后续 `OV3660` 直连与设备直连 AI API 方案取代。
 - 固化了硬件拓扑、推荐组件划分、状态机、MQTT/HTTP 接口、数据模型、分区建议和测试验收路径。
 
 ----
@@ -72,7 +72,7 @@
 - 新增 `components/ai_client`，支持在开发板 NVS 中保存 OpenAI-compatible API Base URL、模型、系统提示词和 API Key，并通过 HTTPS `/chat/completions` 执行文本聊天测试。
 - 扩展 Web Serial 协议命令：`get_ai_config`、`set_ai_config`、`clear_ai_key`、`test_ai_chat`；响应中不回传 API Key 明文，只返回保存状态和脱敏预览。
 - Web 面板新增 `AI API` 页面，支持配置保存、清除 Key 和模拟聊天测试；Mock 模式同步支持无硬件演示。
-- 安全边界：当前为 NVS 开发模式保存 Key，适合今天快速联调；后续可替换为云端 AI Adapter 或 NVS 加密方案。
+- 安全边界：当前为 NVS 开发模式保存 Key，适合今天快速联调；后续可评估 NVS 加密和 Key 轮换方案。
 ----
 
 ## 2026-05-20 23:26:33 USB 协议稳定与 Wi-Fi 扫描恢复
@@ -115,3 +115,35 @@
 - Web 周期刷新不再每轮读取 AI 配置列表，仅进入 AI 页面或配置变更后刷新，降低串口和浏览器压力。
 - 已完成固件构建、Web 构建、刷写和真机回归；连续 10 次 	est_ai_chat 均 HTTP 200，无 stack overflow、无重启、无串口 JSON 破碎。
 - 验证记录：AI worker 栈水位约 27344-27568 words，USB 协议任务 AI 后栈水位约 8944 words，Wi-Fi 获取到 IP 192.168.0.106，API 配置仍保存在 NVS。
+- 2026-05-21 02:05:48 补充：放宽 AI API 系统提示词配置。固件 FRIDGE_AI_MAX_SYSTEM_PROMPT_LEN 从 256B 提升到 2048B，Web 输入框取消 240 字硬限制并改为 UTF-8 字节计数提示；USB 侧相关 AI 配置结构改为堆分配，避免长提示词增加常驻任务栈压力。已通过 
+pm run build 和 idf.py build。- 2026-05-21 02:06:48 补充：USB JSON Lines 单行缓冲从 4096B 提升到 6144B，用于容纳长系统提示词转义后的请求；复跑 idf.py build 通过。- 2026-05-21 02:22:55 补充：系统提示词长文本支持升级到 8192B。固件改为使用 NVS blob 保存 systemPrompt，兼容旧版短字符串读取；USB JSON Lines 单行缓冲提升到 16KB，AI 配置/测试大结构改为堆分配。已刷写 COM16，并用当前厨房助手完整提示词真机校验：3779B 写入、3779B 读回、内容完全一致。
+----
+## 2026-05-21 14:14:26 AI 系统架构第一版落地
+
+- 新增 `doc/AI系统设计架构.md`，固定 AI 链路的任务类型、结构化上下文注入、记忆边界和用户确认闭环；并在主架构文档中加入引用。
+- 新增 `components/storage` 存储门面，提供库存快照、临期提醒、用户偏好、结构化记忆摘要和离线队列的统一读取接口；当前使用种子 JSON 与 NVS 记忆摘要，后续在组件内部替换为 LittleFS cache/assets。
+- 新增 `components/ai_context`，支持 `chat_assist`、`recognize_ingredients`、`inventory_parse`、`recipe_generate`、`shopping_list_generate`、`reminder_explain`、`voice_intent_parse` 等任务的上下文预览和 Mock 结构化结果。
+- 扩展 USB JSON Lines 命令：`get_ai_context_preview`、`test_ai_task`、`get_memory_summary`、`clear_memory_summary`，用于 Web 面板验证任务上下文、记忆边界和“AI 结果不直接入库”规则。
+- Web 面板新增“项目 AI”页面，支持选择任务类型、开关库存/提醒/偏好/记忆注入、预览上下文、运行 Mock 项目 AI 任务、读取和清空结构化记忆摘要。
+- 当时曾新增服务端参考实现，后续架构已删除该参考并收敛为设备直连 AI API。
+- 已通过 `npm run build` 和 `idf.py build`；固件 app 大小 `0xfb160`，最小 app 分区仍有约 56% 空间。----
+## 2026-05-21 14:53:10 AI 助手合并与真实上下文调用
+
+- 将 Web 面板的 `AI API` 与 `项目 AI` 合并为 `AI 助手` 单一入口，主界面包含真实多轮对话、任务类型选择、上下文开关、上下文预览、AI 设置和硬件测试记忆维护。
+- 新增 USB JSON Lines 命令 `ai_assistant_chat`：设备端先通过 `ai_context` 生成最小项目上下文，再把最近对话历史与上下文注入 OpenAI-compatible `/chat/completions`，返回模型、耗时、HTTP 状态、任务类型和确认标记。
+- 新增 `set_memory_summary` 与 `fridge_storage_set_memory_summary()`，允许 Web 面板明确写入结构化硬件测试记忆；仍不自动保存完整聊天记录，也不让 AI 结果直接入库。
+- `test_ai_chat` 与 `test_ai_task` 保留为开发探针和 Mock 兜底；Web 默认路径改为真实上下文助手调用。
+- 已通过 `npm run build` 和 `idf.py build`；固件 app 大小 `0xfc7d0`，最小 app 分区仍有约 56% 空间。
+----
+## 2026-05-21 14:59:00 AI 方案调整为设备直连 API
+
+- 按当前开发目标，将首版正式 AI 路线调整为“ESP32-S3 设备直连 OpenAI-compatible API”。
+- 更新 `AGENTS.md`、`doc/项目架构与工作流设计.md` 和 `doc/AI系统设计架构.md`：`components/ai_client` 作为首版 AI API 正式入口，`ai_context` 负责上下文注入和任务约束，远程同步降级为后续可选扩展。
+- 明确安全边界：API Key 允许在 Demo 阶段保存到设备 NVS，但串口响应、日志和仓库不得回显明文；公开部署前再评估 NVS 加密和 Key 轮换。
+----
+## 2026-05-21 15:40:44 设备直连 AI 架构收敛
+
+- 按最新项目架构，明确首版 AI 只走 ESP32-S3 设备直连 OpenAI-compatible API。
+- 更新 `AGENTS.md`、`doc/AI系统设计架构.md` 和 `doc/项目架构与工作流设计.md`，将远程能力限定为后续同步、日志或 OTA 运维扩展，不参与 AI 主链路。
+- 删除服务端参考实现，避免后续实现误回到服务端中转方案。
+- 保留本地 Mock 结果作为比赛现场兜底；真实 AI 仍由设备端 `ai_client` 和 `ai_context` 完成配置、上下文注入与 HTTPS 调用。

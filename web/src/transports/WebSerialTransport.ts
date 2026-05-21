@@ -121,7 +121,13 @@ export class WebSerialTransport extends BaseTransport {
     if (command === "scan_wifi") {
       return Math.max(this.timeoutMs, 60000);
     }
-    if (command === "set_network" || command === "test_ai_chat") {
+    if (
+      command === "set_network" ||
+      command === "test_ai_chat" ||
+      command === "ai_assistant_chat" ||
+      command === "get_ai_context_preview" ||
+      command === "test_ai_task"
+    ) {
       return Math.max(this.timeoutMs, 90000);
     }
     return this.timeoutMs;

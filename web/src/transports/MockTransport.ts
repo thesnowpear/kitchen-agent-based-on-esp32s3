@@ -8,7 +8,20 @@ import {
   createMockStatus,
   createMockWifiNetworks,
 } from "../data/mockData";
-import type { AIChatResponse, AIConfig, AIProfilesResponse, DeviceCommand, DeviceResponse, NetworkConfig } from "../types";
+import type {
+  AIAssistantChatRequest,
+  AIAssistantChatResponse,
+  AIChatResponse,
+  AIConfig,
+  AIContextPreview,
+  AIProfilesResponse,
+  DeviceCommand,
+  DeviceResponse,
+  MemorySummary,
+  NetworkConfig,
+  ProjectAITaskRequest,
+  ProjectAITaskResponse,
+} from "../types";
 import { BaseTransport } from "./DeviceTransport";
 
 // Mock 传输层：无硬件时模拟 ESP32-S3 返回，便于比赛展示和前端开发。
@@ -18,6 +31,15 @@ export class MockTransport extends BaseTransport {
   private network = createMockNetwork();
   private aiConfig = createMockAIConfig();
   private aiProfiles: AIConfig[] = [this.aiConfig];
+  private memorySummary: MemorySummary = {
+    schema_version: 1,
+    memory_policy: "只保存结构化摘要，不保存完整聊天记录",
+    family_size: 2,
+    taste: ["清淡", "少油"],
+    avoid: ["香菜"],
+    allergies: [],
+    recent_summary: ["用户希望优先处理临期食材", "早餐偏快手，晚餐偏家常"],
+  };
 
   async connect() {
     this.connected = true;
@@ -167,6 +189,68 @@ export class MockTransport extends BaseTransport {
         } satisfies AIChatResponse;
         break;
       }
+      case "ai_assistant_chat": {
+        const request = this.normalizeAssistantRequest(payload);
+        if (!this.aiConfig.hasApiKey) {
+          throw new Error("Mock AI 缺少 API Key，请先保存一个测试 Key。");
+        }
+        responsePayload = {
+          reply: this.createAssistantReply(request),
+          model: this.aiConfig.model,
+          latencyMs: 260,
+          status: "mock_ok",
+          httpStatus: 200,
+          taskType: request.taskType,
+          contextInjected: request.includeInventory || request.includeMemory || request.includeReminders || request.includePreferences,
+          localSnapshotVersion: 1,
+          needsConfirmation: request.taskType !== "chat_assist",
+        } satisfies AIAssistantChatResponse;
+        this.emitLog("info", `Mock AI 助手已注入上下文并完成：${request.taskType}`, "ai");
+        break;
+      }
+      case "get_ai_context_preview": {
+        const request = this.normalizeProjectAiRequest(payload);
+        responsePayload = this.createContextPreview(request);
+        break;
+      }
+      case "test_ai_task": {
+        const request = this.normalizeProjectAiRequest(payload);
+        responsePayload = this.createProjectAiResult(request);
+        this.emitLog("info", `Mock 项目 AI 任务完成：${request.taskType}`, "ai_context");
+        break;
+      }
+      case "get_memory_summary":
+        responsePayload = this.memorySummary;
+        break;
+      case "set_memory_summary": {
+        const update = payload as { memory?: MemorySummary } | MemorySummary | undefined;
+        const next = update && "memory" in update ? update.memory : update;
+        this.memorySummary = {
+          schema_version: 1,
+          memory_policy: "硬件测试记忆：只保存结构化摘要，不保存完整聊天记录",
+          family_size: 2,
+          taste: [],
+          avoid: [],
+          allergies: [],
+          recent_summary: [],
+          ...(next as MemorySummary),
+        };
+        responsePayload = this.memorySummary;
+        this.emitLog("info", "Mock 硬件测试记忆已写入。", "ai_context");
+        break;
+      }
+      case "clear_memory_summary":
+        this.memorySummary = {
+          schema_version: 1,
+          memory_policy: "已清空结构化记忆摘要，不保存完整聊天记录",
+          family_size: 0,
+          taste: [],
+          avoid: [],
+          allergies: [],
+          recent_summary: [],
+        };
+        responsePayload = this.memorySummary;
+        break;
       case "get_pins":
         responsePayload = createMockPins();
         break;
@@ -198,6 +282,135 @@ export class MockTransport extends BaseTransport {
     return {
       activeProfileId: this.aiConfig.profileId ?? 0,
       profiles: this.aiProfiles,
+    };
+  }
+
+  private normalizeProjectAiRequest(payload: unknown): ProjectAITaskRequest {
+    const request = payload as Partial<ProjectAITaskRequest> | undefined;
+    return {
+      taskType: request?.taskType ?? "chat_assist",
+      userText: request?.userText ?? "",
+      includeInventory: request?.includeInventory ?? true,
+      includeMemory: request?.includeMemory ?? true,
+      includeReminders: request?.includeReminders ?? true,
+      includePreferences: request?.includePreferences ?? true,
+    };
+  }
+
+  private normalizeAssistantRequest(payload: unknown): AIAssistantChatRequest {
+    const request = payload as Partial<AIAssistantChatRequest> | undefined;
+    const base = this.normalizeProjectAiRequest(payload);
+    return {
+      ...base,
+      message: request?.message ?? request?.userText ?? "",
+      userText: request?.userText ?? request?.message ?? "",
+      history: (request?.history ?? []).slice(-6).map((item) => ({
+        role: item.role === "assistant" ? "assistant" : "user",
+        content: item.content.slice(0, 512),
+      })),
+    };
+  }
+
+  private createAssistantReply(request: AIAssistantChatRequest) {
+    const contextParts = [
+      request.includeInventory ? "库存" : "",
+      request.includeReminders ? "临期提醒" : "",
+      request.includePreferences ? "偏好" : "",
+      request.includeMemory ? "测试记忆" : "",
+    ].filter(Boolean);
+    if (request.taskType === "recipe_generate") {
+      return `Mock 真实助手：我已注入${contextParts.join("、") || "无额外上下文"}。按当前测试库存，建议先处理牛奶和番茄，可以做番茄鸡蛋汤；如果牛奶有异味、胀包或冷链异常，请不要食用。`;
+    }
+    if (request.taskType === "shopping_list_generate") {
+      return `Mock 真实助手：根据已注入的${contextParts.join("、") || "上下文"}，建议购买绿叶菜和主食，葱花、酸奶属于可选补充，避免一次买太多。`;
+    }
+    return `Mock 真实助手：已收到“${request.message.slice(0, 80)}”。我会优先依据项目上下文回答，不会编造库存或把结果直接入库。`;
+  }
+
+  private createContextPreview(request: ProjectAITaskRequest): AIContextPreview {
+    return {
+      taskType: request.taskType,
+      localSnapshotVersion: 1,
+      needsConfirmation: request.taskType !== "chat_assist",
+      context: {
+        schema_version: 1,
+        task_type: request.taskType,
+        request_id: "mock_preview",
+        persona_template: "你是冰箱小精灵的智能厨房助手。回答要实用、保守、可确认、少打扰。",
+        task_template: "按任务类型输出结构化 JSON，AI 结果不能直接入库。",
+        user_text: request.userText,
+        dynamic_context: {
+          inventory: request.includeInventory ? { items: [{ name: "牛奶", days_left: 1, location: "门架中层" }, { name: "番茄", days_left: 2, location: "冷藏主仓 B2" }] } : null,
+          reminders: request.includeReminders ? { reminders: [{ name: "牛奶", suggestion: "今天优先处理" }] } : null,
+          preferences: request.includePreferences ? { people: 2, taste: ["清淡", "少油"], avoid: ["香菜"] } : null,
+          memory_summary: request.includeMemory ? this.memorySummary : null,
+          offline_queue: { pending_count: 0 },
+        },
+        output_policy: {
+          ai_result_must_be_confirmed: true,
+          do_not_fabricate_inventory: true,
+          do_not_store_full_chat: true,
+        },
+      },
+    };
+  }
+
+  private createProjectAiResult(request: ProjectAITaskRequest): ProjectAITaskResponse {
+    const base = {
+      taskType: request.taskType,
+      confidence: 82,
+      needsConfirmation: request.taskType !== "chat_assist",
+      safetyNote: "Mock 结果只验证上下文注入和结构化输出，不会直接写入库存。",
+    };
+    if (request.taskType === "recipe_generate") {
+      return {
+        ...base,
+        needsConfirmation: false,
+        result: {
+          schema_version: 1,
+          type: "recipe_generate",
+          recipe: {
+            name: "番茄鸡蛋汤",
+            use_inventory: ["番茄", "鸡蛋"],
+            missing: ["葱花，可选"],
+            time_minutes: 15,
+            steps: ["番茄切块，鸡蛋打散", "少油炒番茄出汁", "加水煮开后淋入蛋液", "按口味少量加盐"],
+          },
+        },
+      };
+    }
+    if (request.taskType === "shopping_list_generate") {
+      return {
+        ...base,
+        result: {
+          schema_version: 1,
+          type: "shopping_list_generate",
+          suggested: ["绿叶菜", "面条"],
+          optional: ["葱花", "低脂酸奶"],
+          basis: "根据当前库存和快手晚餐偏好生成，避免过量购买",
+        },
+      };
+    }
+    if (request.taskType === "recognize_ingredients") {
+      return {
+        ...base,
+        result: {
+          schema_version: 1,
+          type: "recognize_ingredients",
+          candidates: [{ name: "番茄", quantity: "约2-3个", confidence: 0.82, doubt: "Mock 未接入真实图片" }],
+          needs_confirmation: true,
+          confirm_fields: ["名称", "数量", "保质期", "位置"],
+        },
+      };
+    }
+    return {
+      ...base,
+      needsConfirmation: request.taskType !== "chat_assist",
+      result: {
+        schema_version: 1,
+        type: request.taskType,
+        reply: "我会优先依据当前库存、临期提醒和你的偏好给出建议；信息不足时会请你确认，不会编造库存。",
+      },
     };
   }
 }

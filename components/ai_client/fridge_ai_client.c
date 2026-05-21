@@ -23,8 +23,9 @@
 #define AI_NVS_KEY_SYSTEM "system"
 #define AI_NVS_KEY_TIMEOUT "timeout_ms"
 #define AI_NVS_KEY_ACTIVE_PROFILE "active"
-#define AI_HTTP_RESPONSE_CAP 4096
+#define AI_HTTP_RESPONSE_CAP 8192
 #define AI_TEST_MAX_TOKENS 128
+#define AI_ASSISTANT_MAX_TOKENS 512
 #define AI_COMPLETIONS_PATH "/chat/completions"
 
 static const char *TAG = "fridge_ai";
@@ -260,6 +261,24 @@ static void read_nvs_string(nvs_handle_t handle, const char *key, char *out, siz
     }
 }
 
+static void read_nvs_text(nvs_handle_t handle, const char *key, char *out, size_t out_size, const char *fallback)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+
+    // 长系统提示词使用 NVS blob 保存，避免 nvs_set_str 的单页字符串长度限制。
+    // 旧固件已经保存过的短字符串仍可回读，保证升级后不丢原配置。
+    size_t len = out_size;
+    esp_err_t err = nvs_get_blob(handle, key, out, &len);
+    if (err == ESP_OK && len > 0) {
+        out[out_size - 1] = '\0';
+        return;
+    }
+
+    read_nvs_string(handle, key, out, out_size, fallback);
+}
+
 static uint8_t clamp_profile_id(uint8_t profile_id)
 {
     return profile_id < FRIDGE_AI_MAX_PROFILES ? profile_id : 0;
@@ -401,8 +420,8 @@ static esp_err_t load_profile_config(uint8_t profile_id, fridge_ai_config_update
     make_profile_key(profile_id, "model", key, sizeof(key));
     read_nvs_string(handle, key, config->model, sizeof(config->model), FRIDGE_AI_DEFAULT_MODEL);
     make_profile_key(profile_id, "system", key, sizeof(key));
-    read_nvs_string(handle, key, config->system_prompt, sizeof(config->system_prompt),
-                    "你是冰箱小精灵的开发测试助手，请用简短中文回答。");
+    read_nvs_text(handle, key, config->system_prompt, sizeof(config->system_prompt),
+                  "你是冰箱小精灵的开发测试助手，请用简短中文回答。");
     size_t key_len = sizeof(config->api_key);
     make_profile_key(profile_id, "key", key, sizeof(key));
     esp_err_t key_err = nvs_get_str(handle, key, config->api_key, &key_len);
@@ -488,6 +507,145 @@ static char *build_chat_request(const fridge_ai_config_update_t *config, const c
     return body;
 }
 
+static const char *safe_history_role(const char *role)
+{
+    return (role && strcmp(role, "assistant") == 0) ? "assistant" : "user";
+}
+
+static char *build_assistant_request(const fridge_ai_config_update_t *config, const fridge_ai_assistant_request_t *request)
+{
+    char *model = json_escape_alloc(config->model);
+    char *system_prompt = json_escape_alloc(config->system_prompt);
+    char *task_type = json_escape_alloc(request->task_type);
+    char *context_json = json_escape_alloc(request->context_json);
+    char *user_message = json_escape_alloc(request->message);
+    if (!model || !system_prompt || !task_type || !context_json || !user_message) {
+        free(model);
+        free(system_prompt);
+        free(task_type);
+        free(context_json);
+        free(user_message);
+        return NULL;
+    }
+
+    size_t history_len = 0;
+    size_t history_count = request->history ? request->history_count : 0;
+    history_count = history_count > FRIDGE_AI_MAX_CHAT_HISTORY ? FRIDGE_AI_MAX_CHAT_HISTORY : history_count;
+    char **history_roles = calloc(history_count ? history_count : 1, sizeof(char *));
+    char **history_contents = calloc(history_count ? history_count : 1, sizeof(char *));
+    if (!history_roles || !history_contents) {
+        free(model);
+        free(system_prompt);
+        free(task_type);
+        free(context_json);
+        free(user_message);
+        free(history_roles);
+        free(history_contents);
+        return NULL;
+    }
+    for (size_t i = 0; i < history_count; i++) {
+        history_roles[i] = json_escape_alloc(safe_history_role(request->history[i].role));
+        history_contents[i] = json_escape_alloc(request->history[i].content);
+        if (!history_roles[i] || !history_contents[i]) {
+            for (size_t j = 0; j <= i; j++) {
+                free(history_roles[j]);
+                free(history_contents[j]);
+            }
+            free(model);
+            free(system_prompt);
+            free(task_type);
+            free(context_json);
+            free(user_message);
+            free(history_roles);
+            free(history_contents);
+            return NULL;
+        }
+        history_len += strlen(history_roles[i]) + strlen(history_contents[i]) + 48;
+    }
+
+    const char *assistant_policy =
+        "你现在运行在冰箱小精灵硬件测试模式。必须优先依据下方项目上下文回答；"
+        "不要编造库存、日期、数量、识别结果或传感器状态；涉及库存变更、识别候选、过敏、过期和霉变时要保守，并提醒用户确认。";
+    char *policy = json_escape_alloc(assistant_policy);
+    if (!policy) {
+        for (size_t i = 0; i < history_count; i++) {
+            free(history_roles[i]);
+            free(history_contents[i]);
+        }
+        free(model);
+        free(system_prompt);
+        free(task_type);
+        free(context_json);
+        free(user_message);
+        free(history_roles);
+        free(history_contents);
+        return NULL;
+    }
+
+    size_t body_len = strlen(model) + strlen(system_prompt) + strlen(policy) + strlen(task_type) +
+                      strlen(context_json) + strlen(user_message) + history_len + 768;
+    char *body = calloc(1, body_len);
+    if (body) {
+        size_t used = 0;
+        // 兼容更多 OpenAI-compatible 服务：只保留一个 system 消息。
+        // 部分服务在第二轮带 history 时会拒绝多个 system 消息，导致 HTTP 400。
+        int written = snprintf(body,
+                               body_len,
+                               "{\"model\":\"%s\",\"messages\":["
+                               "{\"role\":\"system\",\"content\":\"%s\\n%s\\n项目AI任务类型：%s\\n项目上下文JSON：%s\"}",
+                               model,
+                               system_prompt,
+                               policy,
+                               task_type,
+                               context_json);
+        if (written < 0 || (size_t)written >= body_len) {
+            free(body);
+            body = NULL;
+        } else {
+            used = (size_t)written;
+        }
+        for (size_t i = 0; body && i < history_count; i++) {
+            written = snprintf(body + used,
+                               body_len - used,
+                               ",{\"role\":\"%s\",\"content\":\"%s\"}",
+                               history_roles[i],
+                               history_contents[i]);
+            if (written < 0 || (size_t)written >= body_len - used) {
+                free(body);
+                body = NULL;
+                break;
+            }
+            used += (size_t)written;
+        }
+        if (body) {
+            written = snprintf(body + used,
+                               body_len - used,
+                               ",{\"role\":\"user\",\"content\":\"%s\"}],"
+                               "\"temperature\":0.2,\"max_tokens\":%d,\"stream\":false}",
+                               user_message,
+                               AI_ASSISTANT_MAX_TOKENS);
+            if (written < 0 || (size_t)written >= body_len - used) {
+                free(body);
+                body = NULL;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < history_count; i++) {
+        free(history_roles[i]);
+        free(history_contents[i]);
+    }
+    free(history_roles);
+    free(history_contents);
+    free(model);
+    free(system_prompt);
+    free(policy);
+    free(task_type);
+    free(context_json);
+    free(user_message);
+    return body;
+}
+
 static esp_err_t parse_chat_response(const char *response, fridge_ai_chat_result_t *out)
 {
     if (!response || response[0] == '\0') {
@@ -552,19 +710,26 @@ esp_err_t fridge_ai_client_get_config(fridge_ai_config_view_t *out)
     ESP_RETURN_ON_FALSE(out, ESP_ERR_INVALID_ARG, TAG, "out is NULL");
     memset(out, 0, sizeof(*out));
 
-    fridge_ai_config_update_t config = {0};
-    ESP_RETURN_ON_ERROR(load_full_config(&config), TAG, "load AI config failed");
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI config allocation failed");
 
-    out->profile_id = config.profile_id;
-    strlcpy(out->profile_name, config.profile_name, sizeof(out->profile_name));
-    strlcpy(out->api_base_url, config.api_base_url, sizeof(out->api_base_url));
-    strlcpy(out->model, config.model, sizeof(out->model));
-    strlcpy(out->system_prompt, config.system_prompt, sizeof(out->system_prompt));
-    out->timeout_ms = clamp_timeout_ms(config.timeout_ms);
-    out->has_api_key = config.api_key[0] != '\0';
+    esp_err_t err = load_full_config(config);
+    if (err != ESP_OK) {
+        free(config);
+        ESP_RETURN_ON_ERROR(err, TAG, "load AI config failed");
+    }
+
+    out->profile_id = config->profile_id;
+    strlcpy(out->profile_name, config->profile_name, sizeof(out->profile_name));
+    strlcpy(out->api_base_url, config->api_base_url, sizeof(out->api_base_url));
+    strlcpy(out->model, config->model, sizeof(out->model));
+    strlcpy(out->system_prompt, config->system_prompt, sizeof(out->system_prompt));
+    out->timeout_ms = clamp_timeout_ms(config->timeout_ms);
+    out->has_api_key = config->api_key[0] != '\0';
     out->ready = out->api_base_url[0] != '\0' && out->model[0] != '\0' && out->has_api_key;
-    make_key_preview(config.api_key, out->api_key_preview, sizeof(out->api_key_preview));
+    make_key_preview(config->api_key, out->api_key_preview, sizeof(out->api_key_preview));
     strlcpy(out->last_error, s_last_error, sizeof(out->last_error));
+    free(config);
     return ESP_OK;
 }
 
@@ -597,7 +762,7 @@ esp_err_t fridge_ai_client_set_config(const fridge_ai_config_update_t *config)
     }
     if (err == ESP_OK) {
         make_profile_key(profile_id, "system", key, sizeof(key));
-        err = nvs_set_str(handle, key, config->system_prompt);
+        err = nvs_set_blob(handle, key, config->system_prompt, strlen(config->system_prompt) + 1);
     }
     if (err == ESP_OK) {
         make_profile_key(profile_id, "timeout", key, sizeof(key));
@@ -671,19 +836,33 @@ esp_err_t fridge_ai_client_get_profiles(fridge_ai_profile_list_t *out)
             continue;
         }
 
-        fridge_ai_config_update_t config = {0};
-        ESP_RETURN_ON_ERROR(load_profile_config(id, &config), TAG, "load AI profile failed");
+        fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+        if (!config) {
+            if (has_handle) {
+                nvs_close(handle);
+            }
+            ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "AI profile allocation failed");
+        }
+        err = load_profile_config(id, config);
+        if (err != ESP_OK) {
+            free(config);
+            if (has_handle) {
+                nvs_close(handle);
+            }
+            ESP_RETURN_ON_ERROR(err, TAG, "load AI profile failed");
+        }
         fridge_ai_config_view_t *view = &out->profiles[out->count++];
-        view->profile_id = config.profile_id;
-        strlcpy(view->profile_name, config.profile_name, sizeof(view->profile_name));
-        strlcpy(view->api_base_url, config.api_base_url, sizeof(view->api_base_url));
-        strlcpy(view->model, config.model, sizeof(view->model));
-        strlcpy(view->system_prompt, config.system_prompt, sizeof(view->system_prompt));
-        view->timeout_ms = clamp_timeout_ms(config.timeout_ms);
-        view->has_api_key = config.api_key[0] != '\0';
+        view->profile_id = config->profile_id;
+        strlcpy(view->profile_name, config->profile_name, sizeof(view->profile_name));
+        strlcpy(view->api_base_url, config->api_base_url, sizeof(view->api_base_url));
+        strlcpy(view->model, config->model, sizeof(view->model));
+        view->system_prompt[0] = '\0';
+        view->timeout_ms = clamp_timeout_ms(config->timeout_ms);
+        view->has_api_key = config->api_key[0] != '\0';
         view->ready = view->api_base_url[0] != '\0' && view->model[0] != '\0' && view->has_api_key;
-        make_key_preview(config.api_key, view->api_key_preview, sizeof(view->api_key_preview));
+        make_key_preview(config->api_key, view->api_key_preview, sizeof(view->api_key_preview));
         strlcpy(view->last_error, s_last_error, sizeof(view->last_error));
+        free(config);
     }
 
     if (has_handle) {
@@ -709,18 +888,21 @@ esp_err_t fridge_ai_client_create_profile(const char *profile_name, fridge_ai_co
     nvs_close(handle);
     ESP_RETURN_ON_FALSE(new_id < FRIDGE_AI_MAX_PROFILES, ESP_ERR_NO_MEM, TAG, "AI profile slots are full");
 
-    fridge_ai_config_update_t config = {0};
-    config.profile_id = new_id;
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI config allocation failed");
+    config->profile_id = new_id;
     if (profile_name && profile_name[0]) {
-        strlcpy(config.profile_name, profile_name, sizeof(config.profile_name));
+        strlcpy(config->profile_name, profile_name, sizeof(config->profile_name));
     } else {
-        default_profile_name(new_id, config.profile_name, sizeof(config.profile_name));
+        default_profile_name(new_id, config->profile_name, sizeof(config->profile_name));
     }
-    strlcpy(config.model, FRIDGE_AI_DEFAULT_MODEL, sizeof(config.model));
-    strlcpy(config.system_prompt, "你是冰箱小精灵的开发测试助手，请用简短中文回答。", sizeof(config.system_prompt));
-    config.timeout_ms = FRIDGE_AI_DEFAULT_TIMEOUT_MS;
+    strlcpy(config->model, FRIDGE_AI_DEFAULT_MODEL, sizeof(config->model));
+    strlcpy(config->system_prompt, "你是冰箱小精灵的开发测试助手，请用简短中文回答。", sizeof(config->system_prompt));
+    config->timeout_ms = FRIDGE_AI_DEFAULT_TIMEOUT_MS;
 
-    ESP_RETURN_ON_ERROR(fridge_ai_client_set_config(&config), TAG, "create AI profile failed");
+    esp_err_t err = fridge_ai_client_set_config(config);
+    free(config);
+    ESP_RETURN_ON_ERROR(err, TAG, "create AI profile failed");
     return out ? fridge_ai_client_get_config(out) : ESP_OK;
 }
 
@@ -794,29 +976,38 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
         }
     }
 
-    fridge_ai_config_update_t config = {0};
-    ESP_RETURN_ON_ERROR(load_full_config(&config), TAG, "load AI config failed");
-    if (config.api_base_url[0] == '\0') {
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI config allocation failed");
+    esp_err_t load_err = load_full_config(config);
+    if (load_err != ESP_OK) {
+        free(config);
+        ESP_RETURN_ON_ERROR(load_err, TAG, "load AI config failed");
+    }
+    if (config->api_base_url[0] == '\0') {
+        free(config);
         strlcpy(out->error, "缺少 API Base URL", sizeof(out->error));
         set_last_error(out->error);
         return ESP_ERR_INVALID_STATE;
     }
-    if (config.api_key[0] == '\0') {
+    if (config->api_key[0] == '\0') {
+        free(config);
         strlcpy(out->error, "缺少 API Key，请先在 AI API 页面保存", sizeof(out->error));
         set_last_error(out->error);
         return ESP_ERR_INVALID_STATE;
     }
 
     char url[FRIDGE_AI_MAX_BASE_URL_LEN + sizeof(AI_COMPLETIONS_PATH) + 8] = {0};
-    esp_err_t err = compose_chat_url(config.api_base_url, url, sizeof(url));
+    esp_err_t err = compose_chat_url(config->api_base_url, url, sizeof(url));
     if (err != ESP_OK) {
+        free(config);
         strlcpy(out->error, "API Base URL 必须使用 https://，并建议以 /v1 结尾", sizeof(out->error));
         set_last_error(out->error);
         return err;
     }
 
-    char *request_body = build_chat_request(&config, message);
+    char *request_body = build_chat_request(config, message);
     if (!request_body) {
+        free(config);
         strlcpy(out->error, "构造 AI 请求 JSON 失败", sizeof(out->error));
         set_last_error(out->error);
         return ESP_ERR_NO_MEM;
@@ -824,6 +1015,7 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
 
     char *response_body = calloc(1, AI_HTTP_RESPONSE_CAP);
     if (!response_body) {
+        free(config);
         free(request_body);
         strlcpy(out->error, "分配 AI 响应缓冲失败", sizeof(out->error));
         set_last_error(out->error);
@@ -839,7 +1031,7 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
     esp_http_client_config_t http_config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = (int)clamp_timeout_ms(config.timeout_ms),
+        .timeout_ms = (int)clamp_timeout_ms(config->timeout_ms),
         .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler = ai_http_event_handler,
         .user_data = &rx,
@@ -847,6 +1039,7 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
 
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
     if (!client) {
+        free(config);
         free(request_body);
         free(response_body);
         strlcpy(out->error, "初始化 HTTP 客户端失败", sizeof(out->error));
@@ -855,7 +1048,7 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
     }
 
     char auth_header[FRIDGE_AI_MAX_API_KEY_LEN + 16] = {0};
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", config.api_key);
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", config->api_key);
     esp_http_client_set_header(client, "Accept", "application/json");
     esp_http_client_set_header(client, "Accept-Encoding", "identity");
     esp_http_client_set_header(client, "Content-Type", "application/json");
@@ -865,8 +1058,9 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
     err = esp_http_client_perform(client);
     out->http_status = esp_http_client_get_status_code(client);
     out->latency_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
-    strlcpy(out->model, config.model, sizeof(out->model));
+    strlcpy(out->model, config->model, sizeof(out->model));
     esp_http_client_cleanup(client);
+    free(config);
     free(request_body);
 
     if (err != ESP_OK) {
@@ -888,6 +1082,155 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
     }
 
     err = parse_chat_response(response_body, out);
+    free(response_body);
+    return err;
+}
+
+esp_err_t fridge_ai_client_assistant_chat(const fridge_ai_assistant_request_t *request, fridge_ai_assistant_result_t *out)
+{
+    ESP_RETURN_ON_FALSE(request && request->message[0] != '\0' && out, ESP_ERR_INVALID_ARG, TAG, "invalid assistant args");
+    memset(out, 0, sizeof(*out));
+    int64_t start_us = esp_timer_get_time();
+
+    strlcpy(out->task_type, request->task_type[0] ? request->task_type : "chat_assist", sizeof(out->task_type));
+    out->context_injected = request->context_injected;
+    out->needs_confirmation = request->needs_confirmation;
+    out->local_snapshot_version = request->local_snapshot_version;
+
+    fridge_network_status_t net = {0};
+    fridge_network_get_status(&net);
+    if (!net.connected) {
+        strlcpy(out->chat.error, "Wi-Fi 未连接，请先在 Web 面板完成配网", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!net.internet_ready) {
+        esp_err_t sync_err = fridge_network_sync_time();
+        fridge_network_get_status(&net);
+        if (sync_err != ESP_OK || !net.internet_ready) {
+            strlcpy(out->chat.error, "网络未校时或外网不可用，请确认 SNTP/互联网连接", sizeof(out->chat.error));
+            set_last_error(out->chat.error);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI config allocation failed");
+    esp_err_t load_err = load_full_config(config);
+    if (load_err != ESP_OK) {
+        free(config);
+        ESP_RETURN_ON_ERROR(load_err, TAG, "load AI config failed");
+    }
+    if (config->api_base_url[0] == '\0') {
+        free(config);
+        strlcpy(out->chat.error, "缺少 API Base URL", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (config->api_key[0] == '\0') {
+        free(config);
+        strlcpy(out->chat.error, "缺少 API Key，请先在 AI 设置中保存", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[FRIDGE_AI_MAX_BASE_URL_LEN + sizeof(AI_COMPLETIONS_PATH) + 8] = {0};
+    esp_err_t err = compose_chat_url(config->api_base_url, url, sizeof(url));
+    if (err != ESP_OK) {
+        free(config);
+        strlcpy(out->chat.error, "API Base URL 必须使用 https://，并建议以 /v1 结尾", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return err;
+    }
+
+    char *request_body = build_assistant_request(config, request);
+    if (!request_body) {
+        free(config);
+        strlcpy(out->chat.error, "构造 AI 助手请求 JSON 失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG,
+             "AI assistant request prepared: task=%s, history=%u, context=%u bytes, body=%u bytes",
+             request->task_type[0] ? request->task_type : "chat_assist",
+             (unsigned)(request->history ? request->history_count : 0),
+             (unsigned)strlen(request->context_json),
+             (unsigned)strlen(request_body));
+
+    char *response_body = calloc(1, AI_HTTP_RESPONSE_CAP);
+    if (!response_body) {
+        free(config);
+        free(request_body);
+        strlcpy(out->chat.error, "分配 AI 响应缓冲失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ai_http_buffer_t rx = {
+        .data = response_body,
+        .len = 0,
+        .cap = AI_HTTP_RESPONSE_CAP,
+        .overflow = false,
+    };
+    esp_http_client_config_t http_config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = (int)clamp_timeout_ms(config->timeout_ms),
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = ai_http_event_handler,
+        .user_data = &rx,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_config);
+    if (!client) {
+        free(config);
+        free(request_body);
+        free(response_body);
+        strlcpy(out->chat.error, "初始化 HTTP 客户端失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_FAIL;
+    }
+
+    char auth_header[FRIDGE_AI_MAX_API_KEY_LEN + 16] = {0};
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", config->api_key);
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_post_field(client, request_body, (int)strlen(request_body));
+
+    err = esp_http_client_perform(client);
+    out->chat.http_status = esp_http_client_get_status_code(client);
+    out->chat.latency_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+    strlcpy(out->chat.model, config->model, sizeof(out->chat.model));
+    esp_http_client_cleanup(client);
+    free(config);
+    free(request_body);
+
+    if (err != ESP_OK) {
+        snprintf(out->chat.error, sizeof(out->chat.error), "HTTP 请求失败：%s", esp_err_to_name(err));
+        set_last_error(out->chat.error);
+        free(response_body);
+        return err;
+    }
+    ESP_LOGI(TAG,
+             "AI assistant HTTP done: status=%d, response=%u bytes, latency=%lu ms",
+             out->chat.http_status,
+             (unsigned)rx.len,
+             (unsigned long)out->chat.latency_ms);
+    if (rx.overflow) {
+        strlcpy(out->chat.error, "AI 响应过长，串口测试缓冲已截断", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        free(response_body);
+        return ESP_FAIL;
+    }
+    if (out->chat.http_status < 200 || out->chat.http_status >= 300) {
+        set_http_status_error(response_body, &out->chat);
+        free(response_body);
+        return ESP_FAIL;
+    }
+
+    err = parse_chat_response(response_body, &out->chat);
     free(response_body);
     return err;
 }
