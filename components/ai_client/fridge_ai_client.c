@@ -61,10 +61,59 @@ static bool starts_with(const char *text, const char *prefix)
     return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
 }
 
+static size_t utf8_sequence_len(unsigned char ch)
+{
+    if (ch < 0x80) {
+        return 1;
+    }
+    if (ch >= 0xC2 && ch <= 0xDF) {
+        return 2;
+    }
+    if (ch >= 0xE0 && ch <= 0xEF) {
+        return 3;
+    }
+    if (ch >= 0xF0 && ch <= 0xF4) {
+        return 4;
+    }
+    return 0;
+}
+
+static bool utf8_sequence_valid(const unsigned char *p, size_t len)
+{
+    if (!p || len == 0) {
+        return false;
+    }
+    if (len == 1) {
+        return p[0] < 0x80;
+    }
+    for (size_t i = 1; i < len; i++) {
+        if ((p[i] & 0xC0) != 0x80) {
+            return false;
+        }
+    }
+    if (len == 3) {
+        if (p[0] == 0xE0 && p[1] < 0xA0) {
+            return false;
+        }
+        if (p[0] == 0xED && p[1] >= 0xA0) {
+            return false;
+        }
+    }
+    if (len == 4) {
+        if (p[0] == 0xF0 && p[1] < 0x90) {
+            return false;
+        }
+        if (p[0] == 0xF4 && p[1] > 0x8F) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static size_t json_escaped_len(const char *text)
 {
     size_t len = 0;
-    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p;) {
         switch (*p) {
         case '"':
         case '\\':
@@ -72,9 +121,23 @@ static size_t json_escaped_len(const char *text)
         case '\r':
         case '\t':
             len += 2;
+            p++;
             break;
         default:
-            len += (*p < 0x20) ? 6 : 1;
+            if (*p < 0x20) {
+                len += 6;
+                p++;
+            } else {
+                size_t seq_len = utf8_sequence_len(*p);
+                if (seq_len > 0 && utf8_sequence_valid(p, seq_len)) {
+                    len += seq_len;
+                    p += seq_len;
+                } else {
+                    // 任何非法 UTF-8 或被 strlcpy 截断的半个中文字符都替换成 '?'，避免 AI 服务拒绝 JSON。
+                    len += 1;
+                    p++;
+                }
+            }
             break;
         }
     }
@@ -90,34 +153,48 @@ static char *json_escape_alloc(const char *text)
     }
 
     char *w = out;
-    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p;) {
         switch (*p) {
         case '"':
             *w++ = '\\';
             *w++ = '"';
+            p++;
             break;
         case '\\':
             *w++ = '\\';
             *w++ = '\\';
+            p++;
             break;
         case '\n':
             *w++ = '\\';
             *w++ = 'n';
+            p++;
             break;
         case '\r':
             *w++ = '\\';
             *w++ = 'r';
+            p++;
             break;
         case '\t':
             *w++ = '\\';
             *w++ = 't';
+            p++;
             break;
         default:
             if (*p < 0x20) {
                 snprintf(w, 7, "\\u%04x", *p);
                 w += 6;
+                p++;
             } else {
-                *w++ = (char)*p;
+                size_t seq_len = utf8_sequence_len(*p);
+                if (seq_len > 0 && utf8_sequence_valid(p, seq_len)) {
+                    for (size_t i = 0; i < seq_len; i++) {
+                        *w++ = (char)*p++;
+                    }
+                } else {
+                    *w++ = '?';
+                    p++;
+                }
             }
             break;
         }
@@ -240,6 +317,32 @@ static bool json_get_string_value(const char *json, const char *key, char *out, 
     }
     out[written] = '\0';
     return true;
+}
+
+static void compact_json_preview(const char *json, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!json) {
+        return;
+    }
+
+    size_t written = 0;
+    bool last_space = false;
+    for (const unsigned char *p = (const unsigned char *)json; *p && written + 1 < out_size; p++) {
+        if (isspace(*p)) {
+            if (!last_space && written > 0) {
+                out[written++] = ' ';
+                last_space = true;
+            }
+            continue;
+        }
+        out[written++] = (char)*p;
+        last_space = false;
+    }
+    out[written] = '\0';
 }
 
 static esp_err_t open_ai_nvs(nvs_open_mode_t mode, nvs_handle_t *handle)
@@ -680,12 +783,28 @@ static esp_err_t parse_chat_response(const char *response, fridge_ai_chat_result
 static void set_http_status_error(const char *response, fridge_ai_chat_result_t *out)
 {
     char service_message[FRIDGE_AI_MAX_ERROR_LEN + 1] = {0};
-    if (response && json_get_string_value(response, "message", service_message, sizeof(service_message)) && service_message[0] != '\0') {
+    if (response) {
+        json_get_string_value(response, "message", service_message, sizeof(service_message));
+    }
+    if (response && service_message[0] == '\0') {
+        json_get_string_value(response, "error_msg", service_message, sizeof(service_message));
+    }
+    if (response && service_message[0] == '\0') {
+        json_get_string_value(response, "detail", service_message, sizeof(service_message));
+    }
+    if (response && service_message[0] == '\0') {
+        json_get_string_value(response, "error", service_message, sizeof(service_message));
+    }
+    if (response && service_message[0] == '\0') {
+        compact_json_preview(response, service_message, sizeof(service_message));
+    }
+    if (service_message[0] != '\0') {
         snprintf(out->error, sizeof(out->error), "AI HTTP %d：", out->http_status);
         strlcat(out->error, service_message, sizeof(out->error));
     } else {
         snprintf(out->error, sizeof(out->error), "AI HTTP 状态异常：%d", out->http_status);
     }
+    ESP_LOGW(TAG, "AI HTTP status error: status=%d, message=%s", out->http_status, service_message[0] ? service_message : "(empty)");
     set_last_error(out->error);
 }
 

@@ -4,6 +4,7 @@
 
 #include "fridge_ai_context.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,10 +32,37 @@ typedef struct {
     char preferences[FRIDGE_STORAGE_MAX_JSON_LEN];
     char memory[FRIDGE_STORAGE_MAX_MEMORY_LEN];
     char offline[FRIDGE_STORAGE_MAX_JSON_LEN];
+    char history_json[FRIDGE_STORAGE_MAX_JSON_LEN];
     char escaped_user[FRIDGE_AI_CONTEXT_MAX_TEXT_LEN * 2 + 1];
     char escaped_persona[512];
     char escaped_template[512];
 } ai_context_work_t;
+
+static void truncate_history_content(const char *input, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!input) {
+        return;
+    }
+
+    size_t input_len = strlen(input);
+    if (input_len + 1 <= out_size) {
+        strlcpy(out, input, out_size);
+        return;
+    }
+
+    if (out_size <= 4) {
+        strlcpy(out, input, out_size);
+        return;
+    }
+
+    size_t keep = out_size - 4;
+    memcpy(out, input, keep);
+    memcpy(out + keep, "...", 4);
+}
 
 static const char *task_template_for(const char *task_type)
 {
@@ -119,6 +147,60 @@ static void json_escape_into(const char *text, char *out, size_t out_size)
     out[used] = '\0';
 }
 
+static void build_history_preview_json(const fridge_storage_chat_history_t *history, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) {
+        return;
+    }
+    if (!history) {
+        strlcpy(out, "{\"time_ready\":false,\"count\":0,\"ttl_seconds\":172800,\"messages\":[]}", out_size);
+        return;
+    }
+
+    size_t used = 0;
+    int written = snprintf(out,
+                           out_size,
+                           "{\"time_ready\":%s,\"count\":%u,\"ttl_seconds\":%u,\"messages\":[",
+                           history->time_ready ? "true" : "false",
+                           (unsigned)history->count,
+                           (unsigned)history->ttl_seconds);
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return;
+    }
+    used = (size_t)written;
+
+    for (size_t i = 0; i < history->count && i < FRIDGE_STORAGE_MAX_CHAT_MESSAGES; i++) {
+        char history_preview[161] = {0};
+        char escaped_content[sizeof(history_preview) * 2] = {0};
+        char escaped_role[FRIDGE_STORAGE_MAX_CHAT_ROLE_LEN * 2] = {0};
+        char escaped_task_type[64] = {0};
+        const fridge_storage_chat_message_t *message = &history->messages[i];
+        truncate_history_content(message->content, history_preview, sizeof(history_preview));
+        json_escape_into(history_preview, escaped_content, sizeof(escaped_content));
+        json_escape_into(message->role, escaped_role, sizeof(escaped_role));
+        json_escape_into(message->task_type, escaped_task_type, sizeof(escaped_task_type));
+        written = snprintf(out + used,
+                           out_size - used,
+                           "%s{\"role\":\"%s\",\"content\":\"%s\",\"task_type\":\"%s\",\"created_at\":%" PRId64 "}",
+                           i == 0 ? "" : ",",
+                           escaped_role,
+                           escaped_content,
+                           escaped_task_type,
+                           message->created_at);
+        if (written < 0 || (size_t)written >= out_size - used) {
+            out[0] = '\0';
+            return;
+        }
+        used += (size_t)written;
+    }
+
+    written = snprintf(out + used, out_size - used, "]}");
+    if (written < 0 || (size_t)written >= out_size - used) {
+        out[0] = '\0';
+    }
+}
+
 bool fridge_ai_context_task_type_supported(const char *task_type)
 {
     if (!task_type || task_type[0] == '\0') {
@@ -145,16 +227,24 @@ esp_err_t fridge_ai_context_build_preview(const fridge_ai_task_request_t *reques
     strlcpy(work->preferences, "{}", sizeof(work->preferences));
     strlcpy(work->memory, "{}", sizeof(work->memory));
     strlcpy(work->offline, "{}", sizeof(work->offline));
+    strlcpy(work->history_json, "{\"time_ready\":false,\"count\":0,\"ttl_seconds\":172800,\"messages\":[]}", sizeof(work->history_json));
 
     fridge_storage_status_t status = {0};
+    fridge_storage_chat_history_t *chat_history = calloc(1, sizeof(*chat_history));
+    if (!chat_history) {
+        free(work);
+        ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "chat history allocation failed");
+    }
     esp_err_t err = fridge_storage_get_status(&status);
     if (err != ESP_OK) {
+        free(chat_history);
         free(work);
         ESP_RETURN_ON_ERROR(err, TAG, "get storage status failed");
     }
     if (request->include_inventory) {
         err = fridge_storage_get_inventory_snapshot(work->inventory, sizeof(work->inventory));
         if (err != ESP_OK) {
+            free(chat_history);
             free(work);
             ESP_RETURN_ON_ERROR(err, TAG, "get inventory failed");
         }
@@ -162,6 +252,7 @@ esp_err_t fridge_ai_context_build_preview(const fridge_ai_task_request_t *reques
     if (request->include_reminders) {
         err = fridge_storage_get_reminder_queue(work->reminders, sizeof(work->reminders));
         if (err != ESP_OK) {
+            free(chat_history);
             free(work);
             ESP_RETURN_ON_ERROR(err, TAG, "get reminders failed");
         }
@@ -169,6 +260,7 @@ esp_err_t fridge_ai_context_build_preview(const fridge_ai_task_request_t *reques
     if (request->include_preferences) {
         err = fridge_storage_get_user_preferences(work->preferences, sizeof(work->preferences));
         if (err != ESP_OK) {
+            free(chat_history);
             free(work);
             ESP_RETURN_ON_ERROR(err, TAG, "get preferences failed");
         }
@@ -176,14 +268,28 @@ esp_err_t fridge_ai_context_build_preview(const fridge_ai_task_request_t *reques
     if (request->include_memory) {
         err = fridge_storage_get_memory_summary(work->memory, sizeof(work->memory));
         if (err != ESP_OK) {
+            free(chat_history);
             free(work);
             ESP_RETURN_ON_ERROR(err, TAG, "get memory failed");
         }
     }
     err = fridge_storage_get_offline_queue_summary(work->offline, sizeof(work->offline));
     if (err != ESP_OK) {
+        free(chat_history);
         free(work);
         ESP_RETURN_ON_ERROR(err, TAG, "get offline queue failed");
+    }
+    err = fridge_storage_get_chat_history(chat_history, NULL);
+    if (err != ESP_OK) {
+        free(chat_history);
+        free(work);
+        ESP_RETURN_ON_ERROR(err, TAG, "get chat history failed");
+    }
+    build_history_preview_json(chat_history, work->history_json, sizeof(work->history_json));
+    free(chat_history);
+    if (work->history_json[0] == '\0') {
+        free(work);
+        ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "build history preview failed");
     }
 
     json_escape_into(request->user_text, work->escaped_user, sizeof(work->escaped_user));
@@ -218,6 +324,10 @@ esp_err_t fridge_ai_context_build_preview(const fridge_ai_task_request_t *reques
     ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, request->include_memory ? work->memory : "null");
     ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, ",\"offline_queue\":");
     ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, work->offline);
+    ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, ",\"conversation_history\":");
+    // 语音对话通常连续触发，完整历史会让部分 OpenAI-compatible 服务请求体过大或重复上下文而返回 400。
+    // 需要历史时仍通过 assistant_request->history 注入；上下文 JSON 里仅在 include_memory 打开时放预览。
+    ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, request->include_memory ? work->history_json : "null");
     ok = ok && append_text(out->preview_json, sizeof(out->preview_json), &used, "},\"output_policy\":{\"ai_result_must_be_confirmed\":true,\"do_not_fabricate_inventory\":true,\"do_not_store_full_chat\":true}}");
     if (!ok) {
         free(work);

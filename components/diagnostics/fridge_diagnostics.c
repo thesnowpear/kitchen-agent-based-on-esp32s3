@@ -14,11 +14,6 @@
 
 static int64_t s_boot_time_us;
 
-static const char *health_from_bool(bool ok)
-{
-    return ok ? "ok" : "offline";
-}
-
 static void format_uptime(char *buffer, size_t buffer_size)
 {
     int64_t elapsed_s = (esp_timer_get_time() - s_boot_time_us) / 1000000;
@@ -75,15 +70,15 @@ esp_err_t fridge_diagnostics_get_status(fridge_device_status_t *status)
     status->free_heap_kb = heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024;
     status->min_heap_kb = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT) / 1024;
     status->free_psram_kb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
-    status->page = net.connected ? "WIFI_CONNECTED / USB_CONSOLE" : "PROVISIONING / USB_CONSOLE";
+    status->page = net.connected ? "WIFI_CONNECTED / USB_CONSOLE" : (net.connecting ? "WIFI_CONNECTING / USB_CONSOLE" : "PROVISIONING / USB_CONSOLE");
     status->power_note = "Wi-Fi 发射有电流峰值；调试时请确认 USB/5V 供电稳定，避免 brownout。";
-    status->wifi_health = health_from_bool(net.connected);
+    status->wifi_health = net.connected ? "ok" : (net.connecting ? "warn" : "offline");
     status->mqtt_health = "offline";
     status->usb_health = "ok";
     status->ota_health = "warn";
     set_task_snapshot(&status->tasks[0], "main_task", "高", "running", "boot");
     set_task_snapshot(&status->tasks[1], "usb_protocol", "中", "running", "stdin");
-    set_task_snapshot(&status->tasks[2], "wifi", "中", net.connected ? "connected" : "idle", net.ip);
+    set_task_snapshot(&status->tasks[2], "wifi", "中", net.connected ? "connected" : (net.connecting ? "connecting" : "idle"), net.ip);
     status->task_count = 3;
     return ESP_OK;
 }

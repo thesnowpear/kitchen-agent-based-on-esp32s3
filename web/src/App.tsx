@@ -9,6 +9,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LockKeyhole,
+  Mic,
   Play,
   Plus,
   Power,
@@ -30,12 +31,13 @@ import { MockTransport } from "./transports/MockTransport";
 import { WebSerialTransport } from "./transports/WebSerialTransport";
 import type {
   AIAssistantChatResponse,
-  AIAssistantHistoryItem,
   AIChatMessage,
   AIConfig,
   AIContextPreview,
   AIProfilesResponse,
+  ASRConfig,
   ConnectionState,
+  DeviceChatHistory,
   DeviceCommand,
   DeviceLog,
   DeviceStatus,
@@ -50,6 +52,8 @@ import type {
   SectionDefinition,
   SensorSnapshot,
   TransportMode,
+  VoiceChatResponse,
+  VoiceChatStatus,
   WifiNetwork,
 } from "./types";
 
@@ -58,6 +62,7 @@ const sections: SectionDefinition[] = [
   { id: "usb", label: "USB 连接", icon: Cable },
   { id: "network", label: "网络配置", icon: Wifi },
   { id: "ai", label: "AI 助手", icon: Sparkles },
+  { id: "mic", label: "麦克风测试", icon: Mic },
   { id: "pins", label: "GPIO/引脚", icon: Cpu },
   { id: "sensors", label: "传感器", icon: Activity },
   { id: "logs", label: "日志", icon: Terminal },
@@ -79,6 +84,16 @@ const defaultAiConfig: AIConfig = {
   model: "gpt-4o-mini",
   systemPrompt: "你是冰箱小精灵的开发测试助手，请用简短中文回答。",
   timeoutMs: 30000,
+  hasApiKey: false,
+  apiKeyPreview: "",
+  lastError: "",
+  ready: false,
+};
+
+const defaultAsrConfig: ASRConfig = {
+  apiBaseUrl: "https://api.siliconflow.cn/v1/audio/transcriptions",
+  model: "TeleAI/TeleSpeechASR",
+  timeoutMs: 45000,
   hasApiKey: false,
   apiKeyPreview: "",
   lastError: "",
@@ -115,7 +130,29 @@ const nowTime = () =>
     second: "2-digit",
   }).format(new Date());
 
+const formatHistoryTime = (createdAt: number) => {
+  if (!createdAt) {
+    return "--:--:--";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(createdAt * 1000));
+};
+
+const deviceHistoryToChatMessages = (history: DeviceChatHistory): AIChatMessage[] =>
+  history.messages.map((message, index) => ({
+    id: message.id || `device-history-${message.createdAt}-${index}`,
+    role: message.role === "assistant" ? "assistant" : "user",
+    content: message.content,
+    at: formatHistoryTime(message.createdAt),
+    status: "ok",
+  }));
+
 const toErrorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
 const toNetworkErrorMessage = (error: unknown) => {
   const message = toErrorMessage(error);
@@ -156,11 +193,21 @@ function App() {
   const [aiConfig, setAiConfig] = useState<AIConfig | null>(null);
   const [aiProfiles, setAiProfiles] = useState<AIConfig[]>([]);
   const [aiKeyInput, setAiKeyInput] = useState("");
+  const [asrConfig, setAsrConfig] = useState<ASRConfig | null>(defaultAsrConfig);
+  const [asrKeyInput, setAsrKeyInput] = useState("");
+  const [voiceStatus, setVoiceStatus] = useState<VoiceChatStatus | null>(null);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [micTestMode, setMicTestMode] = useState<"idle" | "hardware" | "asr">("idle");
+  const [micSamples, setMicSamples] = useState<VoiceChatStatus[]>([]);
+  const [micTranscript, setMicTranscript] = useState("");
+  const [micAiReply, setMicAiReply] = useState("");
+  const [micAsrResult, setMicAsrResult] = useState<VoiceChatResponse | null>(null);
   const [aiChatDraft, setAiChatDraft] = useState("");
   const [aiMessages, setAiMessages] = useState<AIChatMessage[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
   const [projectAiRequest, setProjectAiRequest] = useState<ProjectAITaskRequest>(defaultProjectAiRequest);
   const [aiContextPreview, setAiContextPreview] = useState<AIContextPreview | null>(null);
+  const [deviceChatHistory, setDeviceChatHistory] = useState<DeviceChatHistory | null>(null);
   const [memorySummary, setMemorySummary] = useState<MemorySummary | null>(null);
   const [memoryDraft, setMemoryDraft] = useState(JSON.stringify({
     schema_version: 1,
@@ -188,6 +235,7 @@ function App() {
   const staticInfoLoadedRef = useRef(false);
   const networkDirtyRef = useRef(false);
   const aiConfigDirtyRef = useRef(false);
+  const asrConfigDirtyRef = useRef(false);
 
   const appendLog = useCallback((level: LogLevel, message: string, source = "web") => {
     setLogs((current) => [
@@ -206,6 +254,10 @@ function App() {
     ].slice(0, 180));
   }, []);
 
+  const pushMicSample = useCallback((sample: VoiceChatStatus) => {
+    setMicSamples((current) => [...current.slice(-29), sample]);
+  }, []);
+
   const createTransport = useCallback(() => {
     return transportMode === "mock" ? new MockTransport() : new WebSerialTransport(timeoutMs);
   }, [timeoutMs, transportMode]);
@@ -217,11 +269,16 @@ function App() {
     setAiConfig(null);
     setAiProfiles([]);
     setAiKeyInput("");
+    setAsrConfig(defaultAsrConfig);
+    setAsrKeyInput("");
+    setVoiceStatus(null);
+    setVoiceBusy(false);
     setAiChatDraft("");
     setAiMessages([]);
     setAiBusy(false);
     setProjectAiRequest(defaultProjectAiRequest);
     setAiContextPreview(null);
+    setDeviceChatHistory(null);
     setMemorySummary(null);
     setMemoryDraft(JSON.stringify({
       schema_version: 1,
@@ -244,6 +301,7 @@ function App() {
     staticInfoLoadedRef.current = false;
     networkDirtyRef.current = false;
     aiConfigDirtyRef.current = false;
+    asrConfigDirtyRef.current = false;
     setSearchTerm("");
     setLogFilter("all");
   }, []);
@@ -256,6 +314,11 @@ function App() {
   const setAiConfigDraft = useCallback((next: AIConfig) => {
     aiConfigDirtyRef.current = true;
     setAiConfig(next);
+  }, []);
+
+  const setAsrConfigDraft = useCallback((next: ASRConfig) => {
+    asrConfigDirtyRef.current = true;
+    setAsrConfig(next);
   }, []);
 
   const changeTransportMode = useCallback(
@@ -312,6 +375,10 @@ function App() {
       });
       await optionalRead<SensorSnapshot>("get_sensors", "传感器状态", setSensors);
 
+      await optionalRead<ASRConfig>("get_asr_config", "ASR API config", (payload) => {
+        setAsrConfig((current) => (asrConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
+      });
+
       if (shouldReadStatic) {
         await optionalRead<PinInfo[]>("get_pins", "GPIO 信息", setPins);
         await optionalRead<DiagnosticSnapshot>("get_diagnostics", "诊断信息", setDiagnostics);
@@ -347,6 +414,10 @@ function App() {
 
     try {
       await transport.connect();
+      if (transportMode === "serial") {
+        setConnectionNotice("USB 串口已打开，等待开发板复位后启动协议任务...");
+        await sleep(1800);
+      }
       setConnection("connected");
       setConnectionNotice("");
       appendLog("info", transportMode === "mock" ? "已进入 Mock 运维模式。" : "已连接 USB 串口。");
@@ -491,6 +562,52 @@ function App() {
     }
   };
 
+  const saveAsrConfig = async () => {
+    const transport = transportRef.current;
+    const current = asrConfig ?? defaultAsrConfig;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再保存 ASR 配置。", "asr");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<ASRConfig>("set_asr_config", {
+        apiBaseUrl: current.apiBaseUrl.trim(),
+        apiKey: asrKeyInput.trim(),
+        model: current.model.trim(),
+        timeoutMs: current.timeoutMs,
+      });
+      asrConfigDirtyRef.current = false;
+      setAsrConfig(response.payload);
+      setAsrKeyInput("");
+      appendLog("info", "ASR 配置已保存，Key 不会从设备回显。", "asr");
+    } catch (error) {
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const clearAsrKey = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再清除 ASR Key。", "asr");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<ASRConfig>("clear_asr_key");
+      asrConfigDirtyRef.current = false;
+      setAsrConfig(response.payload);
+      setAsrKeyInput("");
+      appendLog("warn", "ASR Key 已清除。", "asr");
+    } catch (error) {
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
   const refreshAiProfiles = useCallback(async () => {
     const transport = transportRef.current;
     if (!transport || connection !== "connected") {
@@ -572,17 +689,9 @@ function App() {
       return;
     }
     if (!transport || connection !== "connected") {
-      appendLog("warn", "请先连接 Mock 或 USB 设备，再使用 AI 助手。", "ai");
+      appendLog("warn", "请先连接 Mock 或 USB 设备，再发送 AI 对话。", "ai");
       return;
     }
-
-    const history: AIAssistantHistoryItem[] = aiMessages
-      .filter((item) => item.status !== "pending" && item.content.trim().length > 0)
-      .slice(-12)
-      .map((item) => ({
-        role: item.role,
-        content: item.content.slice(0, 512),
-      }));
 
     const userMessage: AIChatMessage = {
       id: crypto.randomUUID(),
@@ -595,7 +704,7 @@ function App() {
     const pendingMessage: AIChatMessage = {
       id: pendingId,
       role: "assistant",
-      content: "正在让设备注入项目上下文并请求真实 AI API...",
+      content: "正在整理上下文并请求 AI API...",
       at: nowTime(),
       status: "pending",
     };
@@ -609,24 +718,34 @@ function App() {
         ...projectAiRequest,
         message,
         userText: message,
-        history,
       };
       const preview = await transport.sendCommand<AIContextPreview>("get_ai_context_preview", request);
       setAiContextPreview(preview.payload);
       const response = await transport.sendCommand<AIAssistantChatResponse>("ai_assistant_chat", request);
-      setAiMessages((current) =>
-        current.map((item) =>
-          item.id === pendingId
-            ? {
-                ...item,
-                content: response.payload.reply,
-                status: "ok",
-                latencyMs: response.payload.latencyMs,
-              }
-            : item,
-        ),
+      const historyResponse = await transport.sendCommand<DeviceChatHistory>("get_chat_history").catch(() => null);
+      if (historyResponse) {
+        setDeviceChatHistory(historyResponse.payload);
+        setAiMessages(deviceHistoryToChatMessages(historyResponse.payload));
+      }
+      if (!historyResponse) {
+        setAiMessages((current) =>
+          current.map((item) =>
+            item.id === pendingId
+              ? {
+                  ...item,
+                  content: response.payload.reply,
+                  status: "ok",
+                  latencyMs: response.payload.latencyMs,
+                }
+              : item,
+          ),
+        );
+      }
+      appendLog(
+        "info",
+        `AI 助手已完成 ${projectAiTaskLabels[response.payload.taskType]}，模型 ${response.payload.model}，耗时 ${response.payload.latencyMs} ms，注入历史 ${response.payload.historyCount} 条。`,
+        "ai",
       );
-      appendLog("info", `AI 助手完成：${projectAiTaskLabels[response.payload.taskType]}，模型 ${response.payload.model}，耗时 ${response.payload.latencyMs} ms。`, "ai");
     } catch (error) {
       setAiMessages((current) =>
         current.map((item) =>
@@ -643,6 +762,214 @@ function App() {
     } finally {
       commandInFlightRef.current = false;
       setAiBusy(false);
+    }
+  };
+  const refreshDeviceChatHistory = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接 Mock 或 USB 设备，再读取设备会话历史。", "ai_context");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<DeviceChatHistory>("get_chat_history");
+      setDeviceChatHistory(response.payload);
+      setAiMessages(deviceHistoryToChatMessages(response.payload));
+      appendLog("info", `已读取设备会话历史：${response.payload.count} 条。`, "ai_context");
+    } catch (error) {
+      appendLog("error", String(error), "ai_context");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  }, [appendLog, connection]);
+
+  const clearDeviceChatHistory = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接 Mock 或 USB 设备，再清空设备会话历史。", "ai_context");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<DeviceChatHistory>("clear_chat_history");
+      setDeviceChatHistory(response.payload);
+      setAiMessages([]);
+      appendLog("warn", "设备会话历史已清空，对话窗口也已同步清空。", "ai_context");
+    } catch (error) {
+      appendLog("error", String(error), "ai_context");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const toggleVoiceChat = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再使用语音对话。", "asr");
+      return;
+    }
+    if (voiceBusy || aiBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "asr");
+      return;
+    }
+
+    const recording = voiceStatus?.state === "recording";
+    if (recording && micTestMode !== "asr") {
+      appendLog("warn", "当前正在进行麦克风硬件测试，请先到“麦克风测试”页停止硬件录音。", "asr");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setVoiceBusy(true);
+      if (!recording) {
+        setMicTestMode("asr");
+        setMicTranscript("");
+        setMicAiReply("");
+        setMicAsrResult(null);
+        const response = await transport.sendCommand<VoiceChatStatus>("voice_chat_start");
+        setVoiceStatus(response.payload);
+        pushMicSample(response.payload);
+        appendLog("info", "语音录音已开始。", "asr");
+        return;
+      }
+
+      const pendingId = crypto.randomUUID();
+      const pendingMessage: AIChatMessage = {
+        id: pendingId,
+        role: "assistant",
+        content: "正在转文字并请求 AI...",
+        at: nowTime(),
+        status: "pending",
+      };
+      setAiMessages((current) => [...current, pendingMessage].slice(-18));
+      const response = await transport.sendCommand<VoiceChatResponse>("voice_chat_stop");
+      setVoiceStatus({
+        state: "ready",
+        durationMs: 0,
+        pcmBytes: response.payload.audioBytes,
+        rms: 0,
+        sampleCount: Math.max(0, Math.floor((response.payload.audioBytes - 44) / 2)),
+        peakAbs: 0,
+        minSample: 0,
+        maxSample: 0,
+        meanSample: 0,
+        clipCount: 0,
+        timeoutCount: 0,
+        qualityHint: "ok",
+        error: "",
+      });
+      setMicTestMode("idle");
+      setMicTranscript(response.payload.transcript);
+      setMicAiReply(response.payload.reply);
+      setMicAsrResult(response.payload);
+      const voiceUserMessage: AIChatMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: response.payload.transcript,
+        at: nowTime(),
+        status: "ok",
+      };
+      const voiceAssistantMessage: AIChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: response.payload.reply,
+        at: nowTime(),
+        status: "ok",
+        latencyMs: response.payload.asrLatencyMs + response.payload.aiLatencyMs,
+      };
+      setAiMessages((current) => [
+        ...current.filter((item) => item.id !== pendingId),
+        voiceUserMessage,
+        voiceAssistantMessage,
+      ].slice(-18));
+      const historyResponse = await transport.sendCommand<DeviceChatHistory>("get_chat_history").catch(() => null);
+      if (historyResponse) {
+        setDeviceChatHistory(historyResponse.payload);
+      }
+      appendLog("info", `语音对话完成：ASR ${response.payload.asrLatencyMs} ms / AI ${response.payload.aiLatencyMs} ms。`, "asr");
+    } catch (error) {
+      setAiMessages((current) => current.map((item) => item.status === "pending" ? { ...item, content: String(error), status: "error" } : item));
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+      setVoiceBusy(false);
+    }
+  };
+
+  const startMicHardwareTest = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再测试麦克风。", "asr");
+      return;
+    }
+    if (voiceBusy || aiBusy || commandInFlightRef.current || voiceStatus?.state === "recording") {
+      appendLog("warn", "录音或设备命令正在进行，请稍后再试。", "asr");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setVoiceBusy(true);
+      setMicTestMode("hardware");
+      setMicSamples([]);
+      setMicTranscript("");
+      setMicAiReply("");
+      setMicAsrResult(null);
+      const response = await transport.sendCommand<VoiceChatStatus>("mic_record_start");
+      setVoiceStatus(response.payload);
+      pushMicSample(response.payload);
+      appendLog("info", "麦克风硬件录音测试已开始。", "asr");
+    } catch (error) {
+      setMicTestMode("idle");
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+      setVoiceBusy(false);
+    }
+  };
+
+  const refreshMicHardwareStatus = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      return;
+    }
+    if (commandInFlightRef.current) {
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<VoiceChatStatus>("mic_record_status");
+      setVoiceStatus(response.payload);
+      pushMicSample(response.payload);
+    } catch (error) {
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const stopMicHardwareTest = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再停止麦克风测试。", "asr");
+      return;
+    }
+    if (voiceBusy || aiBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "asr");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setVoiceBusy(true);
+      const response = await transport.sendCommand<VoiceChatStatus>("mic_record_stop");
+      setVoiceStatus(response.payload);
+      pushMicSample(response.payload);
+      setMicTestMode("idle");
+      appendLog("info", "麦克风硬件录音测试已停止，未触发 ASR/AI。", "asr");
+    } catch (error) {
+      appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+      setVoiceBusy(false);
     }
   };
 
@@ -786,8 +1113,19 @@ function App() {
   useEffect(() => {
     if (connection === "connected" && activeSection === "ai") {
       refreshAiProfiles().catch((error) => appendLog("warn", `AI API 配置列表读取失败：${toErrorMessage(error)}`, "web"));
+      refreshDeviceChatHistory().catch((error) => appendLog("warn", `设备会话历史读取失败：${toErrorMessage(error)}`, "web"));
     }
-  }, [activeSection, appendLog, connection, refreshAiProfiles]);
+  }, [activeSection, appendLog, connection, refreshAiProfiles, refreshDeviceChatHistory]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "mic" || micTestMode !== "hardware" || voiceStatus?.state !== "recording") {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshMicHardwareStatus();
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [activeSection, connection, micTestMode, voiceStatus?.state]);
 
   useEffect(() => {
     if (connection !== "connected") {
@@ -973,6 +1311,13 @@ function App() {
             setAiConfig={setAiConfigDraft}
             apiKeyInput={aiKeyInput}
             setApiKeyInput={setAiKeyInput}
+            asrConfig={asrConfig}
+            setAsrConfig={setAsrConfigDraft}
+            asrKeyInput={asrKeyInput}
+            setAsrKeyInput={setAsrKeyInput}
+            voiceStatus={voiceStatus}
+            voiceBusy={voiceBusy}
+            micTestMode={micTestMode}
             messages={aiMessages}
             draft={aiChatDraft}
             setDraft={setAiChatDraft}
@@ -981,21 +1326,45 @@ function App() {
             setProjectRequest={setProjectAiRequest}
             contextPreview={aiContextPreview}
             projectBusy={projectAiBusy}
+            deviceChatHistory={deviceChatHistory}
             memorySummary={memorySummary}
             memoryDraft={memoryDraft}
             setMemoryDraft={setMemoryDraft}
             saveAiConfig={saveAiConfig}
             clearAiKey={clearAiKey}
+            saveAsrConfig={saveAsrConfig}
+            clearAsrKey={clearAsrKey}
             createAiProfile={createAiProfile}
             selectAiProfile={selectAiProfile}
             deleteAiProfile={deleteAiProfile}
             sendAiChat={sendAiChat}
+            toggleVoiceChat={toggleVoiceChat}
             clearMessages={clearAiMessages}
             previewContext={previewProjectAiContext}
             runMockTask={runProjectAiTask}
+            refreshDeviceHistory={refreshDeviceChatHistory}
+            clearDeviceHistory={clearDeviceChatHistory}
             refreshMemory={refreshMemorySummary}
             saveMemory={saveMemorySummary}
             clearMemory={clearMemorySummary}
+          />
+        );
+      case "mic":
+        return (
+          <MicrophoneTestPanel
+            connection={connection}
+            asrConfig={asrConfig}
+            voiceStatus={voiceStatus}
+            voiceBusy={voiceBusy}
+            micTestMode={micTestMode}
+            micSamples={micSamples}
+            micTranscript={micTranscript}
+            micAiReply={micAiReply}
+            micAsrResult={micAsrResult}
+            startHardwareTest={startMicHardwareTest}
+            stopHardwareTest={stopMicHardwareTest}
+            refreshHardwareStatus={refreshMicHardwareStatus}
+            toggleVoiceChat={toggleVoiceChat}
           />
         );
       case "pins":
@@ -1040,6 +1409,7 @@ function Overview({
   diagnostics: DiagnosticSnapshot | null;
   logs: DeviceLog[];
 }) {
+  const lightValue = sensors?.lightValue10bit ?? sensors?.lux;
   return (
     <div className="section-flow">
       <div className="section-heading">
@@ -1064,7 +1434,7 @@ function Overview({
       <div className="two-column">
         <KeyValue title="传感器摘要" rows={[
           ["门状态", sensors?.doorState ?? "--"],
-          ["光照", sensors ? `${sensors.lux} lux` : "--"],
+          ["亮度", sensors ? `${lightValue} / 1023` : "--"],
           ["PIR", sensors?.pir ? "触发" : "未触发"],
           ["更新时间", sensors?.updatedAt ?? "--"],
         ]} />
@@ -1303,6 +1673,13 @@ function AiPanel({
   setAiConfig,
   apiKeyInput,
   setApiKeyInput,
+  asrConfig,
+  setAsrConfig,
+  asrKeyInput,
+  setAsrKeyInput,
+  voiceStatus,
+  voiceBusy,
+  micTestMode,
   messages,
   draft,
   setDraft,
@@ -1311,18 +1688,24 @@ function AiPanel({
   setProjectRequest,
   contextPreview,
   projectBusy,
+  deviceChatHistory,
   memorySummary,
   memoryDraft,
   setMemoryDraft,
   saveAiConfig,
   clearAiKey,
+  saveAsrConfig,
+  clearAsrKey,
   createAiProfile,
   selectAiProfile,
   deleteAiProfile,
   sendAiChat,
+  toggleVoiceChat,
   clearMessages,
   previewContext,
   runMockTask,
+  refreshDeviceHistory,
+  clearDeviceHistory,
   refreshMemory,
   saveMemory,
   clearMemory,
@@ -1333,6 +1716,13 @@ function AiPanel({
   setAiConfig: (config: AIConfig) => void;
   apiKeyInput: string;
   setApiKeyInput: (value: string) => void;
+  asrConfig: ASRConfig | null;
+  setAsrConfig: (config: ASRConfig) => void;
+  asrKeyInput: string;
+  setAsrKeyInput: (value: string) => void;
+  voiceStatus: VoiceChatStatus | null;
+  voiceBusy: boolean;
+  micTestMode: "idle" | "hardware" | "asr";
   messages: AIChatMessage[];
   draft: string;
   setDraft: (value: string) => void;
@@ -1341,25 +1731,35 @@ function AiPanel({
   setProjectRequest: (request: ProjectAITaskRequest) => void;
   contextPreview: AIContextPreview | null;
   projectBusy: boolean;
+  deviceChatHistory: DeviceChatHistory | null;
   memorySummary: MemorySummary | null;
   memoryDraft: string;
   setMemoryDraft: (value: string) => void;
   saveAiConfig: (event: FormEvent<HTMLFormElement>) => void;
   clearAiKey: () => Promise<void>;
+  saveAsrConfig: () => Promise<void>;
+  clearAsrKey: () => Promise<void>;
   createAiProfile: () => Promise<void>;
   selectAiProfile: (profileId: number) => Promise<void>;
   deleteAiProfile: (profileId: number) => Promise<void>;
   sendAiChat: (event?: FormEvent<HTMLFormElement>) => Promise<void>;
+  toggleVoiceChat: () => Promise<void>;
   clearMessages: () => void;
   previewContext: () => Promise<void>;
   runMockTask: () => Promise<void>;
+  refreshDeviceHistory: () => Promise<void>;
+  clearDeviceHistory: () => Promise<void>;
   refreshMemory: () => Promise<void>;
   saveMemory: () => Promise<void>;
   clearMemory: () => Promise<void>;
 }) {
   const current = aiConfig ?? defaultAiConfig;
+  const currentAsr = asrConfig ?? defaultAsrConfig;
   const update = (patch: Partial<AIConfig>) => {
     setAiConfig({ ...current, ...patch });
+  };
+  const updateAsr = (patch: Partial<ASRConfig>) => {
+    setAsrConfig({ ...currentAsr, ...patch });
   };
   const updateProject = (patch: Partial<ProjectAITaskRequest>) => {
     setProjectRequest({ ...projectRequest, ...patch });
@@ -1368,7 +1768,10 @@ function AiPanel({
   const systemPromptBytes = utf8ByteLength(current.systemPrompt);
   const systemPromptTooLong = systemPromptBytes > AI_SYSTEM_PROMPT_MAX_BYTES;
   const contextBytes = utf8ByteLength(JSON.stringify(contextPreview?.context ?? {}, null, 2));
+  const historyBytes = utf8ByteLength(JSON.stringify(deviceChatHistory ?? {}, null, 2));
   const memoryBytes = utf8ByteLength(memoryDraft);
+  const voiceRecording = voiceStatus?.state === "recording";
+  const voiceFromHardwareTest = voiceRecording && micTestMode === "hardware";
 
   return (
     <div className="section-flow">
@@ -1378,13 +1781,13 @@ function AiPanel({
           <h2>AI 助手</h2>
         </div>
         <StatusPill state={current.ready ? "ok" : current.hasApiKey ? "warn" : "offline"}>
-          {busy ? "请求中" : current.ready ? "可对话" : current.hasApiKey ? "待补配置" : "未保存 Key"}
+          {busy ? "对话中" : current.ready ? "已就绪" : current.hasApiKey ? "待测试" : "缺少 Key"}
         </StatusPill>
       </div>
 
       <div className="warning-line">
         <Info size={16} />
-        这里已经合并为真实项目助手：每次发送会携带所选任务、最近对话和勾选的项目上下文；API Key 仍只用于开发期设备直连测试。
+        这里是开发调试入口。真实上下文注入、短期会话历史和测试记忆都由开发板负责，Web 面板只做配置、预览和调试。
       </div>
 
       <div className="ai-assistant-grid">
@@ -1393,19 +1796,27 @@ function AiPanel({
             <div className="ai-chat-head">
               <div>
                 <h3>真实上下文对话</h3>
-                <p>发送时会调用设备端 `ai_assistant_chat`，注入最近 6 轮对话和当前项目上下文。</p>
+                <p>发送后会调用 `ai_assistant_chat`，由开发板注入库存、提醒、偏好、记忆和 48 小时内最多 15 轮设备侧会话历史。</p>
               </div>
               <div className="button-row compact">
-                <button className="action-button secondary" type="button" disabled={messages.length === 0 || busy} onClick={clearMessages}>
-                  清空对话
+                <button className="action-button secondary" type="button" disabled={!connected || busy} onClick={() => void refreshDeviceHistory()}>
+                  加载设备历史
                 </button>
-                <StatusPill state={busy ? "warn" : current.ready ? "ok" : "offline"}>{busy ? "请求中" : current.ready ? "就绪" : "待配置"}</StatusPill>
+                <button className="action-button secondary" type="button" disabled={messages.length === 0 || busy} onClick={clearMessages}>
+                  清空窗口
+                </button>
+                <button className="action-button secondary danger-soft" type="button" disabled={!connected || busy} onClick={() => void clearDeviceHistory()}>
+                  清空设备历史
+                </button>
+                <StatusPill state={busy ? "warn" : current.ready ? "ok" : "offline"}>
+                  {busy ? "等待中" : current.ready ? "在线" : "未就绪"}
+                </StatusPill>
               </div>
             </div>
             <div className="ai-chat-stream">
               {messages.map((message) => (
                 <div className={`ai-message ${message.role} ${message.status ?? "ok"}`} key={message.id}>
-                  <span>{message.role === "user" ? "我" : "AI"}</span>
+                  <span>{message.role === "user" ? "?" : "AI"}</span>
                   <p>{message.content}</p>
                   <small>{message.at}{message.latencyMs ? ` / ${message.latencyMs} ms` : ""}</small>
                 </div>
@@ -1414,7 +1825,7 @@ function AiPanel({
                 <div className="ai-chat-empty">
                   <Bot size={22} />
                   <strong>还没有对话</strong>
-                  <span>可以问：“今晚用快过期的食材做什么？”或“根据当前库存生成购物清单”。</span>
+                  <span>先配置可用的 API，再试试“今晚用快过期食材做什么”这类真实问题。</span>
                 </div>
               )}
             </div>
@@ -1423,13 +1834,30 @@ function AiPanel({
                 value={draft}
                 maxLength={512}
                 rows={3}
-                placeholder="输入给冰箱小精灵的问题，最多 512 字符"
+                placeholder="输入一条消息，最多 512 个字符"
                 onChange={(event) => setDraft(event.target.value)}
               />
+              <button
+                className={voiceRecording ? "action-button danger-soft" : "action-button secondary"}
+                type="button"
+                disabled={!connected || busy || voiceBusy || voiceFromHardwareTest}
+                onClick={() => void toggleVoiceChat()}
+                title={voiceFromHardwareTest ? "硬件录音测试请到麦克风测试页停止" : voiceRecording ? "stop voice recording" : "start voice recording"}
+              >
+                <Mic size={17} />
+                {voiceFromHardwareTest ? "硬件测试中" : voiceRecording ? "停止" : "语音"}
+              </button>
               <button className="action-button" type="submit" disabled={!connected || busy || draft.trim().length === 0}>
                 <Send size={17} />
                 发送
               </button>
+            </div>
+            <div className="form-hint">
+              Voice: {voiceStatus?.state ?? "idle"} / {voiceStatus?.durationMs ?? 0} ms / rms {voiceStatus?.rms ?? 0}
+              {" / "}peak {voiceStatus?.peakAbs ?? 0}
+              {" / "}range {voiceStatus?.minSample ?? 0}..{voiceStatus?.maxSample ?? 0}
+              {" / "}timeout {voiceStatus?.timeoutCount ?? 0}
+              {" / "}hint {voiceStatus?.qualityHint ?? "idle"}。更详细的采样诊断请到“麦克风测试”页。
             </div>
           </form>
 
@@ -1440,15 +1868,34 @@ function AiPanel({
                 {contextPreview ? `${contextBytes} bytes` : "未生成"}
               </StatusPill>
             </div>
-            <pre className="json-preview tall">{JSON.stringify(contextPreview?.context ?? { note: "点击“预览上下文”查看本次对话会注入哪些数据。" }, null, 2)}</pre>
+            <pre className="json-preview tall">{JSON.stringify(contextPreview?.context ?? { note: "点击右侧“预览上下文”后，这里会显示开发板将注入给模型的数据。" }, null, 2)}</pre>
+          </div>
+
+          <div className="project-ai-card">
+            <div className="ai-chat-head compact-head">
+              <h3>设备会话历史</h3>
+              <StatusPill state={deviceChatHistory ? "ok" : "offline"}>
+                {deviceChatHistory ? `${Math.floor(deviceChatHistory.count / 2)}/${Math.floor(deviceChatHistory.maxMessages / 2)} 轮` : "未读取"}
+              </StatusPill>
+            </div>
+            <pre className="json-preview tall">{JSON.stringify(deviceChatHistory ?? { note: "这里显示开发板本地保存的短期会话历史，超过 48 小时或超出 15 轮上限会自动裁剪。" }, null, 2)}</pre>
+            <div className="button-row">
+              <button className="action-button secondary" type="button" disabled={!connected} onClick={() => void refreshDeviceHistory()}>
+                刷新历史
+              </button>
+              <button className="action-button secondary danger-soft" type="button" disabled={!connected} onClick={() => void clearDeviceHistory()}>
+                清空历史
+              </button>
+              <span className="form-hint">{historyBytes} bytes</span>
+            </div>
           </div>
         </div>
 
         <aside className="section-flow">
           <form className="project-ai-card" onSubmit={(event) => { event.preventDefault(); void previewContext(); }}>
             <div className="ai-chat-head compact-head">
-              <h3>任务与上下文</h3>
-              <StatusPill state={projectBusy ? "warn" : connected ? "ok" : "offline"}>{projectBusy ? "生成中" : "可配置"}</StatusPill>
+              <h3>任务与注入</h3>
+              <StatusPill state={projectBusy ? "warn" : connected ? "ok" : "offline"}>{projectBusy ? "处理中" : "可调试"}</StatusPill>
             </div>
             <label>
               <span>任务类型</span>
@@ -1459,10 +1906,10 @@ function AiPanel({
               </select>
             </label>
             <div className="context-toggle-grid">
-              <label><input type="checkbox" checked={projectRequest.includeInventory} onChange={(event) => updateProject({ includeInventory: event.target.checked })} />库存快照</label>
-              <label><input type="checkbox" checked={projectRequest.includeReminders} onChange={(event) => updateProject({ includeReminders: event.target.checked })} />临期提醒</label>
-              <label><input type="checkbox" checked={projectRequest.includePreferences} onChange={(event) => updateProject({ includePreferences: event.target.checked })} />用户偏好</label>
-              <label><input type="checkbox" checked={projectRequest.includeMemory} onChange={(event) => updateProject({ includeMemory: event.target.checked })} />硬件测试记忆</label>
+              <label><input type="checkbox" checked={projectRequest.includeInventory} onChange={(event) => updateProject({ includeInventory: event.target.checked })} />库存</label>
+              <label><input type="checkbox" checked={projectRequest.includeReminders} onChange={(event) => updateProject({ includeReminders: event.target.checked })} />提醒</label>
+              <label><input type="checkbox" checked={projectRequest.includePreferences} onChange={(event) => updateProject({ includePreferences: event.target.checked })} />偏好</label>
+              <label><input type="checkbox" checked={projectRequest.includeMemory} onChange={(event) => updateProject({ includeMemory: event.target.checked })} />记忆</label>
             </div>
             <div className="button-row">
               <button className="action-button secondary" type="submit" disabled={!connected || projectBusy}>
@@ -1471,7 +1918,7 @@ function AiPanel({
               </button>
               <button className="action-button secondary" type="button" disabled={!connected || projectBusy} onClick={() => void runMockTask()}>
                 <Play size={17} />
-                Mock 结构化
+                Mock 任务
               </button>
             </div>
           </form>
@@ -1480,15 +1927,15 @@ function AiPanel({
             <div className="ai-chat-head compact-head">
               <h3>AI 设置</h3>
               <StatusPill state={current.ready ? "ok" : current.hasApiKey ? "warn" : "offline"}>
-                {current.ready ? "已就绪" : "待配置"}
+                {current.ready ? "可调用" : "待配置"}
               </StatusPill>
             </div>
             <div className="ai-profile-bar compact-card">
               <div className="ai-profile-head">
-                <strong>配置列表</strong>
+                <strong>配置槽</strong>
                 <button className="action-button secondary" type="button" disabled={!connected || aiProfiles.length >= 5} onClick={() => void createAiProfile()}>
                   <Plus size={17} />
-                  添加
+                  新增
                 </button>
               </div>
               <div className="ai-profile-list">
@@ -1520,7 +1967,7 @@ function AiPanel({
                 <input value={current.apiBaseUrl} placeholder="https://api.openai.com/v1" inputMode="url" required onChange={(event) => update({ apiBaseUrl: event.target.value })} />
               </label>
               <label>
-                <span>模型名</span>
+                <span>模型</span>
                 <input value={current.model} placeholder="gpt-4o-mini" required onChange={(event) => update({ model: event.target.value })} />
               </label>
               <label>
@@ -1528,14 +1975,14 @@ function AiPanel({
                 <input
                   type="password"
                   value={apiKeyInput}
-                  placeholder={current.hasApiKey ? `保持现有 Key：${current.apiKeyPreview || "已保存"}` : "保存到开发板 NVS"}
+                  placeholder={current.hasApiKey ? `当前已保存 Key：${current.apiKeyPreview || "已脱敏"}` : "输入后保存到设备 NVS"}
                   maxLength={256}
                   autoComplete="new-password"
                   onChange={(event) => setApiKeyInput(event.target.value)}
                 />
               </label>
               <label>
-                <span>请求超时 ms</span>
+                <span>超时时间 ms</span>
                 <input type="number" min={5000} max={45000} value={current.timeoutMs} onChange={(event) => update({ timeoutMs: Number(event.target.value) })} />
               </label>
             </div>
@@ -1545,21 +1992,21 @@ function AiPanel({
                 value={current.systemPrompt}
                 rows={4}
                 aria-invalid={systemPromptTooLong}
-                placeholder="固定人格和回答风格；项目上下文会在发送时单独注入。"
+                placeholder="用于约束 AI 助手的基础人格、输出风格和项目规则"
                 onChange={(event) => update({ systemPrompt: event.target.value })}
               />
               <small className={systemPromptTooLong ? "form-hint danger" : "form-hint"}>
-                {systemPromptBytes}/{AI_SYSTEM_PROMPT_MAX_BYTES} UTF-8 字节。
+                {systemPromptBytes}/{AI_SYSTEM_PROMPT_MAX_BYTES} UTF-8 字节
               </small>
             </label>
             <div className="button-row">
               <button className="action-button" type="submit" disabled={!connected || systemPromptTooLong}>
                 <KeyRound size={17} />
-                保存
+                保存配置
               </button>
               <button className="action-button secondary" type="button" disabled={!connected || !current.hasApiKey} onClick={() => void clearAiKey()}>
                 <Trash2 size={17} />
-                清除 Key
+                清空 Key
               </button>
               <button className="action-button secondary danger-soft" type="button" disabled={!connected || (current.profileId ?? 0) === 0} onClick={() => void deleteAiProfile(current.profileId ?? 0)}>
                 删除配置
@@ -1567,7 +2014,50 @@ function AiPanel({
             </div>
             <div className="warning-line">
               <ShieldAlert size={16} />
-              设备直连 AI API 会把 Key 写入开发板 NVS；串口响应和日志不会回显明文。
+              当前是开发模式，真实 AI API 的 Key 会保存在设备 NVS 中，但不会在日志或串口响应里明文回显。
+            </div>
+          </form>
+
+          <form className="ai-config-main" onSubmit={(event) => { event.preventDefault(); void saveAsrConfig(); }}>
+            <div className="ai-chat-head compact-head">
+              <h3>ASR 设置</h3>
+              <StatusPill state={currentAsr.ready ? "ok" : currentAsr.hasApiKey ? "warn" : "offline"}>
+                {currentAsr.ready ? "ready" : "need key"}
+              </StatusPill>
+            </div>
+            <div className="form-grid single">
+              <label>
+                <span>ASR Base URL</span>
+                <input value={currentAsr.apiBaseUrl} inputMode="url" required onChange={(event) => updateAsr({ apiBaseUrl: event.target.value })} />
+              </label>
+              <label>
+                <span>ASR 模型</span>
+                <input value={currentAsr.model} required onChange={(event) => updateAsr({ model: event.target.value })} />
+              </label>
+              <label>
+                <span>ASR Key</span>
+                <input
+                  type="password"
+                  value={asrKeyInput}
+                  placeholder={currentAsr.hasApiKey ? `已保存：${currentAsr.apiKeyPreview || "hidden"}` : "输入后保存到设备 NVS"}
+                  maxLength={256}
+                  autoComplete="new-password"
+                  onChange={(event) => setAsrKeyInput(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>ASR 超时 ms</span>
+                <input type="number" min={10000} max={90000} value={currentAsr.timeoutMs} onChange={(event) => updateAsr({ timeoutMs: Number(event.target.value) })} />
+              </label>
+            </div>
+            <div className="button-row">
+              <button className="action-button" type="submit" disabled={!connected}>
+                <Check size={17} />
+                保存 ASR
+              </button>
+              <button className="action-button secondary danger-soft" type="button" disabled={!connected || !currentAsr.hasApiKey} onClick={() => void clearAsrKey()}>
+                清除 ASR Key
+              </button>
             </div>
           </form>
 
@@ -1584,9 +2074,15 @@ function AiPanel({
               onChange={(event) => setMemoryDraft(event.target.value)}
             />
             <div className="button-row">
-              <button className="action-button secondary" type="button" disabled={!connected} onClick={() => void refreshMemory()}>读取</button>
-              <button className="action-button" type="button" disabled={!connected} onClick={() => void saveMemory()}>写入测试记忆</button>
-              <button className="action-button secondary danger-soft" type="button" disabled={!connected} onClick={() => void clearMemory()}>清空</button>
+              <button className="action-button secondary" type="button" disabled={!connected} onClick={() => void refreshMemory()}>
+                读取
+              </button>
+              <button className="action-button" type="button" disabled={!connected} onClick={() => void saveMemory()}>
+                写入记忆
+              </button>
+              <button className="action-button secondary danger-soft" type="button" disabled={!connected} onClick={() => void clearMemory()}>
+                清空
+              </button>
             </div>
           </div>
         </aside>
@@ -1594,7 +2090,6 @@ function AiPanel({
     </div>
   );
 }
-
 function PinsPanel({ pins }: { pins: PinInfo[] }) {
   return (
     <div className="section-flow">
@@ -1634,7 +2129,182 @@ function PinsPanel({ pins }: { pins: PinInfo[] }) {
   );
 }
 
+const micQualityText: Record<string, string> = {
+  ok: "采样基本可用，可以继续测试 ASR。",
+  silent: "声音过小或接近静音：检查 VDD/GND/SD、L/R 声道和说话距离。",
+  clipping: "采样可能削顶：后续可调大 AUDIO_PCM_SHIFT，或降低输入增益。",
+  i2s_timeout: "I2S 读取不连续：优先检查 SCK/WS/SD/GND、线长和接触。",
+  too_short: "录音太短或没有有效样本：至少录 1-2 秒再判断。",
+};
+
+function MicrophoneTestPanel({
+  connection,
+  asrConfig,
+  voiceStatus,
+  voiceBusy,
+  micTestMode,
+  micSamples,
+  micTranscript,
+  micAiReply,
+  micAsrResult,
+  startHardwareTest,
+  stopHardwareTest,
+  refreshHardwareStatus,
+  toggleVoiceChat,
+}: {
+  connection: ConnectionState;
+  asrConfig: ASRConfig | null;
+  voiceStatus: VoiceChatStatus | null;
+  voiceBusy: boolean;
+  micTestMode: "idle" | "hardware" | "asr";
+  micSamples: VoiceChatStatus[];
+  micTranscript: string;
+  micAiReply: string;
+  micAsrResult: VoiceChatResponse | null;
+  startHardwareTest: () => Promise<void>;
+  stopHardwareTest: () => Promise<void>;
+  refreshHardwareStatus: () => Promise<void>;
+  toggleVoiceChat: () => Promise<void>;
+}) {
+  const connected = connection === "connected";
+  const recording = voiceStatus?.state === "recording";
+  const hardwareRecording = recording && micTestMode === "hardware";
+  const asrRecording = recording && micTestMode === "asr";
+  const hint = voiceStatus?.qualityHint ?? "too_short";
+  const maxBar = Math.max(1, ...micSamples.map((item) => Math.max(item.rms ?? 0, item.peakAbs ?? 0)));
+
+  return (
+    <div className="section-flow">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">INMP441 / I2S / ASR</p>
+          <h2>麦克风测试</h2>
+        </div>
+        <StatusPill state={hint === "ok" ? "ok" : hint === "i2s_timeout" || hint === "clipping" ? "danger" : "warn"}>
+          {voiceStatus?.qualityHint ?? "等待测试"}
+        </StatusPill>
+      </div>
+
+      <div className="warning-line">
+        <Info size={16} />
+        当前接线：VDD=3V3，GND=GND，SCK=GPIO40，WS=GPIO41，SD=GPIO42，L/R=GND。这里的硬件录音测试不会触发 ASR 或 AI。
+      </div>
+
+      <div className="mic-test-grid">
+        <div className="project-ai-card mic-control-card">
+          <div className="ai-chat-head compact-head">
+            <h3>硬件录音测试</h3>
+            <StatusPill state={hardwareRecording ? "warn" : connected ? "ok" : "offline"}>
+              {hardwareRecording ? "录音中" : connected ? "可测试" : "未连接"}
+            </StatusPill>
+          </div>
+          <div className="button-row">
+            <button className="action-button" type="button" disabled={!connected || voiceBusy || recording} onClick={() => void startHardwareTest()}>
+              <Mic size={17} />
+              开始硬件录音
+            </button>
+            <button className="action-button secondary danger-soft" type="button" disabled={!connected || voiceBusy || !hardwareRecording} onClick={() => void stopHardwareTest()}>
+              停止硬件录音
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || voiceBusy} onClick={() => void refreshHardwareStatus()}>
+              <RotateCw size={17} />
+              刷新状态
+            </button>
+          </div>
+          <p className="form-hint">录音中会每 500 ms 自动刷新状态；停止后只保留诊断结果，不上传音频。</p>
+        </div>
+
+        <div className="project-ai-card">
+          <div className="ai-chat-head compact-head">
+            <h3>ASR 识别测试</h3>
+            <StatusPill state={asrConfig?.ready ? "ok" : asrConfig?.hasApiKey ? "warn" : "offline"}>
+              {asrConfig?.ready ? "ASR ready" : asrConfig?.hasApiKey ? "待测试" : "缺少 Key"}
+            </StatusPill>
+          </div>
+          <div className="button-row">
+            <button className={asrRecording ? "action-button danger-soft" : "action-button secondary"} type="button" disabled={!connected || voiceBusy || (recording && !asrRecording)} onClick={() => void toggleVoiceChat()}>
+              <Mic size={17} />
+              {asrRecording ? "停止并识别" : "开始 ASR 测试"}
+            </button>
+          </div>
+          <p className="form-hint">{asrConfig?.apiBaseUrl ?? "未读取 ASR 配置"} / {asrConfig?.model ?? "--"}</p>
+        </div>
+      </div>
+
+      <div className="mic-metrics-grid">
+        <GaugeBlock label="状态" value={voiceStatus?.state ?? "idle"} state={recording ? "warn" : hint === "ok" ? "ok" : "offline"} />
+        <GaugeBlock label="时长" value={`${voiceStatus?.durationMs ?? 0} ms`} state="ok" />
+        <GaugeBlock label="PCM" value={`${voiceStatus?.pcmBytes ?? 0} B`} state="ok" />
+        <GaugeBlock label="样本" value={`${voiceStatus?.sampleCount ?? 0}`} state="ok" />
+        <GaugeBlock label="RMS" value={`${voiceStatus?.rms ?? 0}`} state={voiceStatus?.rms ? "ok" : "warn"} />
+        <GaugeBlock label="Peak" value={`${voiceStatus?.peakAbs ?? 0}`} state="ok" />
+        <GaugeBlock label="Min/Max" value={`${voiceStatus?.minSample ?? 0} / ${voiceStatus?.maxSample ?? 0}`} state="ok" />
+        <GaugeBlock label="Timeout" value={`${voiceStatus?.timeoutCount ?? 0}`} state={(voiceStatus?.timeoutCount ?? 0) > 0 ? "danger" : "ok"} />
+      </div>
+
+      <div className="mic-test-grid">
+        <div className="project-ai-card">
+          <div className="ai-chat-head compact-head">
+            <h3>音量历史</h3>
+            <span className="form-hint">最近 {micSamples.length}/30 次</span>
+          </div>
+          <div className="mic-bars" aria-label="麦克风音量历史">
+            {Array.from({ length: 30 }).map((_, index) => {
+              const sample = micSamples[index];
+              const rmsHeight = sample ? Math.max(4, Math.round(((sample.rms ?? 0) / maxBar) * 100)) : 4;
+              const peakHeight = sample ? Math.max(rmsHeight, Math.round(((sample.peakAbs ?? 0) / maxBar) * 100)) : 4;
+              return (
+                <span className="mic-bar" key={index}>
+                  <i style={{ height: `${peakHeight}%` }} />
+                  <b style={{ height: `${rmsHeight}%` }} />
+                </span>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="project-ai-card">
+          <div className="ai-chat-head compact-head">
+            <h3>诊断建议</h3>
+            <StatusPill state={hint === "ok" ? "ok" : hint === "i2s_timeout" || hint === "clipping" ? "danger" : "warn"}>{hint}</StatusPill>
+          </div>
+          <p>{micQualityText[hint] ?? "等待更多录音数据后判断。"}</p>
+          <KeyValue title="原始诊断" rows={[
+            ["mean", `${voiceStatus?.meanSample ?? 0}`],
+            ["clip", `${voiceStatus?.clipCount ?? 0}`],
+            ["error", voiceStatus?.error || "无"],
+          ]} />
+        </div>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>ASR / AI 结果</h3>
+          <StatusPill state={micAsrResult ? "ok" : "offline"}>{micAsrResult ? `${micAsrResult.asrLatencyMs + micAsrResult.aiLatencyMs} ms` : "未测试"}</StatusPill>
+        </div>
+        <div className="mic-result-grid">
+          <div>
+            <span className="form-hint">转写文本</span>
+            <p>{micTranscript || "完成 ASR 测试后显示。"}</p>
+          </div>
+          <div>
+            <span className="form-hint">AI 回复</span>
+            <p>{micAiReply || "完成 ASR + AI 后显示。"}</p>
+          </div>
+        </div>
+        {micAsrResult && (
+          <p className="form-hint">ASR HTTP {micAsrResult.asrHttpStatus} / AI HTTP {micAsrResult.aiHttpStatus} / 音频 {micAsrResult.audioBytes} B</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SensorsPanel({ sensors }: { sensors: SensorSnapshot | null }) {
+  const light10 = sensors?.lightValue10bit ?? sensors?.lux;
+  const lightRaw = sensors?.lightRaw12bit;
+  const lightPercent = sensors?.lightPercent;
+  const lightPolarityLabel = sensors?.lightPolarity === "raw_high_dark" ? "高=暗 / 低=亮" : "按设备上报";
   return (
     <div className="section-flow">
       <div className="section-heading">
@@ -1645,9 +2315,12 @@ function SensorsPanel({ sensors }: { sensors: SensorSnapshot | null }) {
         <StatusPill state={sensors ? "ok" : "offline"}>{sensors?.updatedAt ?? "无数据"}</StatusPill>
       </div>
       <div className="sensor-grid">
+        <GaugeBlock label="亮度 0-1023" value={sensors ? `${light10}` : "--"} state="ok" />
+        <GaugeBlock label="ADC 原始值" value={lightRaw !== undefined ? `${lightRaw}` : "--"} state="ok" />
+        <GaugeBlock label="亮度百分比" value={lightPercent !== undefined ? `${lightPercent}%` : "--"} state="ok" />
+        <GaugeBlock label="光敏极性" value={sensors ? lightPolarityLabel : "--"} state="ok" />
         <GaugeBlock label="PIR" value={sensors?.pir ? "触发" : "未触发"} state={sensors?.pir ? "warn" : "ok"} />
-        <GaugeBlock label="光照" value={sensors ? `${sensors.lux} lux` : "--"} state="ok" />
-        <GaugeBlock label="光照突变" value={sensors ? `${sensors.lightDelta}` : "--"} state="warn" />
+        <GaugeBlock label="亮度突变" value={sensors ? `${sensors.lightDelta}` : "--"} state="warn" />
         <GaugeBlock label="姿态变化" value={sensors ? `${sensors.angleDelta}°` : "--"} state="ok" />
         <GaugeBlock label="震动峰值" value={sensors ? `${sensors.vibrationPeak} g` : "--"} state="ok" />
         <GaugeBlock label="门状态" value={sensors?.doorState ?? "--"} state="ok" />

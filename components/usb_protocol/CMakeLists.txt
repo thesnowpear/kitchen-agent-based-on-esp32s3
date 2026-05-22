@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "fridge_usb_protocol.c"
     INCLUDE_DIRS "include"
-    REQUIRES network diagnostics ai_client ai_context storage freertos
+    REQUIRES network diagnostics ai_client ai_context storage sensors audio asr freertos
 )

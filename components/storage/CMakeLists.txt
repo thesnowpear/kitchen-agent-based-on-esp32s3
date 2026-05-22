@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "fridge_storage.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash
+    REQUIRES nvs_flash littlefs esp_timer cjson
 )

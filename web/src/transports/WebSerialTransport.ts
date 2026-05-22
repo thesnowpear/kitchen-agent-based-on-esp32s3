@@ -125,6 +125,7 @@ export class WebSerialTransport extends BaseTransport {
       command === "set_network" ||
       command === "test_ai_chat" ||
       command === "ai_assistant_chat" ||
+      command === "voice_chat_stop" ||
       command === "get_ai_context_preview" ||
       command === "test_ai_task"
     ) {

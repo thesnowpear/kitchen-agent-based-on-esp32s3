@@ -21,6 +21,7 @@
 #define LCD_TOTAL_BUF_SIZE (LCD_WIDTH * LCD_HEIGHT * LCD_BYTES_PER_PIXEL)
 #define LCD_BLOCK_COUNT 50
 #define LCD_BLOCK_SIZE (LCD_TOTAL_BUF_SIZE / LCD_BLOCK_COUNT)
+#define LCD_TEST_STEP_DELAY_MS 20
 
 #ifndef CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ
 // 屏幕测试组件在正常主控模式下仍会参与编译；此默认值只保证编译通过，不会启动屏幕测试任务。
@@ -35,7 +36,9 @@
 #define LCD_PIN_D3 GPIO_NUM_9
 #define LCD_PIN_RST GPIO_NUM_8
 #define LCD_PIN_WAIT GPIO_NUM_6
-#define LCD_SPI_HOST SPI3_HOST
+#define LCD_SPI_HOST SPI2_HOST
+#define LCD_WAIT_READY_TIMEOUT_MS 500
+#define LCD_WAIT_POLL_INTERVAL_MS 10
 
 #define COLOR_BLACK 0x0000
 #define COLOR_RED 0xF800
@@ -73,6 +76,21 @@ typedef struct {
     uint8_t databytes;
 } lcd_init_cmd_t;
 
+// 等待 TR230S 允许发送命令。
+// 注意：WAIT# 为屏幕侧 3.3V 逻辑输出，低电平表示不能继续写命令，首次接线异常时应停下复核硬件。
+static esp_err_t example_lcd_wait_ready(const char *stage)
+{
+    for (int elapsed = 0; elapsed <= LCD_WAIT_READY_TIMEOUT_MS; elapsed += LCD_WAIT_POLL_INTERVAL_MS) {
+        if (gpio_get_level(LCD_PIN_WAIT) == 1) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(LCD_WAIT_POLL_INTERVAL_MS));
+    }
+
+    ESP_LOGE(TAG, "WAIT# stayed low while %s; stop QSPI writes and check reset/power/FPC direction", stage);
+    return ESP_ERR_TIMEOUT;
+}
+
 // 例程里的 QSPI 命令发送函数：普通命令阶段仍用单线发送，必要时保持 CS。
 static esp_err_t example_qspi_write_cmd_bytes(const uint8_t *data, int len, bool keep_cs)
 {
@@ -86,7 +104,12 @@ static esp_err_t example_qspi_write_cmd_bytes(const uint8_t *data, int len, bool
     if (keep_cs) {
         t.flags = SPI_TRANS_CS_KEEP_ACTIVE;
     }
-    return spi_device_polling_transmit(s_lcd, &t);
+    esp_err_t ret = spi_device_polling_transmit(s_lcd, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "QSPI command transmit failed len=%d keep_cs=%d ret=%s",
+                 len, keep_cs, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 // 例程里的 QSPI 数据发送函数：像素数据阶段使用 4 线 QIO。
@@ -99,12 +122,22 @@ static esp_err_t example_qspi_write_data(const uint8_t *data, int len, bool keep
     }
     t.length = len * 8;
     t.tx_buffer = data;
-    return spi_device_polling_transmit(s_lcd, &t);
+    esp_err_t ret = spi_device_polling_transmit(s_lcd, &t);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "QSPI pixel transmit failed len=%d keep_cs=%d ret=%s",
+                 len, keep_cs, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 // 例程里的 TR230S 命令封包：0x02 写寄存器，0x12 写显存。
 static esp_err_t example_lcd_write_cmd(uint8_t cmd, const uint8_t *data, uint8_t datalen)
 {
+    esp_err_t ready = example_lcd_wait_ready("writing TR230S command");
+    if (ready != ESP_OK) {
+        return ready;
+    }
+
     uint8_t packet[100] = {0x02, 0x00, 0x00, 0x00};
     uint8_t pos = 4;
 
@@ -152,21 +185,30 @@ static void example_lcd_hard_reset(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-// 初始化 SPI3 QSPI 总线。除引脚替换外，配置结构贴近 example/screen/components/BSP/SPILCD/qspi.c。
-static esp_err_t example_spi3_init(void)
+// 初始化 QSPI 总线。
+// 注意：当前 20-pin 飞线使用的是 ESP32-S3 的 SPI2 常用 QSPI 引脚组；先强制走 GPIO matrix，
+// 避免 IOMUX 自动路径和官方例程的 SPI3 命名差异干扰首次点亮排查。
+static esp_err_t example_qspi_bus_init(void)
 {
+    ESP_LOGI(TAG, "step: spi bus init start host=%d block=%d total=%d", LCD_SPI_HOST, LCD_BLOCK_SIZE, LCD_TOTAL_BUF_SIZE);
+
     spi_bus_config_t bus_conf = {0};
     bus_conf.data0_io_num = LCD_PIN_D0;
     bus_conf.data1_io_num = LCD_PIN_D1;
     bus_conf.data2_io_num = LCD_PIN_D2;
     bus_conf.data3_io_num = LCD_PIN_D3;
     bus_conf.sclk_io_num = LCD_PIN_SCLK;
-    bus_conf.quadwp_io_num = LCD_PIN_D2;
-    bus_conf.quadhd_io_num = LCD_PIN_D3;
-    bus_conf.max_transfer_sz = LCD_TOTAL_BUF_SIZE;
-    bus_conf.flags = SPICOMMON_BUSFLAG_QUAD;
+    // ESP-IDF 6.x 中 data2/quadwp、data3/quadhd 是同一组 union 字段，不能再单独写成 NC 覆盖掉 D2/D3。
+    bus_conf.data4_io_num = GPIO_NUM_NC;
+    bus_conf.data5_io_num = GPIO_NUM_NC;
+    bus_conf.data6_io_num = GPIO_NUM_NC;
+    bus_conf.data7_io_num = GPIO_NUM_NC;
+    bus_conf.max_transfer_sz = LCD_BLOCK_SIZE;
+    bus_conf.flags = SPICOMMON_BUSFLAG_QUAD | SPICOMMON_BUSFLAG_GPIO_PINS;
 
-    return spi_bus_initialize(LCD_SPI_HOST, &bus_conf, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(LCD_SPI_HOST, &bus_conf, SPI_DMA_CH_AUTO);
+    ESP_LOGI(TAG, "step: spi bus init done ret=%s", esp_err_to_name(ret));
+    return ret;
 }
 
 // 飞线调试时先让 CS 保持高电平，避免屏幕上电复位阶段误收命令。
@@ -183,10 +225,13 @@ static void configure_safe_start_levels(void)
     gpio_set_level(LCD_PIN_CS, 1);
 }
 
-// 初始化 LCD 设备和背光 PWM 寄存器。
-// 客服确认 0x20 为背光控制寄存器，最大值 0x64；这里保持例程写法但把亮度拉到 100%。
+// 初始化 LCD 设备和 TR230S 背光/显示寄存器。
+// 注意：20-pin 模式没有独立 BL GPIO，背光由 TR230S 内部 PWM 控制；先关占空比，再设置频率和 Display On，
+// 最后拉到 100%，避免复位后背光状态不确定。
 static esp_err_t example_lcd_init(void)
 {
+    ESP_LOGI(TAG, "step: spi add lcd device start clock=%d", CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ);
+
     spi_device_interface_config_t dev_conf = {
         .clock_speed_hz = CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ,
         .mode = 0,
@@ -197,11 +242,15 @@ static esp_err_t example_lcd_init(void)
 
     esp_err_t ret = spi_bus_add_device(LCD_SPI_HOST, &dev_conf, &s_lcd);
     if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "step: spi add lcd device failed ret=%s", esp_err_to_name(ret));
         return ret;
     }
+    ESP_LOGI(TAG, "step: spi add lcd device done");
 
     lcd_init_cmd_t init_cmds[] = {
         {0x20, {0x00}, 0x81},
+        {0x21, {0x64}, 0x81},
+        {0x29, {0x00}, 0x80},
         {0x20, {0x64}, 0x81},
         {0, {0}, 0xFF},
     };
@@ -221,6 +270,7 @@ static esp_err_t example_lcd_init(void)
     }
 
     example_lcd_display_dir(1);
+    ESP_LOGI(TAG, "step: lcd init commands done");
     return ESP_OK;
 }
 
@@ -256,6 +306,7 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
     uint8_t high = color >> 8;
     uint8_t low = color & 0xFF;
 
+    ESP_LOGI(TAG, "step: acquire spi bus color=0x%04X", color);
     esp_err_t ret = spi_device_acquire_bus(s_lcd, portMAX_DELAY);
     if (ret != ESP_OK) {
         return ret;
@@ -272,6 +323,9 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
         }
 
         for (int i = 0; i < LCD_BLOCK_COUNT; i++) {
+            if (i == 0 || i == LCD_BLOCK_COUNT - 1) {
+                ESP_LOGI(TAG, "step: write qspi block %d/%d size=%d", i + 1, LCD_BLOCK_COUNT, LCD_BLOCK_SIZE);
+            }
             ret = example_qspi_write_data(s_lcd_buf + i * LCD_BLOCK_SIZE, LCD_BLOCK_SIZE, true);
             if (ret != ESP_OK) {
                 break;
@@ -284,6 +338,7 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
     }
 
     spi_device_release_bus(s_lcd);
+    ESP_LOGI(TAG, "step: release spi bus color=0x%04X ret=%s", color, esp_err_to_name(ret));
     return ret;
 }
 
@@ -313,19 +368,28 @@ void fridge_display_test_run(void)
     ESP_ERROR_CHECK(gpio_config(&wait_conf));
 
     configure_safe_start_levels();
+    ESP_LOGI(TAG, "step: hard reset start");
     example_lcd_hard_reset();
     ESP_LOGI(TAG, "after reset WAIT#=%d", gpio_get_level(LCD_PIN_WAIT));
-
-    esp_err_t ret = example_spi3_init();
+    esp_err_t ret = example_lcd_wait_ready("after hardware reset");
     if (ret != ESP_OK) {
-        stop_forever("example spi3 init failed", ret);
+        stop_forever("LCD WAIT# stayed low after reset", ret);
     }
+    vTaskDelay(pdMS_TO_TICKS(LCD_TEST_STEP_DELAY_MS));
+
+    ret = example_qspi_bus_init();
+    if (ret != ESP_OK) {
+        stop_forever("example qspi bus init failed", ret);
+    }
+    vTaskDelay(pdMS_TO_TICKS(LCD_TEST_STEP_DELAY_MS));
 
     ret = example_lcd_init();
     if (ret != ESP_OK) {
         stop_forever("example lcd init failed", ret);
     }
+    vTaskDelay(pdMS_TO_TICKS(LCD_TEST_STEP_DELAY_MS));
 
+    ESP_LOGI(TAG, "step: allocate PSRAM framebuffer start");
     s_lcd_buf = (uint8_t *)heap_caps_malloc(LCD_TOTAL_BUF_SIZE, MALLOC_CAP_SPIRAM);
     if (!s_lcd_buf) {
         stop_forever("example lcd full-frame PSRAM buffer allocation failed", ESP_ERR_NO_MEM);

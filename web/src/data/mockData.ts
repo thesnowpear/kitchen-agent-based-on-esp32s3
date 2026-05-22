@@ -1,5 +1,6 @@
 import type {
   AIConfig,
+  ASRConfig,
   DeviceLog,
   DeviceStatus,
   DiagnosticSnapshot,
@@ -78,6 +79,18 @@ export function createMockAIConfig(): AIConfig {
   };
 }
 
+export function createMockASRConfig(): ASRConfig {
+  return {
+    apiBaseUrl: "https://api.siliconflow.cn/v1/audio/transcriptions",
+    model: "TeleAI/TeleSpeechASR",
+    timeoutMs: 45000,
+    hasApiKey: false,
+    apiKeyPreview: "",
+    lastError: "",
+    ready: false,
+  };
+}
+
 export function createMockWifiNetworks(): WifiNetwork[] {
   return [
     { ssid: "KitchenLab-2.4G", band: "2.4G", signal: 92, rssi: -54, channel: 6, secured: true, authmode: "WPA2", note: "Mock 扫描结果，ESP32 兼容" },
@@ -97,8 +110,10 @@ export function createMockPins(): PinInfo[] {
     { gpio: "GPIO7", signal: "LCD_BL", usage: "背光 PWM", level: "caution", note: "确认背光驱动，不让 GPIO 承担超额电流。", readonly: true },
     { gpio: "GPIO4", signal: "I2C_SDA", usage: "触摸/光照/IMU", level: "caution", note: "SDA 上拉到 3.3V，不能上拉到 5V。", readonly: true },
     { gpio: "GPIO5", signal: "I2C_SCL", usage: "触摸/光照/IMU", level: "caution", note: "SCL 上拉到 3.3V，避免总线过长。", readonly: true },
-    { gpio: "GPIO1", signal: "PIR_OUT", usage: "人体感应", level: "safe", note: "输入信号需确认 3.3V 逻辑。", readonly: true },
+    { gpio: "GPIO1", signal: "LIGHT_AO", usage: "光敏 ADC", level: "safe", note: "AO 模拟输出，只允许 3.3V 供电后接入 ADC1_CH0。", readonly: true },
     { gpio: "GPIO40", signal: "MIC_BCLK", usage: "I2S 麦克风", level: "safe", note: "I2S 时钟线，避免与屏幕高速线过近。", readonly: true },
+    { gpio: "GPIO41", signal: "MIC_WS", usage: "I2S 麦克风", level: "safe", note: "INMP441 字选择线，L/R 接 GND 时使用左声道。", readonly: true },
+    { gpio: "GPIO42", signal: "MIC_SD", usage: "I2S 麦克风", level: "safe", note: "INMP441 数据输出到 ESP32-S3。", readonly: true },
     { gpio: "GPIO47", signal: "BUZZER", usage: "蜂鸣器 PWM", level: "caution", note: "蜂鸣器建议使用驱动管或限流方案。", readonly: true },
     { gpio: "GPIO0", signal: "BOOT", usage: "启动绑带脚", level: "danger", note: "禁止随意外接，会影响下载/启动模式。", readonly: true },
     { gpio: "GPIO35-37", signal: "PSRAM/Flash", usage: "保留", level: "danger", note: "可能被 Flash/PSRAM 占用，首版不使用。", readonly: true },
@@ -107,9 +122,15 @@ export function createMockPins(): PinInfo[] {
 }
 
 export function createMockSensors(): SensorSnapshot {
+  const raw = Math.round(900 + Math.random() * 2400);
+  const brightness10 = Math.round(((4095 - raw) * 1023) / 4095);
   return {
     pir: Math.random() > 0.65,
-    lux: Number((125 + Math.random() * 40).toFixed(1)),
+    lux: brightness10,
+    lightRaw12bit: raw,
+    lightValue10bit: brightness10,
+    lightPercent: Math.round((brightness10 * 100) / 1023),
+    lightPolarity: "raw_high_dark",
     lightDelta: Number((8 + Math.random() * 22).toFixed(1)),
     angleDelta: Number((1.2 + Math.random() * 3).toFixed(1)),
     vibrationPeak: Number((0.02 + Math.random() * 0.08).toFixed(2)),
@@ -142,7 +163,7 @@ export function createMockLogs(): DeviceLog[] {
   return [
     { id: crypto.randomUUID(), at: now(), level: "info", source: "boot", message: "Fridge Spirit console mock boot complete" },
     { id: crypto.randomUUID(), at: now(), level: "warn", source: "partition", message: "sdkconfig still reports single app partition" },
-    { id: crypto.randomUUID(), at: now(), level: "info", source: "sensor_task", message: "lux=132.4 angle_delta=2.1 pir=0" },
+    { id: crypto.randomUUID(), at: now(), level: "info", source: "sensor_task", message: "brightness=642 delta=12 angle_delta=2.1 pir=0" },
     { id: crypto.randomUUID(), at: now(), level: "debug", source: "mqtt", message: "heartbeat queued because broker is not connected" },
   ];
 }

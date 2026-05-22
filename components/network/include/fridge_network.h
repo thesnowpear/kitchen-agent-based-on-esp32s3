@@ -36,6 +36,7 @@ typedef struct {
 typedef struct {
     bool initialized;
     bool connected;
+    bool connecting;
     bool saved;
     bool internet_ready;
     char ssid[FRIDGE_WIFI_MAX_SSID_LEN + 1];
@@ -58,6 +59,9 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save);
 
 // 使用 NVS 中保存的 SSID/密码自动连接；没有凭据时返回 ESP_ERR_NOT_FOUND。
 esp_err_t fridge_network_connect_saved(void);
+
+// 后台尝试连接 NVS 中保存的 Wi-Fi；不会阻塞 USB/Web Serial 调试面板启动。
+esp_err_t fridge_network_connect_saved_async(void);
 
 // 获取当前网络状态；不包含密码。
 esp_err_t fridge_network_get_status(fridge_network_status_t *status);

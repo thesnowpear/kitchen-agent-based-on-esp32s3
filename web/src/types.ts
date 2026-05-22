@@ -39,16 +39,27 @@ export type DeviceCommand =
   | "get_ai_profiles"
   | "set_ai_config"
   | "clear_ai_key"
+  | "get_asr_config"
+  | "set_asr_config"
+  | "clear_asr_key"
   | "create_ai_profile"
   | "select_ai_profile"
   | "delete_ai_profile"
   | "test_ai_chat"
   | "ai_assistant_chat"
+  | "mic_record_start"
+  | "mic_record_status"
+  | "mic_record_stop"
+  | "voice_chat_start"
+  | "voice_chat_stop"
+  | "voice_chat_status"
   | "get_ai_context_preview"
   | "test_ai_task"
   | "get_memory_summary"
   | "set_memory_summary"
   | "clear_memory_summary"
+  | "get_chat_history"
+  | "clear_chat_history"
   | "get_pins"
   | "get_sensors"
   | "get_diagnostics"
@@ -112,6 +123,46 @@ export interface AIConfig {
   ready: boolean;
 }
 
+export interface ASRConfig {
+  apiBaseUrl: string;
+  apiKey?: string;
+  model: string;
+  timeoutMs: number;
+  hasApiKey: boolean;
+  apiKeyPreview: string;
+  lastError: string;
+  ready: boolean;
+}
+
+export interface VoiceChatStatus {
+  state: "idle" | "recording" | "ready" | "error";
+  durationMs: number;
+  pcmBytes: number;
+  rms: number;
+  sampleCount?: number;
+  peakAbs?: number;
+  minSample?: number;
+  maxSample?: number;
+  meanSample?: number;
+  clipCount?: number;
+  timeoutCount?: number;
+  qualityHint?: "ok" | "silent" | "clipping" | "i2s_timeout" | "too_short" | string;
+  error: string;
+}
+
+export interface VoiceChatResponse {
+  transcript: string;
+  reply: string;
+  asrModel: string;
+  aiModel: string;
+  asrLatencyMs: number;
+  aiLatencyMs: number;
+  asrHttpStatus: number;
+  aiHttpStatus: number;
+  audioBytes: number;
+  historyPrunedCount: number;
+}
+
 export interface AIProfilesResponse {
   activeProfileId: number;
   profiles: AIConfig[];
@@ -159,7 +210,6 @@ export interface AIAssistantHistoryItem {
 
 export interface AIAssistantChatRequest extends ProjectAITaskRequest {
   message: string;
-  history: AIAssistantHistoryItem[];
 }
 
 export interface AIAssistantChatResponse extends AIChatResponse {
@@ -167,6 +217,10 @@ export interface AIAssistantChatResponse extends AIChatResponse {
   contextInjected: boolean;
   localSnapshotVersion: number;
   needsConfirmation: boolean;
+  historyInjected: boolean;
+  historyCount: number;
+  historyPersisted: boolean;
+  historyPrunedCount: number;
 }
 
 export interface AIContextPreview {
@@ -194,6 +248,25 @@ export interface MemorySummary {
   recent_summary?: string[];
 }
 
+export interface DeviceChatHistoryMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  taskType: string;
+  createdAt: number;
+}
+
+export interface DeviceChatHistory {
+  schemaVersion: number;
+  updatedAt: number;
+  ttlSeconds: number;
+  maxMessages: number;
+  timeReady: boolean;
+  count: number;
+  prunedCount: number;
+  messages: DeviceChatHistoryMessage[];
+}
+
 export interface WifiNetwork {
   ssid: string;
   band: "2.4G" | "5G";
@@ -217,6 +290,10 @@ export interface PinInfo {
 export interface SensorSnapshot {
   pir: boolean;
   lux: number;
+  lightRaw12bit?: number;
+  lightValue10bit?: number;
+  lightPercent?: number;
+  lightPolarity?: "raw_high_dark" | "raw_high_bright" | string;
   lightDelta: number;
   angleDelta: number;
   vibrationPeak: number;
@@ -252,6 +329,7 @@ export interface SectionDefinition {
     | "usb"
     | "network"
     | "ai"
+    | "mic"
     | "pins"
     | "sensors"
     | "logs"

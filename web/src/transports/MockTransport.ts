@@ -1,5 +1,6 @@
 import {
   createMockAIConfig,
+  createMockASRConfig,
   createMockDiagnostics,
   createMockLogs,
   createMockNetwork,
@@ -15,31 +16,69 @@ import type {
   AIConfig,
   AIContextPreview,
   AIProfilesResponse,
+  ASRConfig,
+  DeviceChatHistory,
   DeviceCommand,
   DeviceResponse,
   MemorySummary,
   NetworkConfig,
   ProjectAITaskRequest,
   ProjectAITaskResponse,
+  VoiceChatResponse,
+  VoiceChatStatus,
 } from "../types";
 import { BaseTransport } from "./DeviceTransport";
 
-// Mock 传输层：无硬件时模拟 ESP32-S3 返回，便于比赛展示和前端开发。
 export class MockTransport extends BaseTransport {
   private timer: number | undefined;
   private connected = false;
   private network = createMockNetwork();
   private aiConfig = createMockAIConfig();
   private aiProfiles: AIConfig[] = [this.aiConfig];
+  private asrConfig: ASRConfig = createMockASRConfig();
+  private voiceStatus: VoiceChatStatus = {
+    state: "idle",
+    durationMs: 0,
+    pcmBytes: 0,
+    rms: 0,
+    error: "",
+  };
   private memorySummary: MemorySummary = {
     schema_version: 1,
-    memory_policy: "只保存结构化摘要，不保存完整聊天记录",
+    memory_policy: "硬件测试记忆：只保存结构化摘要，不保存完整聊天记录",
     family_size: 2,
     taste: ["清淡", "少油"],
     avoid: ["香菜"],
     allergies: [],
     recent_summary: ["用户希望优先处理临期食材", "早餐偏快手，晚餐偏家常"],
   };
+  private chatHistory: DeviceChatHistory = {
+    schemaVersion: 1,
+    updatedAt: Math.floor(Date.now() / 1000),
+    ttlSeconds: 48 * 60 * 60,
+    maxMessages: 15,
+    timeReady: true,
+    count: 0,
+    prunedCount: 0,
+    messages: [],
+  };
+
+  private withVoiceDiagnostics(status: VoiceChatStatus): VoiceChatStatus {
+    const sampleCount = Math.floor(status.pcmBytes / 2);
+    const peakAbs = Math.max(status.rms * 3, status.rms ? 500 : 0);
+    const clipCount = peakAbs > 32000 ? 4 : 0;
+    return {
+      ...status,
+      sampleCount,
+      peakAbs,
+      minSample: -peakAbs,
+      maxSample: peakAbs,
+      meanSample: Math.round(status.rms / 18),
+      clipCount,
+      timeoutCount: 0,
+      qualityHint: sampleCount < 8000 ? "too_short" : clipCount > 0 ? "clipping" : status.rms < 80 ? "silent" : "ok",
+    };
+  }
 
   async connect() {
     this.connected = true;
@@ -51,7 +90,7 @@ export class MockTransport extends BaseTransport {
         payload: {
           level: "debug",
           source: "sensor_task",
-          message: "PIR hold=0 lux_delta=12.4 angle_delta=0.8",
+          message: "PIR hold=0 brightness_delta=12.4 angle_delta=0.8",
         },
       });
     }, 6500);
@@ -65,10 +104,7 @@ export class MockTransport extends BaseTransport {
     this.emitLog("info", "Mock 设备已断开。", "mock");
   }
 
-  async sendCommand<TPayload = unknown>(
-    command: DeviceCommand,
-    payload?: unknown,
-  ): Promise<DeviceResponse<TPayload>> {
+  async sendCommand<TPayload = unknown>(command: DeviceCommand, payload?: unknown): Promise<DeviceResponse<TPayload>> {
     if (!this.connected) {
       throw new Error("Mock 设备未连接");
     }
@@ -123,8 +159,11 @@ export class MockTransport extends BaseTransport {
           ready: Boolean((update.apiBaseUrl ?? this.aiConfig.apiBaseUrl) && (update.model ?? this.aiConfig.model) && (apiKey || this.aiConfig.hasApiKey)),
           lastError: "",
         };
-        this.aiProfiles = this.aiProfiles.filter((item) => item.profileId !== profileId).concat(this.aiConfig).sort((a, b) => (a.profileId ?? 0) - (b.profileId ?? 0));
-        this.emitLog("info", "AI API 配置已写入 Mock 设备缓存，Key 未回显。", "ai");
+        this.aiProfiles = this.aiProfiles
+          .filter((item) => item.profileId !== profileId)
+          .concat(this.aiConfig)
+          .sort((a, b) => (a.profileId ?? 0) - (b.profileId ?? 0));
+        this.emitLog("info", "AI API 配置已写入 Mock 设备缓存，Key 不会回显。", "ai");
         responsePayload = this.aiConfig;
         break;
       }
@@ -139,6 +178,37 @@ export class MockTransport extends BaseTransport {
         this.aiProfiles = this.aiProfiles.map((item) => (item.profileId === this.aiConfig.profileId ? this.aiConfig : item));
         this.emitLog("warn", "Mock AI API Key 已清除。", "ai");
         responsePayload = this.aiConfig;
+        break;
+      case "get_asr_config":
+        responsePayload = this.asrConfig;
+        break;
+      case "set_asr_config": {
+        const update = payload as Partial<ASRConfig> & { apiKey?: string };
+        const apiKey = update.apiKey?.trim();
+        this.asrConfig = {
+          ...this.asrConfig,
+          ...update,
+          apiKey: undefined,
+          apiBaseUrl: update.apiBaseUrl?.trim() || this.asrConfig.apiBaseUrl,
+          model: update.model?.trim() || this.asrConfig.model,
+          hasApiKey: apiKey ? true : this.asrConfig.hasApiKey,
+          apiKeyPreview: apiKey ? `${apiKey.slice(0, 3)}...${apiKey.slice(-4)}` : this.asrConfig.apiKeyPreview,
+          ready: Boolean((update.apiBaseUrl ?? this.asrConfig.apiBaseUrl) && (update.model ?? this.asrConfig.model) && (apiKey || this.asrConfig.hasApiKey)),
+          lastError: "",
+        };
+        this.emitLog("info", "Mock ASR 配置已保存，Key 不会回显。", "asr");
+        responsePayload = this.asrConfig;
+        break;
+      }
+      case "clear_asr_key":
+        this.asrConfig = {
+          ...this.asrConfig,
+          hasApiKey: false,
+          apiKeyPreview: "",
+          ready: false,
+          lastError: "ASR Key 已清除",
+        };
+        responsePayload = this.asrConfig;
         break;
       case "create_ai_profile": {
         const nextId = Math.max(...this.aiProfiles.map((item) => item.profileId ?? 0)) + 1;
@@ -194,8 +264,11 @@ export class MockTransport extends BaseTransport {
         if (!this.aiConfig.hasApiKey) {
           throw new Error("Mock AI 缺少 API Key，请先保存一个测试 Key。");
         }
+        const reply = this.createAssistantReply(request);
+        const historyCount = this.chatHistory.messages.length;
+        const historyPrunedCount = this.appendMockChatHistory(request, reply);
         responsePayload = {
-          reply: this.createAssistantReply(request),
+          reply,
           model: this.aiConfig.model,
           latencyMs: 260,
           status: "mock_ok",
@@ -204,8 +277,82 @@ export class MockTransport extends BaseTransport {
           contextInjected: request.includeInventory || request.includeMemory || request.includeReminders || request.includePreferences,
           localSnapshotVersion: 1,
           needsConfirmation: request.taskType !== "chat_assist",
+          historyInjected: historyCount > 0,
+          historyCount: Math.min(historyCount, this.chatHistory.maxMessages),
+          historyPersisted: true,
+          historyPrunedCount,
         } satisfies AIAssistantChatResponse;
         this.emitLog("info", `Mock AI 助手已注入上下文并完成：${request.taskType}`, "ai");
+        break;
+      }
+      case "mic_record_start":
+      case "voice_chat_start":
+        this.voiceStatus = this.withVoiceDiagnostics({
+          state: "recording",
+          durationMs: 0,
+          pcmBytes: 0,
+          rms: 0,
+          error: "",
+        });
+        this.emitLog("info", "Mock voice recording started.", "asr");
+        responsePayload = this.voiceStatus;
+        break;
+      case "mic_record_status":
+      case "voice_chat_status":
+        if (this.voiceStatus.state === "recording") {
+          this.voiceStatus = this.withVoiceDiagnostics({
+            ...this.voiceStatus,
+            durationMs: Math.min(this.voiceStatus.durationMs + 500, 6000),
+            pcmBytes: this.voiceStatus.pcmBytes + 16000,
+            rms: Math.round(300 + Math.random() * 1200),
+          });
+        }
+        responsePayload = this.voiceStatus;
+        break;
+      case "mic_record_stop":
+        this.voiceStatus = this.withVoiceDiagnostics({
+          ...this.voiceStatus,
+          state: "ready",
+          durationMs: Math.max(this.voiceStatus.durationMs, 500),
+        });
+        this.emitLog("info", "Mock microphone recording stopped without ASR.", "asr");
+        responsePayload = this.voiceStatus;
+        break;
+      case "voice_chat_stop": {
+        if (!this.asrConfig.hasApiKey) {
+          throw new Error("Mock ASR 缺少 API Key，请先保存 ASR Key。");
+        }
+        if (!this.aiConfig.hasApiKey) {
+          throw new Error("Mock AI 缺少 API Key，请先保存 AI Key。");
+        }
+        this.voiceStatus = this.withVoiceDiagnostics({
+          ...this.voiceStatus,
+          state: "ready",
+          durationMs: Math.max(this.voiceStatus.durationMs, 1800),
+          pcmBytes: Math.max(this.voiceStatus.pcmBytes, 57600),
+          rms: Math.max(this.voiceStatus.rms, 620),
+        });
+        const transcript = "帮我看看今晚可以吃什么";
+        const request: AIAssistantChatRequest = {
+          ...this.normalizeProjectAiRequest({ taskType: "voice_intent_parse", userText: transcript }),
+          taskType: "voice_intent_parse",
+          message: transcript,
+          userText: transcript,
+        };
+        const reply = this.createAssistantReply(request);
+        this.appendMockChatHistory(request, reply);
+        responsePayload = {
+          transcript,
+          reply,
+          asrModel: this.asrConfig.model,
+          aiModel: this.aiConfig.model,
+          asrLatencyMs: 680,
+          aiLatencyMs: 930,
+          asrHttpStatus: 200,
+          aiHttpStatus: 200,
+          audioBytes: this.voiceStatus.pcmBytes + 44,
+          historyPrunedCount: 0,
+        } satisfies VoiceChatResponse;
         break;
       }
       case "get_ai_context_preview": {
@@ -250,6 +397,19 @@ export class MockTransport extends BaseTransport {
           recent_summary: [],
         };
         responsePayload = this.memorySummary;
+        break;
+      case "get_chat_history":
+        responsePayload = this.chatHistory;
+        break;
+      case "clear_chat_history":
+        this.chatHistory = {
+          ...this.chatHistory,
+          updatedAt: Math.floor(Date.now() / 1000),
+          count: 0,
+          prunedCount: 0,
+          messages: [],
+        };
+        responsePayload = this.chatHistory;
         break;
       case "get_pins":
         responsePayload = createMockPins();
@@ -304,11 +464,40 @@ export class MockTransport extends BaseTransport {
       ...base,
       message: request?.message ?? request?.userText ?? "",
       userText: request?.userText ?? request?.message ?? "",
-      history: (request?.history ?? []).slice(-6).map((item) => ({
-        role: item.role === "assistant" ? "assistant" : "user",
-        content: item.content.slice(0, 512),
-      })),
     };
+  }
+
+  private appendMockChatHistory(request: AIAssistantChatRequest, reply: string) {
+    const now = Math.floor(Date.now() / 1000);
+    const cutoff = now - this.chatHistory.ttlSeconds;
+    const merged = [
+      ...this.chatHistory.messages,
+      {
+        id: crypto.randomUUID(),
+        role: "user" as const,
+        content: request.message.slice(0, 512),
+        taskType: request.taskType,
+        createdAt: now,
+      },
+      {
+        id: crypto.randomUUID(),
+        role: "assistant" as const,
+        content: reply.slice(0, 2048),
+        taskType: request.taskType,
+        createdAt: now,
+      },
+    ]
+      .filter((item) => item.createdAt >= cutoff)
+      .slice(-this.chatHistory.maxMessages);
+    const prunedCount = Math.max(0, this.chatHistory.messages.length + 2 - merged.length);
+    this.chatHistory = {
+      ...this.chatHistory,
+      updatedAt: now,
+      count: merged.length,
+      prunedCount,
+      messages: merged,
+    };
+    return prunedCount;
   }
 
   private createAssistantReply(request: AIAssistantChatRequest) {
@@ -345,6 +534,7 @@ export class MockTransport extends BaseTransport {
           preferences: request.includePreferences ? { people: 2, taste: ["清淡", "少油"], avoid: ["香菜"] } : null,
           memory_summary: request.includeMemory ? this.memorySummary : null,
           offline_queue: { pending_count: 0 },
+          conversation_history: this.chatHistory,
         },
         output_policy: {
           ai_result_must_be_confirmed: true,
@@ -360,8 +550,9 @@ export class MockTransport extends BaseTransport {
       taskType: request.taskType,
       confidence: 82,
       needsConfirmation: request.taskType !== "chat_assist",
-      safetyNote: "Mock 结果只验证上下文注入和结构化输出，不会直接写入库存。",
+      safetyNote: "Mock 结果仅验证上下文注入和结构化输出，不会直接写入库存。",
     };
+
     if (request.taskType === "recipe_generate") {
       return {
         ...base,
@@ -379,6 +570,7 @@ export class MockTransport extends BaseTransport {
         },
       };
     }
+
     if (request.taskType === "shopping_list_generate") {
       return {
         ...base,
@@ -391,6 +583,7 @@ export class MockTransport extends BaseTransport {
         },
       };
     }
+
     if (request.taskType === "recognize_ingredients") {
       return {
         ...base,
@@ -403,6 +596,7 @@ export class MockTransport extends BaseTransport {
         },
       };
     }
+
     return {
       ...base,
       needsConfirmation: request.taskType !== "chat_assist",

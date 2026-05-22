@@ -779,6 +779,76 @@ th {
   align-items: center;
 }
 
+.mic-test-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.mic-control-card {
+  border-left: 4px solid var(--accent);
+}
+
+.mic-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mic-bars {
+  height: 168px;
+  display: grid;
+  grid-template-columns: repeat(30, minmax(4px, 1fr));
+  align-items: end;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(22, 125, 127, 0.08), rgba(22, 125, 127, 0)),
+    #f5faf9;
+}
+
+.mic-bar {
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: end;
+  justify-content: center;
+}
+
+.mic-bar i,
+.mic-bar b {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  min-height: 4px;
+  border-radius: 999px 999px 2px 2px;
+}
+
+.mic-bar i {
+  background: rgba(183, 121, 31, 0.24);
+}
+
+.mic-bar b {
+  width: 58%;
+  background: linear-gradient(180deg, #24a39d, var(--accent-strong));
+}
+
+.mic-result-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mic-result-grid > div {
+  min-height: 96px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #f7fbfb;
+}
+
 .json-preview {
   margin: 0;
   min-height: 170px;
@@ -1364,9 +1434,18 @@ textarea {
   .ai-assistant-grid,
   .project-ai-grid,
   .project-ai-grid.wide,
+  .mic-test-grid,
+  .mic-metrics-grid,
+  .mic-result-grid,
   .ai-chat-input,
   .form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .mic-bars {
+    grid-template-columns: repeat(30, minmax(3px, 1fr));
+    gap: 3px;
+    padding: 10px;
   }
 
   .primary-panel {

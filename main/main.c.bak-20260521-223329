@@ -12,11 +12,8 @@
 #include "esp_err.h"
 #include "nvs_flash.h"
 #include "fridge_ai_client.h"
-#include "fridge_asr.h"
-#include "fridge_audio.h"
 #include "fridge_diagnostics.h"
 #include "fridge_network.h"
-#include "fridge_sensors.h"
 #include "fridge_usb_protocol.h"
 #endif
 
@@ -62,9 +59,6 @@ void app_main(void)
 
     ESP_ERROR_CHECK(fridge_network_init());
     ESP_ERROR_CHECK(fridge_ai_client_init());
-    ESP_ERROR_CHECK(fridge_asr_init());
-    ESP_ERROR_CHECK(fridge_sensors_init());
-    ESP_ERROR_CHECK(fridge_audio_init());
     ESP_ERROR_CHECK(fridge_usb_protocol_start());
     ESP_LOGI(TAG, "USB provisioning console is ready");
 

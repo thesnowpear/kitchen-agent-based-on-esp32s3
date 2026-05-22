@@ -28,6 +28,7 @@
 #define WIFI_DISCONNECT_TIMEOUT_MS 3000
 #define WIFI_MAXIMUM_RETRY 5
 #define WIFI_SNTP_TASK_STACK 4096
+#define WIFI_SAVED_CONNECT_TASK_STACK 4096
 #define WIFI_NVS_NAMESPACE "fridge_net"
 #define WIFI_NVS_KEY_SSID "ssid"
 #define WIFI_NVS_KEY_PASSWORD "password"
@@ -38,6 +39,7 @@ static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_connect_mutex;
 static SemaphoreHandle_t s_sntp_mutex;
 static TaskHandle_t s_sntp_task;
+static TaskHandle_t s_saved_connect_task;
 static esp_netif_t *s_sta_netif;
 static bool s_initialized;
 static bool s_connected;
@@ -190,6 +192,24 @@ static void start_sntp_sync_task(void)
         s_sntp_task = NULL;
         ESP_LOGW(TAG, "create SNTP sync task failed");
     }
+}
+
+static void saved_connect_task(void *arg)
+{
+    (void)arg;
+    // 设备启动时先让 USB 调试面板可用，再后台尝试连接已保存 Wi-Fi。
+    // 这样旧密码、热点关闭或信号问题不会阻塞 get_status/get_network。
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_err_t err = fridge_network_connect_saved();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "saved Wi-Fi connected in background");
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "no saved Wi-Fi credential, waiting for USB provisioning");
+    } else {
+        ESP_LOGW(TAG, "saved Wi-Fi background connect failed: %s", esp_err_to_name(err));
+    }
+    s_saved_connect_task = NULL;
+    vTaskDelete(NULL);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -538,6 +558,26 @@ esp_err_t fridge_network_connect_saved(void)
     return fridge_network_connect(&config, false);
 }
 
+esp_err_t fridge_network_connect_saved_async(void)
+{
+    ESP_RETURN_ON_ERROR(fridge_network_init(), TAG, "network init failed before saved async connect");
+    if (s_saved_connect_task) {
+        return ESP_OK;
+    }
+
+    BaseType_t ok = xTaskCreate(saved_connect_task,
+                                "wifi_saved_conn",
+                                WIFI_SAVED_CONNECT_TASK_STACK,
+                                NULL,
+                                3,
+                                &s_saved_connect_task);
+    if (ok != pdPASS) {
+        s_saved_connect_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 esp_err_t fridge_network_sync_time(void)
 {
     if (!s_connected) {
@@ -616,6 +656,7 @@ esp_err_t fridge_network_get_status(fridge_network_status_t *status)
     memset(status, 0, sizeof(*status));
     status->initialized = s_initialized;
     status->connected = s_connected;
+    status->connecting = s_connecting;
     status->saved = s_saved;
     status->internet_ready = s_internet_ready;
     status->rssi = s_last_rssi;
