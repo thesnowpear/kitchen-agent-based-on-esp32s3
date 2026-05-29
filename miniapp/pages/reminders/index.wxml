@@ -1,0 +1,33 @@
+<view class="page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">今日待办</view>
+      <view class="title">提醒中心</view>
+    </view>
+  </view>
+
+  <view wx:if="{{errorText}}" class="panel" style="border-color: var(--color-tomato-soft);">
+    <view class="kicker" style="color: var(--color-tomato);">加载失败</view>
+    <view class="subtitle">{{errorText}}</view>
+    <button class="btn ghost" style="margin-top: var(--space-3);" bindtap="load">重试</button>
+  </view>
+
+  <view wx:if="{{items.length > 0}}" class="list">
+    <view class="panel reminder-card" wx:for="{{items}}" wx:key="id">
+      <view class="row">
+        <view class="title" style="font-size: var(--text-md); margin: 0;">{{item.title}}</view>
+        <view class="tag {{item.tagClass}}">{{item.levelText}}</view>
+      </view>
+      <view wx:if="{{item.content}}" class="subtitle" style="margin-top: var(--space-3);">{{item.content}}</view>
+      <view class="row" style="margin-top: var(--space-4);">
+        <text class="soft">到期：{{item.dueText}}</text>
+        <view class="row" style="gap: var(--space-3);">
+          <button class="btn ghost" style="height: 64rpx; line-height: 64rpx; padding: 0 var(--space-5);" data-id="{{item.id}}" loading="{{item.confirming}}" bindtap="onDismiss">忽略</button>
+          <button class="btn secondary" style="height: 64rpx; line-height: 64rpx; padding: 0 var(--space-5);" data-id="{{item.id}}" loading="{{item.confirming}}" bindtap="onConfirm">确认</button>
+        </view>
+      </view>
+    </view>
+  </view>
+
+  <view wx:if="{{!loading && !errorText && items.length === 0}}" class="empty">暂无待处理提醒</view>
+</view>

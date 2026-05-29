@@ -23,9 +23,11 @@
 #define STORAGE_CACHE_PARTITION_LABEL "cache"
 #define STORAGE_CACHE_BASE_PATH "/cache"
 #define STORAGE_CHAT_HISTORY_PATH STORAGE_CACHE_BASE_PATH "/ai_history.json"
+#define STORAGE_UI_INVENTORY_PATH STORAGE_CACHE_BASE_PATH "/ui_inventory.json"
 #define STORAGE_CHAT_HISTORY_SCHEMA_VERSION 1
 #define STORAGE_CACHE_FORMAT_ON_FAIL true
 #define STORAGE_HISTORY_FILE_BUFFER_SIZE 12288
+#define STORAGE_UI_INVENTORY_FILE_BUFFER_SIZE FRIDGE_STORAGE_MAX_JSON_LEN
 #define STORAGE_EPOCH_READY_THRESHOLD 1735689600LL
 
 static const char *TAG = "fridge_storage";
@@ -50,6 +52,39 @@ static const char *INVENTORY_JSON =
     "{\"item_id\":\"seed_tomato\",\"name\":\"番茄\",\"category\":\"蔬菜\",\"quantity\":\"3个\",\"expire_date\":\"2026-05-23\",\"days_left\":2,\"location\":\"冷藏主仓 B2\",\"confidence\":1.0,\"source\":\"user_confirmed\"},"
     "{\"item_id\":\"seed_egg\",\"name\":\"鸡蛋\",\"category\":\"蛋奶\",\"quantity\":\"6枚\",\"expire_date\":\"2026-05-28\",\"days_left\":7,\"location\":\"门架上层\",\"confidence\":1.0,\"source\":\"user_confirmed\"},"
     "{\"item_id\":\"seed_milk\",\"name\":\"牛奶\",\"category\":\"饮品\",\"quantity\":\"1盒\",\"expire_date\":\"2026-05-22\",\"days_left\":1,\"location\":\"门架中层\",\"confidence\":1.0,\"source\":\"user_confirmed\"}"
+    "]}";
+
+static const char *UI_INVENTORY_JSON =
+    "{\"schema_version\":1,"
+    "\"snapshot_version\":1,"
+    "\"source\":\"ui_reference_seed\","
+    "\"zones\":["
+    "{\"id\":0,\"name\":\"上层冷冻\",\"custom\":false},"
+    "{\"id\":1,\"name\":\"左侧冷藏\",\"custom\":false},"
+    "{\"id\":2,\"name\":\"右侧冷藏\",\"custom\":false},"
+    "{\"id\":3,\"name\":\"门架\",\"custom\":false}"
+    "],"
+    "\"items\":["
+    "{\"name\":\"速冻水饺\",\"quantity\":\"12个\",\"expire_date\":\"30天后\",\"days_left\":30,\"location\":\"上层冷冻 A1\",\"zone\":0,\"cell\":0},"
+    "{\"name\":\"鸡胸肉\",\"quantity\":\"1份\",\"expire_date\":\"12天后\",\"days_left\":12,\"location\":\"上层冷冻 A2\",\"zone\":0,\"cell\":1},"
+    "{\"name\":\"玉米粒\",\"quantity\":\"半袋\",\"expire_date\":\"20天后\",\"days_left\":20,\"location\":\"上层冷冻 B1\",\"zone\":0,\"cell\":3},"
+    "{\"name\":\"虾仁\",\"quantity\":\"200g\",\"expire_date\":\"15天后\",\"days_left\":15,\"location\":\"上层冷冻 B2\",\"zone\":0,\"cell\":4},"
+    "{\"name\":\"牛肉卷\",\"quantity\":\"1盒\",\"expire_date\":\"18天后\",\"days_left\":18,\"location\":\"上层冷冻 C2\",\"zone\":0,\"cell\":7},"
+    "{\"name\":\"鸡蛋\",\"quantity\":\"3个\",\"expire_date\":\"2天后\",\"days_left\":2,\"location\":\"左侧冷藏 A1\",\"zone\":1,\"cell\":0},"
+    "{\"name\":\"酸奶\",\"quantity\":\"2杯\",\"expire_date\":\"3天后\",\"days_left\":3,\"location\":\"左侧冷藏 A2\",\"zone\":1,\"cell\":1},"
+    "{\"name\":\"菠菜\",\"quantity\":\"1把\",\"expire_date\":\"今天\",\"days_left\":0,\"location\":\"左侧冷藏 B1\",\"zone\":1,\"cell\":3},"
+    "{\"name\":\"番茄\",\"quantity\":\"2个\",\"expire_date\":\"3天后\",\"days_left\":3,\"location\":\"左侧冷藏 B2\",\"zone\":1,\"cell\":4},"
+    "{\"name\":\"黄瓜\",\"quantity\":\"1根\",\"expire_date\":\"4天后\",\"days_left\":4,\"location\":\"左侧冷藏 B3\",\"zone\":1,\"cell\":5},"
+    "{\"name\":\"豆腐\",\"quantity\":\"1盒\",\"expire_date\":\"明天\",\"days_left\":1,\"location\":\"左侧冷藏 C1\",\"zone\":1,\"cell\":6},"
+    "{\"name\":\"生菜\",\"quantity\":\"1颗\",\"expire_date\":\"2天后\",\"days_left\":2,\"location\":\"右侧冷藏 A1\",\"zone\":2,\"cell\":0},"
+    "{\"name\":\"胡萝卜\",\"quantity\":\"2根\",\"expire_date\":\"7天后\",\"days_left\":7,\"location\":\"右侧冷藏 A2\",\"zone\":2,\"cell\":1},"
+    "{\"name\":\"蘑菇\",\"quantity\":\"1盒\",\"expire_date\":\"2天后\",\"days_left\":2,\"location\":\"右侧冷藏 A3\",\"zone\":2,\"cell\":2},"
+    "{\"name\":\"蓝莓\",\"quantity\":\"1盒\",\"expire_date\":\"3天后\",\"days_left\":3,\"location\":\"右侧冷藏 B2\",\"zone\":2,\"cell\":4},"
+    "{\"name\":\"苹果\",\"quantity\":\"3个\",\"expire_date\":\"9天后\",\"days_left\":9,\"location\":\"右侧冷藏 C2\",\"zone\":2,\"cell\":7},"
+    "{\"name\":\"番茄酱\",\"quantity\":\"半瓶\",\"expire_date\":\"30天后\",\"days_left\":30,\"location\":\"门架 A1\",\"zone\":3,\"cell\":0},"
+    "{\"name\":\"沙拉酱\",\"quantity\":\"1瓶\",\"expire_date\":\"25天后\",\"days_left\":25,\"location\":\"门架 A2\",\"zone\":3,\"cell\":1},"
+    "{\"name\":\"牛奶\",\"quantity\":\"1盒\",\"expire_date\":\"明天\",\"days_left\":1,\"location\":\"门架 B1\",\"zone\":3,\"cell\":3},"
+    "{\"name\":\"黄油\",\"quantity\":\"1块\",\"expire_date\":\"14天后\",\"days_left\":14,\"location\":\"门架 B2\",\"zone\":3,\"cell\":4}"
     "]}";
 
 static const char *REMINDER_JSON =
@@ -80,6 +115,33 @@ static esp_err_t copy_json(const char *source, char *out, size_t out_size)
     ESP_RETURN_ON_FALSE(len + 1 <= out_size, ESP_ERR_NO_MEM, TAG, "json output buffer too small");
     strlcpy(out, source, out_size);
     return ESP_OK;
+}
+
+static esp_err_t storage_read_text_file(const char *path, char *out, size_t out_size)
+{
+    ESP_RETURN_ON_FALSE(path && out && out_size > 0, ESP_ERR_INVALID_ARG, TAG, "invalid read file args");
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    size_t bytes = fread(out, 1, out_size - 1, file);
+    bool truncated = !feof(file);
+    fclose(file);
+    out[bytes] = '\0';
+    return truncated ? ESP_ERR_NO_MEM : ESP_OK;
+}
+
+static esp_err_t storage_write_text_file(const char *path, const char *text)
+{
+    ESP_RETURN_ON_FALSE(path && text, ESP_ERR_INVALID_ARG, TAG, "invalid write file args");
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        return ESP_FAIL;
+    }
+    size_t len = strlen(text);
+    size_t written = fwrite(text, 1, len, file);
+    fclose(file);
+    return written == len ? ESP_OK : ESP_FAIL;
 }
 
 static esp_err_t open_storage_nvs(nvs_open_mode_t mode, nvs_handle_t *handle)
@@ -491,6 +553,22 @@ esp_err_t fridge_storage_init(void)
     free(history);
     ESP_RETURN_ON_ERROR(err, TAG, "init history file failed");
 
+    char *ui_inventory = calloc(1, STORAGE_UI_INVENTORY_FILE_BUFFER_SIZE);
+    ESP_RETURN_ON_FALSE(ui_inventory, ESP_ERR_NO_MEM, TAG, "allocate ui inventory buffer failed");
+    err = storage_read_text_file(STORAGE_UI_INVENTORY_PATH, ui_inventory, STORAGE_UI_INVENTORY_FILE_BUFFER_SIZE);
+    if (err == ESP_ERR_NOT_FOUND) {
+        err = storage_write_text_file(STORAGE_UI_INVENTORY_PATH, UI_INVENTORY_JSON);
+    } else if (err == ESP_OK) {
+        cJSON *root = cJSON_Parse(ui_inventory);
+        if (!root) {
+            ESP_LOGW(TAG, "ui inventory invalid, recreating");
+            err = storage_write_text_file(STORAGE_UI_INVENTORY_PATH, UI_INVENTORY_JSON);
+        }
+        cJSON_Delete(root);
+    }
+    free(ui_inventory);
+    ESP_RETURN_ON_ERROR(err, TAG, "init ui inventory file failed");
+
     s_initialized = true;
     ESP_LOGI(TAG, "storage facade initialized, inventory_version=%lu", (unsigned long)s_inventory_version);
     return ESP_OK;
@@ -500,6 +578,29 @@ esp_err_t fridge_storage_get_inventory_snapshot(char *out, size_t out_size)
 {
     ESP_RETURN_ON_ERROR(fridge_storage_init(), TAG, "storage init failed");
     return copy_json(INVENTORY_JSON, out, out_size);
+}
+
+esp_err_t fridge_storage_get_ui_inventory_snapshot(char *out, size_t out_size)
+{
+    ESP_RETURN_ON_ERROR(fridge_storage_init(), TAG, "storage init failed");
+    esp_err_t err = storage_read_text_file(STORAGE_UI_INVENTORY_PATH, out, out_size);
+    if (err == ESP_ERR_NOT_FOUND) {
+        ESP_RETURN_ON_ERROR(storage_write_text_file(STORAGE_UI_INVENTORY_PATH, UI_INVENTORY_JSON), TAG, "create ui inventory failed");
+        return copy_json(UI_INVENTORY_JSON, out, out_size);
+    }
+    return err;
+}
+
+esp_err_t fridge_storage_set_ui_inventory_snapshot(const char *inventory_json)
+{
+    ESP_RETURN_ON_FALSE(inventory_json && inventory_json[0] == '{', ESP_ERR_INVALID_ARG, TAG, "ui inventory must be JSON object");
+    ESP_RETURN_ON_FALSE(strlen(inventory_json) < STORAGE_UI_INVENTORY_FILE_BUFFER_SIZE, ESP_ERR_INVALID_SIZE, TAG, "ui inventory too large");
+    ESP_RETURN_ON_ERROR(fridge_storage_init(), TAG, "storage init failed");
+    cJSON *root = cJSON_Parse(inventory_json);
+    ESP_RETURN_ON_FALSE(root, ESP_ERR_INVALID_ARG, TAG, "ui inventory json invalid");
+    cJSON_Delete(root);
+    s_inventory_version++;
+    return storage_write_text_file(STORAGE_UI_INVENTORY_PATH, inventory_json);
 }
 
 esp_err_t fridge_storage_get_reminder_queue(char *out, size_t out_size)

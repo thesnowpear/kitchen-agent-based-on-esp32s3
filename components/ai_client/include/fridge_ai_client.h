@@ -97,6 +97,26 @@ typedef struct {
     uint32_t local_snapshot_version;
 } fridge_ai_assistant_result_t;
 
+// AI 图片识别请求：JPEG 只在内存中传入，不在设备端落盘。
+// 注意：首版通过 image_url(data:) 发送给 OpenAI-compatible /chat/completions；服务商需支持视觉模型。
+typedef struct {
+    const uint8_t *jpeg;
+    size_t jpeg_len;
+    int width;
+    int height;
+    char task_type[32];
+} fridge_ai_image_request_t;
+
+// AI 图片识别结果：只作为候选展示，必须由用户确认后才能进入库存。
+typedef struct {
+    fridge_ai_chat_result_t chat;
+    char task_type[32];
+    int width;
+    int height;
+    size_t jpeg_bytes;
+    bool needs_confirmation;
+} fridge_ai_image_result_t;
+
 // 初始化 AI 客户端；该组件只使用 NVS 和 HTTPS，不控制 GPIO。
 esp_err_t fridge_ai_client_init(void);
 
@@ -126,6 +146,9 @@ esp_err_t fridge_ai_client_test_chat(const char *message, fridge_ai_chat_result_
 
 // 使用 OpenAI-compatible /chat/completions 进行一次带项目上下文的真实 AI 助手对话。
 esp_err_t fridge_ai_client_assistant_chat(const fridge_ai_assistant_request_t *request, fridge_ai_assistant_result_t *out);
+
+// 使用 OpenAI-compatible /chat/completions + image_url(data:) 分析一张最近拍摄的 JPEG。
+esp_err_t fridge_ai_client_analyze_image(const fridge_ai_image_request_t *request, fridge_ai_image_result_t *out);
 
 #ifdef __cplusplus
 }

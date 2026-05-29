@@ -1,0 +1,37 @@
+<view class="page rise">
+  <view class="kicker">第二步</view>
+  <view class="title">绑定你的冰箱贴</view>
+  <view class="subtitle">演示模式可一键绑定后端预置的 DEMO-FRIDGE-001；正式设备请输入屏幕上显示的绑定码或扫码绑定。</view>
+
+  <view class="panel">
+    <view class="kicker">推荐 · 比赛演示</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0 var(--space-3);">一键绑定演示设备</view>
+    <view class="subtitle">绑定码：DEMO · 后端 lifespan 启动时已种入 DEMO-FRIDGE-001。</view>
+    <button class="btn" loading="{{loading}}" bindtap="onBindDemo" style="margin-top: var(--space-5);">一键绑定演示设备</button>
+  </view>
+
+  <view class="panel">
+    <view class="kicker">备用 · 真实设备</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0 var(--space-3);">手动 / 扫码绑定</view>
+    <input class="input" value="{{bindCode}}" placeholder="例如 FS-2026-ABCD" bindinput="onBindCodeInput" />
+    <view class="row" style="margin-top: var(--space-4); gap: var(--space-3);">
+      <button class="btn ghost" bindtap="scanBindCode" style="flex: 1;">扫码读取</button>
+      <button class="btn secondary" loading="{{loading}}" bindtap="onBindManual" style="flex: 1;">确认绑定</button>
+    </view>
+    <view wx:if="{{errorText}}" class="subtitle" style="color: var(--color-tomato); margin-top: var(--space-3);">{{errorText}}</view>
+  </view>
+
+  <view class="panel">
+    <view class="kicker">当前设备</view>
+    <view wx:if="{{device}}" style="margin-top: var(--space-3);">
+      <view class="row">
+        <text class="title" style="font-size: var(--text-md); margin: 0;">{{device.name || device.deviceSn}}</text>
+        <text class="tag {{device.status === 'online' ? 'mint' : device.status === 'offline' ? 'danger' : 'warn'}}">{{device.status}}</text>
+      </view>
+      <view class="subtitle" style="margin-top: var(--space-2);">SN：{{device.deviceSn}}</view>
+      <view wx:if="{{device.firmwareVersion}}" class="subtitle">固件：{{device.firmwareVersion}}</view>
+      <view wx:if="{{device.lastSeenAt}}" class="soft" style="margin-top: var(--space-2);">最近上线：{{device.lastSeenAt}}</view>
+    </view>
+    <view wx:else class="empty">还没有绑定设备</view>
+  </view>
+</view>

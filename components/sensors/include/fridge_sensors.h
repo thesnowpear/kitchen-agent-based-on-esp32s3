@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "driver/i2c_types.h"
+#include "fridge_radar.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,6 +13,11 @@ extern "C" {
 #define FRIDGE_LIGHT_ADC_GPIO 1
 #define FRIDGE_LIGHT_ADC_MAX_RAW 4095
 #define FRIDGE_LIGHT_VALUE_MAX_10BIT 1023
+
+#define FRIDGE_IMU_I2C_PORT I2C_NUM_0
+#define FRIDGE_IMU_I2C_SDA_GPIO 4
+#define FRIDGE_IMU_I2C_SCL_GPIO 5
+#define FRIDGE_IMU_DEFAULT_ADDR 0x68
 
 // 传感器快照：给 Web 面板和后续状态机复用。
 // 注意：当前光敏模块 AO 为反向模拟量，ADC 原始值越高表示越暗，越低表示越亮。
@@ -22,6 +29,22 @@ typedef struct {
     uint16_t light_value_10bit;
     uint8_t light_percent;
     int16_t light_delta;
+    bool imu_ready;
+    uint8_t imu_address;
+    uint8_t imu_who_am_i;
+    int imu_error;
+    float accel_x_g;
+    float accel_y_g;
+    float accel_z_g;
+    float gyro_x_dps;
+    float gyro_y_dps;
+    float gyro_z_dps;
+    float imu_temperature_c;
+    float pitch_deg;
+    float roll_deg;
+    float angle_delta;
+    float vibration_peak;
+    fridge_radar_snapshot_t radar;
     int64_t updated_at_ms;
 } fridge_sensor_snapshot_t;
 

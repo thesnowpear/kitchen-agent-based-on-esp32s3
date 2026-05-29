@@ -1,0 +1,210 @@
+/*
+ * 自定义 tabBar wxss —— 1:1 复刻 ui-reference/WLW 的 .dock。
+ *
+ * ⚠ 自定义 tabBar 是一个 Component；微信对 Component wxss 有严格限制：
+ *   - 不允许 tag 名选择器（如 `page`, `view`, `button`）
+ *   - 不允许 id 选择器（`#xxx`）
+ *   - 不允许属性选择器（`[xxx]`）
+ *   因此本文件不能 `@import "/styles/tokens.wxss"`（tokens 用了 `page` 选择器
+ *   暴露 CSS 变量），所有颜色 / 间距全部硬编码。
+ *
+ * 关键尺寸映射（ui-reference 是 375px 设计稿，miniapp 用 rpx，2rpx ≈ 1px）：
+ *   .dock      left/right 32px → 64rpx；bottom 24px → 48rpx；height 72px → 144rpx
+ *   .dock      border-radius 30px → 60rpx；padding 8px → 16rpx；gap 8px → 16rpx
+ *   .camera-main  margin-top -28px → -56rpx；height 88px → 176rpx
+ *
+ * 颜色硬编码值（取自 styles/tokens.wxss，与全站 design tokens 同步）：
+ *   sage-dark        #2f6047    主色 / 选中底
+ *   paper            #fffdf8    主背景
+ *   tomato           #d95745    中间登记按钮
+ *   line             rgba(47,96,71,0.18)   描边
+ *   sage-soft        rgba(95,143,114,0.12) 悬停底
+ *   shadow-card      0 12rpx 36rpx rgba(74,86,66,0.12)
+ */
+
+/* 整体 dock 容器：低矮的磨砂托盘，降低两端大圆和中间按钮的突兀感。
+ * safe-area-inset-bottom 保留，保证全面屏不会压到 home indicator。 */
+.dock {
+  position: fixed;
+  left: 38rpx;
+  right: 38rpx;
+  bottom: calc(-6rpx + env(safe-area-inset-bottom));
+  z-index: 50;
+  height: 124rpx;
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8rpx;
+  padding: 12rpx;
+  border-radius: 42rpx;
+  background: rgba(255, 253, 248, 0.88);
+  border: 1rpx solid rgba(47, 96, 71, 0.14);
+  box-shadow: 0 18rpx 46rpx rgba(74, 86, 66, 0.16);
+  box-sizing: border-box;
+}
+
+/* 普通 tab 按钮：列方向，icon 上 + text 下 */
+.dock-btn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5rpx;
+  border: 0;
+  border-radius: 30rpx;
+  background: transparent;
+  color: rgba(47, 96, 71, 0.78);
+  font-size: 22rpx;
+  font-weight: 800;
+  line-height: 1;
+  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.dock-btn-hover {
+  background: rgba(95, 143, 114, 0.12);
+  transform: translateY(-2rpx);
+}
+
+.dock-btn.is-selected {
+  background: rgba(47, 96, 71, 0.12);
+  color: #2f6047;
+}
+
+.dock-btn.is-selected .dock-icon {
+  color: #2f6047;
+}
+
+/* ───── 中间"登记"抬起按钮 ─────
+   比原先更低、更圆润：保留主行动权重，但不再像高耸的红色胶囊。 */
+.dock-btn.camera-main {
+  margin-top: -34rpx;
+  height: 136rpx;
+  border-radius: 40rpx;
+  background: linear-gradient(180deg, #e85f4f 0%, #d84d3e 100%);
+  color: #ffffff;
+  box-shadow:
+    0 18rpx 38rpx rgba(217, 87, 69, 0.24),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.28);
+  transform: translateY(-4rpx);
+}
+
+.dock-btn.camera-main .dock-icon {
+  color: #ffffff;
+}
+
+.dock-btn.camera-main.is-selected {
+  background: linear-gradient(180deg, #e85f4f 0%, #c94435 100%);
+  color: #ffffff;
+}
+
+.dock-btn.camera-main.dock-btn-hover {
+  background: linear-gradient(180deg, #ef6b5b 0%, #d84d3e 100%);
+  transform: translateY(-8rpx);
+}
+
+/* ───── icon：纯 CSS 画 ─────
+   尺寸 40rpx，颜色继承父 color（被选中时变白）。 */
+.dock-icon {
+  position: relative;
+  width: 38rpx;
+  height: 38rpx;
+  color: inherit;
+}
+
+.dock-icon::before,
+.dock-icon::after {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+}
+
+/* 首页：屋顶三角 + 房身矩形 */
+.icon-home::before {
+  inset: 14rpx 6rpx 6rpx;
+  border: 4rpx solid currentColor;
+  border-top: 0;
+  border-radius: 0 0 4rpx 4rpx;
+}
+.icon-home::after {
+  left: 50%;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 16rpx solid transparent;
+  border-right: 16rpx solid transparent;
+  border-bottom: 14rpx solid currentColor;
+}
+
+/* AI：星芒（4 个三角拼成的 spark） */
+.icon-ai::before {
+  inset: 6rpx;
+  background:
+    linear-gradient(currentColor, currentColor) center / 4rpx 100% no-repeat,
+    linear-gradient(currentColor, currentColor) center / 100% 4rpx no-repeat;
+}
+.icon-ai::after {
+  inset: 12rpx;
+  background:
+    linear-gradient(45deg, transparent 46%, currentColor 46%, currentColor 54%, transparent 54%) center / 100% 100% no-repeat,
+    linear-gradient(-45deg, transparent 46%, currentColor 46%, currentColor 54%, transparent 54%) center / 100% 100% no-repeat;
+}
+
+/* 相机/登记：镜头（外圆+内圆） + 顶部小帽 */
+.icon-camera::before {
+  inset: 14rpx 4rpx 4rpx;
+  border: 4rpx solid currentColor;
+  border-radius: 6rpx;
+}
+.icon-camera::after {
+  left: 50%;
+  top: 12rpx;
+  width: 14rpx;
+  height: 14rpx;
+  transform: translate(-50%, 50%);
+  border: 4rpx solid currentColor;
+  border-radius: 50%;
+  background: transparent;
+}
+
+/* 设置：齿轮简化为圆形 + 中心点 */
+.icon-settings::before {
+  inset: 6rpx;
+  border: 4rpx solid currentColor;
+  border-radius: 50%;
+}
+.icon-settings::after {
+  left: 50%;
+  top: 50%;
+  width: 8rpx;
+  height: 8rpx;
+  transform: translate(-50%, -50%);
+  background: currentColor;
+  border-radius: 50%;
+}
+
+/* 更多：横向三圆点 */
+.icon-more::before {
+  left: 4rpx;
+  top: 50%;
+  width: 8rpx;
+  height: 8rpx;
+  transform: translateY(-50%);
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow:
+    14rpx 0 0 currentColor,
+    28rpx 0 0 currentColor;
+}
+
+.dock-text {
+  font-size: 21rpx;
+  letter-spacing: 0;
+  font-weight: 700;
+}
+
+.dock-btn.camera-main .dock-text {
+  font-size: 22rpx;
+  font-weight: 800;
+  letter-spacing: 0;
+}

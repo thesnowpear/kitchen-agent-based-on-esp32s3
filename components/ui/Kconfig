@@ -1,0 +1,10 @@
+menu "Fridge Spirit UI"
+
+    config FRIDGE_UI_ENABLE
+        bool "Enable LVGL touch UI"
+        default y
+        help
+            启用后正常主控模式会启动 720x720 LVGL 本地触摸 UI。
+            首轮 UI 会复用已验证的 TR230S QSPI 显示路径，并保留 USB/Web 面板并行运维。
+
+endmenu

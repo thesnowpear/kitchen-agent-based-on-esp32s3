@@ -28,13 +28,29 @@
 #define CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ 10000000
 #endif
 
+#ifndef CONFIG_FRIDGE_SCREEN_TEST_COLOR_HOLD_MS
+// 正常 sdkconfig 会提供该值；这里保留编译兜底，避免非屏幕测试配置下缺少宏。
+#define CONFIG_FRIDGE_SCREEN_TEST_COLOR_HOLD_MS 3000
+#endif
+
+#ifndef CONFIG_FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES
+// 长时间稳定性测试默认低频打印，减少 idf.py monitor 或 Web Serial 端的日志压力。
+#define CONFIG_FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES 10
+#endif
+
+#ifdef CONFIG_FRIDGE_SCREEN_TEST_VERBOSE_LOG
+#define LCD_TEST_VERBOSE_LOG_ENABLED 1
+#else
+#define LCD_TEST_VERBOSE_LOG_ENABLED 0
+#endif
+
 #define LCD_PIN_CS GPIO_NUM_10
 #define LCD_PIN_D0 GPIO_NUM_11
 #define LCD_PIN_SCLK GPIO_NUM_12
 #define LCD_PIN_D1 GPIO_NUM_13
 #define LCD_PIN_D2 GPIO_NUM_14
 #define LCD_PIN_D3 GPIO_NUM_9
-#define LCD_PIN_RST GPIO_NUM_8
+#define LCD_PIN_RST GPIO_NUM_7
 #define LCD_PIN_WAIT GPIO_NUM_6
 #define LCD_SPI_HOST SPI2_HOST
 #define LCD_WAIT_READY_TIMEOUT_MS 500
@@ -167,7 +183,7 @@ static void example_lcd_display_dir(uint8_t dir)
     s_lcd_dev.setycmd = 0x2B;
 }
 
-// 当前主控没有例程板载 XL9555，RESET# 直接接 GPIO8，所以这里做最小硬复位适配。
+// 当前主控没有例程板载 XL9555，RESET# 直接接 GPIO7，所以这里做最小硬复位适配。
 static void example_lcd_hard_reset(void)
 {
     gpio_config_t rst_conf = {
@@ -306,7 +322,9 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
     uint8_t high = color >> 8;
     uint8_t low = color & 0xFF;
 
-    ESP_LOGI(TAG, "step: acquire spi bus color=0x%04X", color);
+    if (LCD_TEST_VERBOSE_LOG_ENABLED) {
+        ESP_LOGI(TAG, "step: acquire spi bus color=0x%04X", color);
+    }
     esp_err_t ret = spi_device_acquire_bus(s_lcd, portMAX_DELAY);
     if (ret != ESP_OK) {
         return ret;
@@ -323,7 +341,7 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
         }
 
         for (int i = 0; i < LCD_BLOCK_COUNT; i++) {
-            if (i == 0 || i == LCD_BLOCK_COUNT - 1) {
+            if (LCD_TEST_VERBOSE_LOG_ENABLED && (i == 0 || i == LCD_BLOCK_COUNT - 1)) {
                 ESP_LOGI(TAG, "step: write qspi block %d/%d size=%d", i + 1, LCD_BLOCK_COUNT, LCD_BLOCK_SIZE);
             }
             ret = example_qspi_write_data(s_lcd_buf + i * LCD_BLOCK_SIZE, LCD_BLOCK_SIZE, true);
@@ -338,7 +356,9 @@ static esp_err_t example_qspilcd_clear(uint16_t color)
     }
 
     spi_device_release_bus(s_lcd);
-    ESP_LOGI(TAG, "step: release spi bus color=0x%04X ret=%s", color, esp_err_to_name(ret));
+    if (LCD_TEST_VERBOSE_LOG_ENABLED) {
+        ESP_LOGI(TAG, "step: release spi bus color=0x%04X ret=%s", color, esp_err_to_name(ret));
+    }
     return ret;
 }
 
@@ -355,7 +375,7 @@ static void stop_forever(const char *reason, esp_err_t err)
 void fridge_display_test_run(void)
 {
     ESP_LOGW(TAG, "Example-based TR230S QSPI test is enabled.");
-    ESP_LOGW(TAG, "Pins: CS=10 D0=11 SCLK=12 D1=13 D2=14 D3=9 RST=8 WAIT#=6; D/C# and QSPI-INT are not used.");
+    ESP_LOGW(TAG, "Pins: CS=10 D0=11 SCLK=12 D1=13 D2=14 D3=9 RST=7 WAIT#=6; D/C# and QSPI-INT are not used.");
     ESP_LOGW(TAG, "Before power-on test: LCD VCC=5V, GPIO logic=3.3V, common GND, no 5V-to-GPIO short.");
 
     gpio_config_t wait_conf = {
@@ -395,17 +415,32 @@ void fridge_display_test_run(void)
         stop_forever("example lcd full-frame PSRAM buffer allocation failed", ESP_ERR_NO_MEM);
     }
     ESP_LOGI(TAG, "example lcd buffer=%p size=%d clock=%d Hz", s_lcd_buf, LCD_TOTAL_BUF_SIZE, CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ);
+    ESP_LOGI(TAG, "long-run mode: color_hold=%d ms report_every=%d cycles verbose_log=%s",
+             CONFIG_FRIDGE_SCREEN_TEST_COLOR_HOLD_MS,
+             CONFIG_FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES,
+             LCD_TEST_VERBOSE_LOG_ENABLED ? "yes" : "no");
 
     const uint16_t colors[] = {COLOR_WHITE, COLOR_RED, COLOR_GREEN, COLOR_BLUE, COLOR_BLACK};
     const char *names[] = {"white", "red", "green", "blue", "black"};
+    uint32_t cycle_count = 0;
     while (true) {
         for (int i = 0; i < (int)(sizeof(colors) / sizeof(colors[0])); i++) {
-            ESP_LOGI(TAG, "example clear: %s", names[i]);
+            if (LCD_TEST_VERBOSE_LOG_ENABLED) {
+                ESP_LOGI(TAG, "example clear: %s", names[i]);
+            }
             ret = example_qspilcd_clear(colors[i]);
             if (ret != ESP_OK) {
                 stop_forever("example qspilcd clear failed", ret);
             }
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_FRIDGE_SCREEN_TEST_COLOR_HOLD_MS));
+        }
+
+        cycle_count++;
+        if ((cycle_count % CONFIG_FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES) == 0) {
+            ESP_LOGI(TAG, "screen test alive: cycles=%lu clock=%d Hz hold=%d ms",
+                     (unsigned long)cycle_count,
+                     CONFIG_FRIDGE_SCREEN_TEST_PCLK_HZ,
+                     CONFIG_FRIDGE_SCREEN_TEST_COLOR_HOLD_MS);
         }
     }
 }

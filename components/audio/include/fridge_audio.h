@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "freertos/FreeRTOS.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,7 @@ extern "C" {
 typedef enum {
     FRIDGE_AUDIO_STATE_IDLE = 0,
     FRIDGE_AUDIO_STATE_RECORDING,
+    FRIDGE_AUDIO_STATE_WAKE_LISTENING,
     FRIDGE_AUDIO_STATE_READY,
     FRIDGE_AUDIO_STATE_ERROR,
 } fridge_audio_state_t;
@@ -50,6 +52,11 @@ esp_err_t fridge_audio_get_status(fridge_audio_status_t *out);
 
 // 读取录音缓冲指针。调用者只读，不负责释放；下一次 start 会覆盖旧数据。
 esp_err_t fridge_audio_get_pcm(const int16_t **pcm, size_t *pcm_bytes, uint32_t *duration_ms);
+
+// 启动唤醒词监听用的连续 PCM 流。该模式和短录音互斥，避免同一 I2S RX 被重复 enable。
+esp_err_t fridge_audio_wake_stream_start(void);
+esp_err_t fridge_audio_wake_stream_read(int16_t *out_samples, size_t max_samples, size_t *sample_count, TickType_t timeout_ticks);
+esp_err_t fridge_audio_wake_stream_stop(void);
 
 #ifdef __cplusplus
 }

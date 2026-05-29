@@ -1,0 +1,56 @@
+<view class="page offline-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">离线模式</view>
+      <view class="title">最近缓存</view>
+    </view>
+    <view class="pill" bindtap="onTapRetry">{{refreshing ? '同步中' : '重试同步'}}</view>
+  </view>
+
+  <view wx:if="{{!hasSnapshot}}" class="panel">
+    <view class="kicker danger">暂无缓存</view>
+    <view class="subtitle">请在网络可用时打开首页、库存或提醒页一次，小程序会自动保存基础快照。</view>
+    <button class="btn" style="margin-top: var(--space-5);" loading="{{refreshing}}" bindtap="onTapRetry">现在尝试同步</button>
+  </view>
+
+  <block wx:else>
+    <view class="panel offline-summary">
+      <view class="kicker">缓存时间</view>
+      <view class="offline-time">{{savedText}}</view>
+      <view class="subtitle">{{deviceText}}</view>
+      <view class="offline-stats">
+        <view><strong>{{inventoryCount}}</strong><text>库存</text></view>
+        <view><strong>{{expiringCount}}</strong><text>临期</text></view>
+        <view><strong>{{reminderCount}}</strong><text>提醒</text></view>
+      </view>
+    </view>
+
+    <view class="row section-head">
+      <view class="kicker">库存快照</view>
+      <view class="pill" bindtap="onTapInventory">打开库存</view>
+    </view>
+    <view class="list">
+      <view wx:for="{{inventory}}" wx:key="id" class="panel compact-card">
+        <view class="row">
+          <view class="col">
+            <view class="item-title">{{item.name}}</view>
+            <view class="subtitle">{{item.quantity}}{{item.unit}} · {{item.placeText}}</view>
+          </view>
+          <view class="tag warn">{{item.expireText}}</view>
+        </view>
+      </view>
+    </view>
+
+    <view class="row section-head">
+      <view class="kicker">待办提醒</view>
+      <view class="pill" bindtap="onTapReminders">打开提醒</view>
+    </view>
+    <view wx:if="{{reminders.length === 0}}" class="empty">没有待处理提醒缓存</view>
+    <view class="list">
+      <view wx:for="{{reminders}}" wx:key="id" class="panel compact-card">
+        <view class="item-title">{{item.title}}</view>
+        <view class="subtitle">{{item.content || '无补充说明'}} · {{item.dueText}}</view>
+      </view>
+    </view>
+  </block>
+</view>

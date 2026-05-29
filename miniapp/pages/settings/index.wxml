@@ -1,0 +1,204 @@
+<view class="page settings-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">运维与隐私</view>
+      <view class="title">小精灵设置</view>
+    </view>
+  </view>
+
+  <!-- 1. 后端 API -->
+  <view class="panel">
+    <view class="kicker">后端 API</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">服务端地址</view>
+    <input class="input" value="{{baseUrl}}" placeholder="http://165.154.23.36:6005" bindinput="onBaseUrlInput" />
+    <view class="row" style="margin-top: var(--space-3);">
+      <text class="subtitle">备用：本地 Mock</text>
+      <switch checked="{{mockEnabled}}" color="#2f6047" bindchange="onMockChange" />
+    </view>
+    <button class="btn" style="margin-top: var(--space-5);" bindtap="saveApiConfig">保存 API 配置</button>
+  </view>
+
+  <!-- 2. 隐私偏好 -->
+  <view class="panel">
+    <view class="kicker">隐私</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">数据与推送</view>
+    <view class="row switch-row">
+      <text>允许云端同步库存</text>
+      <switch checked="{{privacy.allowCloudSync}}" color="#2f6047" data-key="allowCloudSync" bindchange="onPrivacyChange" />
+    </view>
+    <view class="row switch-row">
+      <text>允许上传诊断信息</text>
+      <switch checked="{{privacy.allowUsageDiagnostics}}" color="#2f6047" data-key="allowUsageDiagnostics" bindchange="onPrivacyChange" />
+    </view>
+    <view class="row switch-row">
+      <text>允许提醒推送</text>
+      <switch checked="{{privacy.allowReminderPush}}" color="#2f6047" data-key="allowReminderPush" bindchange="onPrivacyChange" />
+    </view>
+    <button class="btn secondary" style="margin-top: var(--space-5);" loading="{{savingPrivacy}}" bindtap="savePrivacy">保存隐私设置</button>
+  </view>
+
+  <!-- 2.5 提醒偏好 -->
+  <view class="panel">
+    <view class="kicker">提醒偏好</view>
+    <view class="row" style="gap: var(--space-3);">
+      <view class="field-block" style="flex: 1;">
+        <view class="field-label">提前提醒天数</view>
+        <input class="input" type="number" value="{{reminderLeadDays}}" data-field="reminderLeadDays" bindinput="onPreferenceInput" />
+      </view>
+      <view class="field-block" style="flex: 1;">
+        <view class="field-label">低库存阈值</view>
+        <input class="input" type="number" value="{{lowStockThreshold}}" data-field="lowStockThreshold" bindinput="onPreferenceInput" />
+      </view>
+    </view>
+    <view class="row" style="gap: var(--space-3); margin-top: var(--space-5);">
+      <button class="btn ghost" style="flex: 1;" loading="{{subscribing}}" bindtap="requestNotificationSubscribe">订阅登记</button>
+      <button class="btn secondary" style="flex: 1;" loading="{{savingPreferences}}" bindtap="savePreferences">保存偏好</button>
+    </view>
+  </view>
+
+  <!-- 2.6 空间分区 -->
+  <view class="panel">
+    <view class="kicker">空间分区</view>
+    <view class="subtitle">标准分区固定保留；自定义分区存在本地，库存字段可使用 custom_*。</view>
+    <view class="zone-list">
+      <view wx:for="{{zones}}" wx:key="key" class="zone-row">
+        <view>
+          <view class="zone-name">{{item.label}}</view>
+          <view class="soft">{{item.key}} · {{item.hint}}</view>
+        </view>
+        <view wx:if="{{item.custom}}" class="pill danger-pill" data-key="{{item.key}}" bindtap="onDeleteZone">删除</view>
+      </view>
+    </view>
+    <view class="row" style="gap: var(--space-3); margin-top: var(--space-4);">
+      <input class="input" style="flex: 1;" value="{{newZoneName}}" placeholder="新分区名，例如 零食区" bindinput="onZoneNameInput" />
+      <button class="btn" style="width: 180rpx; padding: 0;" bindtap="onAddZone">添加</button>
+    </view>
+  </view>
+
+  <!-- 3. AI 配置（与设备端 OpenAI-compatible 字段对齐） -->
+  <view class="panel">
+    <view class="row">
+      <view>
+        <view class="kicker">AI · 设备直连</view>
+        <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">OpenAI-compatible API</view>
+      </view>
+      <view class="tag {{aiReady ? 'mint' : aiHasKey ? 'warn' : 'danger'}}">{{aiReady ? '可调用' : '待配置'}}</view>
+    </view>
+    <view class="subtitle">与固件 NVS 的 apiBaseUrl / model / systemPrompt / timeoutMs / apiKey 对齐；Key 只显示脱敏预览。当前来源：{{aiSource || 'unknown'}}</view>
+    <view wx:if="{{aiLastError}}" class="ai-alert">最近错误：{{aiLastError}}</view>
+
+    <view class="field-block">
+      <view class="field-label">配置名称 profileName</view>
+      <input class="input" maxlength="32" value="{{aiProfileName}}" placeholder="默认配置" data-field="profileName" bindinput="onAiInput" />
+    </view>
+
+    <view class="field-block">
+      <view class="field-label">API Base URL</view>
+      <input class="input" value="{{aiBaseUrl}}" placeholder="https://api.openai.com/v1" data-field="baseUrl" bindinput="onAiInput" />
+    </view>
+    <view class="field-block">
+      <view class="field-label">设备模型 model</view>
+      <input class="input" value="{{aiModel}}" placeholder="gpt-4o-mini" data-field="model" bindinput="onAiInput" />
+      <view class="soft field-hint">后端保存时会映射到 chatModel；设备端实际使用字段名为 model。</view>
+    </view>
+    <view class="field-block">
+      <view class="field-label">超时时间 timeoutMs</view>
+      <input class="input" type="number" value="{{aiTimeoutMs}}" placeholder="30000" data-field="timeoutMs" bindinput="onAiInput" />
+      <view class="soft field-hint">固件会限制在 5000-60000 ms。</view>
+    </view>
+    <view class="field-block">
+      <view class="field-label">系统提示词 systemPrompt</view>
+      <textarea class="textarea" value="{{aiSystemPrompt}}" maxlength="-1" placeholder="用于约束 AI 助手的基础人格、输出风格和项目规则" data-field="systemPrompt" bindinput="onAiInput" />
+      <view class="soft field-hint {{aiSystemPromptBytes > 8192 ? 'danger-text' : ''}}">{{aiSystemPromptBytes}}/8192 UTF-8 字节</view>
+    </view>
+    <view class="field-block">
+      <view class="field-label">API Key</view>
+      <view wx:if="{{aiHasKey}}" class="soft" style="margin-bottom: var(--space-2);">当前：{{aiKeyPreview}}</view>
+      <input class="input" password value="{{aiNewKey}}" maxlength="256" placeholder="留空表示不修改；保存后不会明文回显" data-field="newKey" bindinput="onAiInput" />
+    </view>
+
+    <view class="ai-backend-box">
+      <view class="field-label">后端图片识别模型 visionModel</view>
+      <input class="input" value="{{aiVisionModel}}" placeholder="例如 Qwen/Qwen2-VL-7B-Instruct" data-field="visionModel" bindinput="onAiInput" />
+      <view class="soft field-hint">仅后端 /inventory/scan 使用，不会写入设备 NVS。</view>
+    </view>
+
+    <view class="voice-config-grid">
+      <view class="voice-config-box">
+        <view class="row">
+          <view class="field-label">语音识别 ASR</view>
+          <view class="tag {{asrHasKey ? 'mint' : 'warn'}}">{{asrHasKey ? '已配置 Key' : '待配置 Key'}}</view>
+        </view>
+        <view class="field-block">
+          <view class="field-label">ASR API Base URL</view>
+          <input class="input" value="{{asrBaseUrl}}" placeholder="https://api.siliconflow.cn/v1/audio/transcriptions" data-field="asrBaseUrl" bindinput="onAiInput" />
+        </view>
+        <view class="field-block">
+          <view class="field-label">ASR 模型 model</view>
+          <input class="input" value="{{asrModel}}" placeholder="TeleAI/TeleSpeechASR" data-field="asrModel" bindinput="onAiInput" />
+        </view>
+        <view class="field-block">
+          <view class="field-label">ASR 超时时间 timeoutMs</view>
+          <input class="input" type="number" value="{{asrTimeoutMs}}" placeholder="45000" data-field="asrTimeoutMs" bindinput="onAiInput" />
+          <view class="soft field-hint">固件范围 10000-90000 ms。</view>
+        </view>
+        <view class="field-block">
+          <view class="field-label">ASR API Key</view>
+          <view wx:if="{{asrHasKey}}" class="soft" style="margin-bottom: var(--space-2);">当前：{{asrKeyPreview}}</view>
+          <input class="input" password value="{{asrNewKey}}" maxlength="256" placeholder="留空表示不修改" data-field="asrNewKey" bindinput="onAiInput" />
+          <button class="btn ghost mini-btn" loading="{{aiSaving}}" bindtap="clearAsrKey">清除 ASR Key</button>
+        </view>
+      </view>
+
+      <view class="voice-config-box">
+        <view class="row">
+          <view class="field-label">语音生成 TTS</view>
+          <view class="tag {{ttsHasKey ? 'mint' : 'warn'}}">{{ttsHasKey ? '已配置 Key' : '待配置 Key'}}</view>
+        </view>
+        <view class="field-block">
+          <view class="field-label">TTS API Base URL</view>
+          <input class="input" value="{{ttsBaseUrl}}" placeholder="https://api.siliconflow.cn/v1/audio/speech" data-field="ttsBaseUrl" bindinput="onAiInput" />
+        </view>
+        <view class="field-block">
+          <view class="field-label">TTS 模型 model</view>
+          <input class="input" value="{{ttsModel}}" placeholder="fnlp/MOSS-TTSD-v0.5" data-field="ttsModel" bindinput="onAiInput" />
+        </view>
+        <view class="field-block">
+          <view class="field-label">TTS 音色 voice</view>
+          <input class="input" value="{{ttsVoice}}" placeholder="fnlp/MOSS-TTSD-v0.5:alex" data-field="ttsVoice" bindinput="onAiInput" />
+          <view class="soft field-hint">MOSS-TTSD 已验证音色为完整格式，不要再填 alloy。</view>
+        </view>
+        <view class="field-block">
+          <view class="field-label">TTS 超时时间 timeoutMs</view>
+          <input class="input" type="number" value="{{ttsTimeoutMs}}" placeholder="45000" data-field="ttsTimeoutMs" bindinput="onAiInput" />
+          <view class="soft field-hint">固件范围 5000-90000 ms。</view>
+        </view>
+        <view class="field-block">
+          <view class="field-label">TTS API Key</view>
+          <view wx:if="{{ttsHasKey}}" class="soft" style="margin-bottom: var(--space-2);">当前：{{ttsKeyPreview}}</view>
+          <input class="input" password value="{{ttsNewKey}}" maxlength="256" placeholder="留空表示不修改" data-field="ttsNewKey" bindinput="onAiInput" />
+          <button class="btn ghost mini-btn" loading="{{aiSaving}}" bindtap="clearTtsKey">清除 TTS Key</button>
+        </view>
+      </view>
+    </view>
+    <view class="soft field-hint">当前小程序会把语音配置保存到后端；设备端 ASR/TTS 仍以 Web Serial 的 get/set_asr_config、get/set_tts_config 为准，待 MQTT 应用链路接入后可自动下发。</view>
+
+    <view class="row" style="margin-top: var(--space-5); gap: var(--space-3);">
+      <button class="btn ghost" style="flex: 1;" loading="{{aiSaving}}" bindtap="clearAiKey">清除 Key</button>
+      <button class="btn" style="flex: 2;" loading="{{aiSaving}}" disabled="{{aiSystemPromptBytes > 8192}}" bindtap="saveAiConfig">保存并同步</button>
+    </view>
+  </view>
+
+  <!-- 4. 设备操作 -->
+  <view class="panel">
+    <view class="kicker">设备操作</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">快捷动作</view>
+    <button class="btn secondary" loading="{{refreshing}}" bindtap="onTapRefreshDevice">↻ 刷新冰箱（透传 MQTT）</button>
+    <button class="btn ghost" style="margin-top: var(--space-3);" bindtap="onResetLocal">重置本地数据并重新登录</button>
+  </view>
+
+  <view class="panel">
+    <view class="kicker">安全提示</view>
+    <view class="subtitle">本期演示模式：apiKey 会存入后端 SystemConfig 表并同步到设备 NVS（均未加密），仅适合比赛/本地联调；上线必须改 KMS 加密或 vault。</view>
+  </view>
+</view>

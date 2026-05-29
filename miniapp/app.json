@@ -1,0 +1,38 @@
+{
+  "pages": [
+    "pages/home/index",
+    "pages/ai-chat/index",
+    "pages/scan/index",
+    "pages/settings/index",
+    "pages/more/index",
+    "pages/inventory/index",
+    "pages/inventory-detail/index",
+    "pages/recipe/index",
+    "pages/shopping/index",
+    "pages/reminders/index",
+    "pages/offline/index",
+    "pages/bind/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "冰箱小精灵",
+    "navigationBarBackgroundColor": "#fffdf8",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#fffdf8"
+  },
+  "tabBar": {
+    "custom": true,
+    "color": "#758078",
+    "selectedColor": "#2f6047",
+    "backgroundColor": "#fffdf8",
+    "borderStyle": "white",
+    "list": [
+      { "pagePath": "pages/home/index",     "text": "首页" },
+      { "pagePath": "pages/ai-chat/index",  "text": "AI" },
+      { "pagePath": "pages/scan/index",     "text": "登记" },
+      { "pagePath": "pages/settings/index", "text": "设置" },
+      { "pagePath": "pages/more/index",     "text": "更多" }
+    ]
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}

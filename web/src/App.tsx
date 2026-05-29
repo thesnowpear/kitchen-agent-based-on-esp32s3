@@ -2,6 +2,7 @@ import {
   Activity,
   Bot,
   Cable,
+  Camera,
   Check,
   Cpu,
   Download,
@@ -20,6 +21,7 @@ import {
   Settings,
   ShieldAlert,
   SlidersHorizontal,
+  Volume2,
   Sparkles,
   Terminal,
   Trash2,
@@ -36,22 +38,35 @@ import type {
   AIContextPreview,
   AIProfilesResponse,
   ASRConfig,
+  CameraAnalyzeResponse,
+  CameraCaptureResponse,
+  CameraProbeResponse,
+  CameraRgb565DiagResponse,
+  CameraStatus,
   ConnectionState,
   DeviceChatHistory,
   DeviceCommand,
   DeviceLog,
+  DeviceMessage,
   DeviceStatus,
   DiagnosticSnapshot,
   LogLevel,
   MemorySummary,
+  MicRecordWavResponse,
+  MQTTConfig,
   NetworkConfig,
   PinInfo,
   ProjectAITaskRequest,
   ProjectAITaskResponse,
   ProjectAITaskType,
+  RadarSnapshot,
   SectionDefinition,
   SensorSnapshot,
   TransportMode,
+  TTSConfig,
+  TTSStatus,
+  WakeStatus,
+  WakeWordDetectedEventPayload,
   VoiceChatResponse,
   VoiceChatStatus,
   WifiNetwork,
@@ -62,7 +77,10 @@ const sections: SectionDefinition[] = [
   { id: "usb", label: "USB 连接", icon: Cable },
   { id: "network", label: "网络配置", icon: Wifi },
   { id: "ai", label: "AI 助手", icon: Sparkles },
+  { id: "camera", label: "摄像头测试", icon: Camera },
   { id: "mic", label: "麦克风测试", icon: Mic },
+  { id: "speaker", label: "扬声器测试", icon: Volume2 },
+  { id: "radar", label: "雷达测试", icon: Radio },
   { id: "pins", label: "GPIO/引脚", icon: Cpu },
   { id: "sensors", label: "传感器", icon: Activity },
   { id: "logs", label: "日志", icon: Terminal },
@@ -100,9 +118,64 @@ const defaultAsrConfig: ASRConfig = {
   ready: false,
 };
 
+const defaultTtsConfig: TTSConfig = {
+  apiBaseUrl: "https://api.siliconflow.cn/v1/audio/speech",
+  model: "fnlp/MOSS-TTSD-v0.5",
+  voice: "fnlp/MOSS-TTSD-v0.5:alex",
+  timeoutMs: 45000,
+  hasApiKey: false,
+  apiKeyPreview: "",
+  lastError: "",
+  ready: false,
+};
+
+type WakeEventRecord = WakeWordDetectedEventPayload & {
+  id: string;
+  receivedAt: string;
+};
+
+type MicPlayback = {
+  url: string;
+  durationMs: number;
+  pcmBytes: number;
+  wavBytes: number;
+  sampleRate: number;
+  channels: number;
+  bitsPerSample: number;
+  createdAt: string;
+};
+
 const AI_SYSTEM_PROMPT_MAX_BYTES = 8192;
 const utf8Encoder = new TextEncoder();
 const utf8ByteLength = (value: string) => utf8Encoder.encode(value).length;
+
+function base64ToBlob(base64: string, mimeType: string) {
+  const binary = window.atob(base64);
+  const chunks: BlobPart[] = [];
+  for (let offset = 0; offset < binary.length; offset += 8192) {
+    const slice = binary.slice(offset, offset + 8192);
+    const bytes = new Uint8Array(slice.length);
+    for (let index = 0; index < slice.length; index += 1) {
+      bytes[index] = slice.charCodeAt(index);
+    }
+    chunks.push(bytes);
+  }
+  return new Blob(chunks, { type: mimeType });
+}
+
+function normalizeTtsVoiceForRequest(model: string, voice: string) {
+  const trimmedModel = model.trim();
+  const trimmedVoice = voice.trim();
+  if (trimmedModel === "fnlp/MOSS-TTSD-v0.5") {
+    if (!trimmedVoice || trimmedVoice === "alloy") {
+      return "fnlp/MOSS-TTSD-v0.5:alex";
+    }
+    if (!trimmedVoice.includes(":")) {
+      return `${trimmedModel}:${trimmedVoice}`;
+    }
+  }
+  return trimmedVoice || defaultTtsConfig.voice;
+}
 
 const projectAiTaskLabels: Record<ProjectAITaskType, string> = {
   chat_assist: "厨房助手问答",
@@ -190,11 +263,29 @@ function App() {
   const [refreshSeconds, setRefreshSeconds] = useState(15);
   const [status, setStatus] = useState<DeviceStatus | null>(null);
   const [network, setNetwork] = useState<NetworkConfig | null>(null);
+  const [mqttConfig, setMqttConfig] = useState<MQTTConfig | null>(null);
+  const [mqttTokenInput, setMqttTokenInput] = useState("");
   const [aiConfig, setAiConfig] = useState<AIConfig | null>(null);
   const [aiProfiles, setAiProfiles] = useState<AIConfig[]>([]);
   const [aiKeyInput, setAiKeyInput] = useState("");
   const [asrConfig, setAsrConfig] = useState<ASRConfig | null>(defaultAsrConfig);
   const [asrKeyInput, setAsrKeyInput] = useState("");
+  const [ttsConfig, setTtsConfig] = useState<TTSConfig | null>(defaultTtsConfig);
+  const [ttsKeyInput, setTtsKeyInput] = useState("");
+  const [ttsText, setTtsText] = useState("冰箱小精灵扬声器测试，当前播放来自云端 TTS。");
+  const [ttsStatus, setTtsStatus] = useState<TTSStatus | null>(null);
+  const [ttsBusy, setTtsBusy] = useState(false);
+  const [browserTtsBusy, setBrowserTtsBusy] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState<CameraStatus | null>(null);
+  const [cameraProbe, setCameraProbe] = useState<CameraProbeResponse | null>(null);
+  const [cameraRgb565Diag, setCameraRgb565Diag] = useState<CameraRgb565DiagResponse | null>(null);
+  const [cameraPreview, setCameraPreview] = useState<string | null>(null);
+  const [cameraAnalyzeResult, setCameraAnalyzeResult] = useState<CameraAnalyzeResponse | null>(null);
+  const [cameraBusy, setCameraBusy] = useState(false);
+  const [cameraLive, setCameraLive] = useState(false);
+  const [cameraLiveFrames, setCameraLiveFrames] = useState(0);
+  const [cameraLiveLastAt, setCameraLiveLastAt] = useState("");
+  const [cameraLiveError, setCameraLiveError] = useState("");
   const [voiceStatus, setVoiceStatus] = useState<VoiceChatStatus | null>(null);
   const [voiceBusy, setVoiceBusy] = useState(false);
   const [micTestMode, setMicTestMode] = useState<"idle" | "hardware" | "asr">("idle");
@@ -202,6 +293,14 @@ function App() {
   const [micTranscript, setMicTranscript] = useState("");
   const [micAiReply, setMicAiReply] = useState("");
   const [micAsrResult, setMicAsrResult] = useState<VoiceChatResponse | null>(null);
+  const [micPlayback, setMicPlayback] = useState<MicPlayback | null>(null);
+  const [wakeStatus, setWakeStatus] = useState<WakeStatus | null>(null);
+  const [wakeBusy, setWakeBusy] = useState(false);
+  const [wakeEvents, setWakeEvents] = useState<WakeEventRecord[]>([]);
+  const [radarStatus, setRadarStatus] = useState<RadarSnapshot | null>(null);
+  const [radarSamples, setRadarSamples] = useState<RadarSnapshot[]>([]);
+  const [radarRunning, setRadarRunning] = useState(false);
+  const [radarBusy, setRadarBusy] = useState(false);
   const [aiChatDraft, setAiChatDraft] = useState("");
   const [aiMessages, setAiMessages] = useState<AIChatMessage[]>([]);
   const [aiBusy, setAiBusy] = useState(false);
@@ -232,10 +331,15 @@ function App() {
   const transportRef = useRef<MockTransport | WebSerialTransport | null>(null);
   const refreshInFlightRef = useRef(false);
   const commandInFlightRef = useRef(false);
+  const sensorRefreshInFlightRef = useRef(false);
+  const radarRefreshInFlightRef = useRef(false);
+  const wakeStatusInFlightRef = useRef(false);
   const staticInfoLoadedRef = useRef(false);
   const networkDirtyRef = useRef(false);
   const aiConfigDirtyRef = useRef(false);
   const asrConfigDirtyRef = useRef(false);
+  const ttsConfigDirtyRef = useRef(false);
+  const micPlaybackUrlRef = useRef<string | null>(null);
 
   const appendLog = useCallback((level: LogLevel, message: string, source = "web") => {
     setLogs((current) => [
@@ -258,6 +362,44 @@ function App() {
     setMicSamples((current) => [...current.slice(-29), sample]);
   }, []);
 
+  const clearMicPlayback = useCallback(() => {
+    if (micPlaybackUrlRef.current) {
+      URL.revokeObjectURL(micPlaybackUrlRef.current);
+      micPlaybackUrlRef.current = null;
+    }
+    setMicPlayback(null);
+  }, []);
+
+  const pushRadarSample = useCallback((sample: RadarSnapshot) => {
+    setRadarSamples((current) => [...current.slice(-59), sample]);
+  }, []);
+
+  const handleDeviceMessage = useCallback((message: DeviceMessage) => {
+    if (message.type !== "event" || message.event !== "wake_word_detected") {
+      return;
+    }
+    const payload = message.payload as WakeWordDetectedEventPayload;
+    setWakeStatus(payload);
+    setWakeEvents((current) => [
+      {
+        ...payload,
+        id: crypto.randomUUID(),
+        receivedAt: nowTime(),
+      },
+      ...current,
+    ].slice(0, 12));
+    appendLog("info", `检测到唤醒词：${payload.wakeWord || "小冰小冰"}，累计 ${payload.triggerCount} 次。`, "wake");
+  }, [appendLog]);
+
+  useEffect(() => {
+    return () => {
+      if (micPlaybackUrlRef.current) {
+        URL.revokeObjectURL(micPlaybackUrlRef.current);
+        micPlaybackUrlRef.current = null;
+      }
+    };
+  }, []);
+
   const createTransport = useCallback(() => {
     return transportMode === "mock" ? new MockTransport() : new WebSerialTransport(timeoutMs);
   }, [timeoutMs, transportMode]);
@@ -271,8 +413,31 @@ function App() {
     setAiKeyInput("");
     setAsrConfig(defaultAsrConfig);
     setAsrKeyInput("");
+    setTtsConfig(defaultTtsConfig);
+    setTtsKeyInput("");
+    setTtsStatus(null);
+    setTtsBusy(false);
+    setBrowserTtsBusy(false);
+    setCameraStatus(null);
+    setCameraProbe(null);
+    setCameraRgb565Diag(null);
+    setCameraPreview(null);
+    setCameraAnalyzeResult(null);
+    setCameraBusy(false);
+    setCameraLive(false);
+    setCameraLiveFrames(0);
+    setCameraLiveLastAt("");
+    setCameraLiveError("");
     setVoiceStatus(null);
     setVoiceBusy(false);
+    clearMicPlayback();
+    setWakeStatus(null);
+    setWakeBusy(false);
+    setWakeEvents([]);
+    setRadarStatus(null);
+    setRadarSamples([]);
+    setRadarRunning(false);
+    setRadarBusy(false);
     setAiChatDraft("");
     setAiMessages([]);
     setAiBusy(false);
@@ -298,13 +463,17 @@ function App() {
     setDiagnostics(null);
     setLogs([]);
     setBusy(false);
+    sensorRefreshInFlightRef.current = false;
+    radarRefreshInFlightRef.current = false;
+    wakeStatusInFlightRef.current = false;
     staticInfoLoadedRef.current = false;
     networkDirtyRef.current = false;
     aiConfigDirtyRef.current = false;
     asrConfigDirtyRef.current = false;
+    ttsConfigDirtyRef.current = false;
     setSearchTerm("");
     setLogFilter("all");
-  }, []);
+  }, [clearMicPlayback]);
 
   const setNetworkDraft = useCallback((next: NetworkConfig) => {
     networkDirtyRef.current = true;
@@ -319,6 +488,11 @@ function App() {
   const setAsrConfigDraft = useCallback((next: ASRConfig) => {
     asrConfigDirtyRef.current = true;
     setAsrConfig(next);
+  }, []);
+
+  const setTtsConfigDraft = useCallback((next: TTSConfig) => {
+    ttsConfigDirtyRef.current = true;
+    setTtsConfig(next);
   }, []);
 
   const changeTransportMode = useCallback(
@@ -370,6 +544,7 @@ function App() {
       await optionalRead<NetworkConfig>("get_network", "网络状态", (payload) => {
         setNetwork((current) => mergeNetworkStatus(current, payload, networkDirtyRef.current));
       });
+      await optionalRead<MQTTConfig>("get_mqtt_config", "MQTT 配置", setMqttConfig);
       await optionalRead<AIConfig>("get_ai_config", "AI API 配置", (payload) => {
         setAiConfig((current) => (aiConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
       });
@@ -378,6 +553,10 @@ function App() {
       await optionalRead<ASRConfig>("get_asr_config", "ASR API config", (payload) => {
         setAsrConfig((current) => (asrConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
       });
+      await optionalRead<TTSConfig>("get_tts_config", "TTS API config", (payload) => {
+        setTtsConfig((current) => (ttsConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
+      });
+      await optionalRead<WakeStatus>("wake_status", "唤醒词状态", setWakeStatus);
 
       if (shouldReadStatic) {
         await optionalRead<PinInfo[]>("get_pins", "GPIO 信息", setPins);
@@ -402,6 +581,167 @@ function App() {
     }
   }, [appendLog, connection]);
 
+  const refreshSensorsOnly = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected" || commandInFlightRef.current || sensorRefreshInFlightRef.current) {
+      return;
+    }
+    sensorRefreshInFlightRef.current = true;
+    try {
+      const response = await transport.sendCommand<SensorSnapshot>("get_sensors");
+      setSensors(response.payload);
+    } catch (error) {
+      appendLog("warn", `传感器快照读取失败：${toErrorMessage(error)}`, "sensors");
+    } finally {
+      sensorRefreshInFlightRef.current = false;
+    }
+  }, [appendLog, connection]);
+
+  const refreshRadarStatus = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected" || commandInFlightRef.current || radarRefreshInFlightRef.current) {
+      return;
+    }
+    radarRefreshInFlightRef.current = true;
+    try {
+      const response = await transport.sendCommand<RadarSnapshot>("radar_test_status");
+      setRadarStatus(response.payload);
+      setRadarRunning(response.payload.mode === "report");
+      pushRadarSample(response.payload);
+    } catch (error) {
+      appendLog("warn", `雷达状态读取失败：${toErrorMessage(error)}`, "radar");
+    } finally {
+      radarRefreshInFlightRef.current = false;
+    }
+  }, [appendLog, connection, pushRadarSample]);
+
+  const startRadarTest = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再测试 24G 雷达。", "radar");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setRadarBusy(true);
+      const response = await transport.sendCommand<RadarSnapshot>("radar_test_start");
+      setRadarStatus(response.payload);
+      setRadarSamples([response.payload]);
+      setRadarRunning(response.payload.mode === "report");
+      appendLog("info", "24G 雷达已切换到上报模式。", "radar");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "radar");
+    } finally {
+      commandInFlightRef.current = false;
+      setRadarBusy(false);
+    }
+  }, [appendLog, connection]);
+
+  const stopRadarTest = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再停止 24G 雷达测试。", "radar");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setRadarBusy(true);
+      const response = await transport.sendCommand<RadarSnapshot>("radar_test_stop");
+      setRadarStatus(response.payload);
+      pushRadarSample(response.payload);
+      setRadarRunning(response.payload.mode === "report");
+      appendLog("info", "24G 雷达已切回正常模式。", "radar");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "radar");
+    } finally {
+      commandInFlightRef.current = false;
+      setRadarBusy(false);
+    }
+  }, [appendLog, connection, pushRadarSample]);
+
+  const refreshWakeStatus = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected" || commandInFlightRef.current || wakeStatusInFlightRef.current) {
+      return;
+    }
+    wakeStatusInFlightRef.current = true;
+    try {
+      const response = await transport.sendCommand<WakeStatus>("wake_status");
+      setWakeStatus(response.payload);
+    } catch (error) {
+      appendLog("warn", `唤醒词状态读取失败：${toErrorMessage(error)}`, "wake");
+    } finally {
+      wakeStatusInFlightRef.current = false;
+    }
+  }, [appendLog, connection]);
+
+  const startWakeListening = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再启动唤醒词监听。", "wake");
+      return;
+    }
+    if (voiceBusy || aiBusy || ttsBusy || commandInFlightRef.current || voiceStatus?.state === "recording") {
+      appendLog("warn", "录音、AI 或 TTS 正在占用音频链路，请稍后再启动唤醒监听。", "wake");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setWakeBusy(true);
+      const response = await transport.sendCommand<WakeStatus>("wake_start");
+      setWakeStatus(response.payload);
+      setVoiceStatus((current) => current ? { ...current, state: "wake_listening", error: "" } : current);
+      appendLog("info", `WakeNet 已开始监听：${response.payload.wakeWord} / ${response.payload.model}`, "wake");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "wake");
+    } finally {
+      commandInFlightRef.current = false;
+      setWakeBusy(false);
+    }
+  }, [aiBusy, appendLog, connection, ttsBusy, voiceBusy, voiceStatus?.state]);
+
+  const stopWakeListening = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再停止唤醒词监听。", "wake");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setWakeBusy(true);
+      const response = await transport.sendCommand<WakeStatus>("wake_stop");
+      setWakeStatus(response.payload);
+      setVoiceStatus((current) => current?.state === "wake_listening" ? { ...current, state: "idle" } : current);
+      appendLog("info", "WakeNet 监听已停止。", "wake");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "wake");
+    } finally {
+      commandInFlightRef.current = false;
+      setWakeBusy(false);
+    }
+  }, [appendLog, connection]);
+
+  const resetWakeStats = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再清空唤醒统计。", "wake");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setWakeBusy(true);
+      const response = await transport.sendCommand<WakeStatus>("wake_reset_stats");
+      setWakeStatus(response.payload);
+      setWakeEvents([]);
+      appendLog("info", "WakeNet 触发统计已清空。", "wake");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "wake");
+    } finally {
+      commandInFlightRef.current = false;
+      setWakeBusy(false);
+    }
+  }, [appendLog, connection]);
+
   const connect = async () => {
     if (connection !== "disconnected") {
       return;
@@ -410,6 +750,7 @@ function App() {
     setConnectionNotice("正在请求浏览器串口权限；选择端口后会打开串口，若端口被占用会在 10 秒内提示。");
     const transport = createTransport();
     transport.onLog(appendLog);
+    transport.onMessage(handleDeviceMessage);
     transportRef.current = transport;
 
     try {
@@ -469,6 +810,47 @@ function App() {
     } finally {
       commandInFlightRef.current = false;
       setNetworkBusy(false);
+    }
+  };
+
+  const saveMqttConfig = async (next: MQTTConfig, token: string) => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接 Mock 或 USB 设备，再写入 MQTT 配置。", "mqtt");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<MQTTConfig>("set_mqtt_config", {
+        ...next,
+        token: token.trim() || undefined,
+      });
+      setMqttConfig(response.payload);
+      setMqttTokenInput("");
+      appendLog("info", "MQTT 云端绑定配置已写入设备，token 不会回显。", "mqtt");
+      await refreshAll({ full: false });
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "mqtt");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const publishMqttState = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接 Mock 或 USB 设备，再发布 MQTT 状态。", "mqtt");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<MQTTConfig>("mqtt_publish_state");
+      setMqttConfig(response.payload);
+      appendLog("info", "设备状态已发布到 MQTT。", "mqtt");
+    } catch (error) {
+      appendLog("error", toErrorMessage(error), "mqtt");
+    } finally {
+      commandInFlightRef.current = false;
     }
   };
 
@@ -603,6 +985,53 @@ function App() {
       appendLog("warn", "ASR Key 已清除。", "asr");
     } catch (error) {
       appendLog("error", String(error), "asr");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const saveTtsConfig = async () => {
+    const transport = transportRef.current;
+    const current = ttsConfig ?? defaultTtsConfig;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再保存 TTS 配置。", "tts");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<TTSConfig>("set_tts_config", {
+        apiBaseUrl: current.apiBaseUrl.trim(),
+        apiKey: ttsKeyInput.trim(),
+        model: current.model.trim(),
+        voice: current.voice.trim(),
+        timeoutMs: current.timeoutMs,
+      });
+      ttsConfigDirtyRef.current = false;
+      setTtsConfig(response.payload);
+      setTtsKeyInput("");
+      appendLog("info", "TTS 配置已保存，Key 不会从设备回显。", "tts");
+    } catch (error) {
+      appendLog("error", String(error), "tts");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const clearTtsKey = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再清除 TTS Key。", "tts");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<TTSConfig>("clear_tts_key");
+      ttsConfigDirtyRef.current = false;
+      setTtsConfig(response.payload);
+      setTtsKeyInput("");
+      appendLog("warn", "TTS Key 已清除。", "tts");
+    } catch (error) {
+      appendLog("error", String(error), "tts");
     } finally {
       commandInFlightRef.current = false;
     }
@@ -812,6 +1241,10 @@ function App() {
       appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "asr");
       return;
     }
+    if (wakeStatus?.enabled) {
+      appendLog("warn", "WakeNet 正在占用麦克风，请先停止唤醒词监听。", "asr");
+      return;
+    }
 
     const recording = voiceStatus?.state === "recording";
     if (recording && micTestMode !== "asr") {
@@ -906,6 +1339,10 @@ function App() {
       appendLog("warn", "录音或设备命令正在进行，请稍后再试。", "asr");
       return;
     }
+    if (wakeStatus?.enabled) {
+      appendLog("warn", "WakeNet 正在占用麦克风，请先停止唤醒词监听。", "asr");
+      return;
+    }
     try {
       commandInFlightRef.current = true;
       setVoiceBusy(true);
@@ -914,6 +1351,7 @@ function App() {
       setMicTranscript("");
       setMicAiReply("");
       setMicAsrResult(null);
+      clearMicPlayback();
       const response = await transport.sendCommand<VoiceChatStatus>("mic_record_start");
       setVoiceStatus(response.payload);
       pushMicSample(response.payload);
@@ -964,12 +1402,384 @@ function App() {
       setVoiceStatus(response.payload);
       pushMicSample(response.payload);
       setMicTestMode("idle");
+      try {
+        const wavResponse = await transport.sendCommand<MicRecordWavResponse>("mic_record_wav");
+        const blob = base64ToBlob(wavResponse.payload.wavBase64, "audio/wav");
+        const url = URL.createObjectURL(blob);
+        clearMicPlayback();
+        micPlaybackUrlRef.current = url;
+        setMicPlayback({
+          url,
+          durationMs: wavResponse.payload.durationMs,
+          pcmBytes: wavResponse.payload.pcmBytes,
+          wavBytes: wavResponse.payload.wavBytes,
+          sampleRate: wavResponse.payload.sampleRate,
+          channels: wavResponse.payload.channels,
+          bitsPerSample: wavResponse.payload.bitsPerSample,
+          createdAt: nowTime(),
+        });
+        appendLog("info", `麦克风录音已取回，可在面板播放：${wavResponse.payload.wavBytes} B WAV。`, "asr");
+      } catch (wavError) {
+        appendLog("warn", `录音已停止，但 WAV 取回失败：${toErrorMessage(wavError)}`, "asr");
+      }
       appendLog("info", "麦克风硬件录音测试已停止，未触发 ASR/AI。", "asr");
     } catch (error) {
       appendLog("error", String(error), "asr");
     } finally {
       commandInFlightRef.current = false;
       setVoiceBusy(false);
+    }
+  };
+
+  const playDeviceTts = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再测试扬声器。", "tts");
+      return;
+    }
+    if (ttsBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "tts");
+      return;
+    }
+    if (!ttsText.trim()) {
+      appendLog("warn", "请输入要合成播放的测试文本。", "tts");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setTtsBusy(true);
+      const response = await transport.sendCommand<TTSStatus>("tts_play", { text: ttsText.trim() });
+      setTtsStatus(response.payload);
+      setWakeStatus((current) => current ? { ...current, enabled: false, state: "idle" } : current);
+      appendLog("info", `设备 TTS 已启动：HTTP ${response.payload.httpStatus}，音频 ${response.payload.audioBytes} B。`, "tts");
+    } catch (error) {
+      appendLog("error", String(error), "tts");
+    } finally {
+      commandInFlightRef.current = false;
+      setTtsBusy(false);
+    }
+  };
+
+  const refreshTtsStatus = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected" || commandInFlightRef.current) {
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<TTSStatus>("tts_status");
+      setTtsStatus(response.payload);
+    } catch (error) {
+      appendLog("warn", `扬声器状态读取失败：${toErrorMessage(error)}`, "tts");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  }, [appendLog, connection]);
+
+  const stopDeviceTts = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再停止扬声器播放。", "tts");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setTtsBusy(true);
+      const response = await transport.sendCommand<TTSStatus>("tts_stop");
+      setTtsStatus(response.payload);
+      appendLog("info", "设备扬声器播放已停止。", "tts");
+    } catch (error) {
+      appendLog("error", String(error), "tts");
+    } finally {
+      commandInFlightRef.current = false;
+      setTtsBusy(false);
+    }
+  };
+
+  const playBrowserTts = async () => {
+    const current = ttsConfig ?? defaultTtsConfig;
+    const apiKey = ttsKeyInput.trim();
+    if (!apiKey) {
+      appendLog("warn", "浏览器试听需要在本次页面输入 TTS API Key；设备保存的 Key 不会回显给浏览器。", "tts");
+      return;
+    }
+    if (!ttsText.trim()) {
+      appendLog("warn", "请输入要合成试听的文本。", "tts");
+      return;
+    }
+    try {
+      setBrowserTtsBusy(true);
+      const response = await fetch(current.apiBaseUrl.trim(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+          model: current.model.trim(),
+          voice: normalizeTtsVoiceForRequest(current.model, current.voice),
+          input: ttsText.trim(),
+          response_format: "mp3",
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`浏览器 TTS HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.onended = () => URL.revokeObjectURL(url);
+      await audio.play();
+      appendLog("info", `浏览器 TTS 试听已播放，音频 ${blob.size} B。`, "tts");
+    } catch (error) {
+      appendLog("error", `${toErrorMessage(error)}。如果是 CORS 限制，请改用设备扬声器播放。`, "tts");
+    } finally {
+      setBrowserTtsBusy(false);
+    }
+  };
+
+  const refreshCameraStatus = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      return;
+    }
+    if (commandInFlightRef.current) {
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<CameraStatus>("get_camera_status");
+      setCameraStatus(response.payload);
+    } catch (error) {
+      appendLog("warn", `摄像头状态读取失败：${toErrorMessage(error)}`, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  }, [appendLog, connection]);
+
+  const captureCameraFrame = useCallback(async (source: "manual" | "live" = "manual") => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再拍照。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      setCameraAnalyzeResult(null);
+      const response = await transport.sendCommand<CameraCaptureResponse>("camera_capture");
+      setCameraStatus(response.payload.status);
+      setCameraPreview(response.payload.previewDataUrl);
+      if (source === "live") {
+        setCameraLiveFrames((current) => current + 1);
+        setCameraLiveLastAt(nowTime());
+        setCameraLiveError("");
+      }
+      if (response.payload.previewOmitted) {
+        appendLog("warn", `JPEG ${response.payload.status.jpegBytes} B 超过串口预览上限 ${response.payload.previewMaxBytes} B，已省略预览。`, "camera");
+      } else {
+        appendLog("info", `${source === "live" ? "实时预览刷新" : "拍照完成"}：${response.payload.status.width}x${response.payload.status.height} / ${response.payload.status.jpegBytes} B，稳定路径为 YUV422 采集后软件 JPEG。`, "camera");
+      }
+    } catch (error) {
+      const message = toErrorMessage(error);
+      setCameraLiveError(message);
+      if (source === "live") {
+        setCameraLive(false);
+      }
+      appendLog("error", message, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  }, [appendLog, cameraBusy, connection]);
+
+  const probeCamera = useCallback(async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再执行摄像头安全探测。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      const response = await transport.sendCommand<CameraProbeResponse>("camera_probe");
+      setCameraProbe(response.payload);
+      if (response.payload.ok) {
+        appendLog("info", `OV3660 安全探测成功：PID=0x${response.payload.pid.toString(16).padStart(4, "0")}，${response.payload.durationMs} ms。`, "camera");
+      } else {
+        appendLog("warn", `OV3660 安全探测未通过：${response.payload.lastError || response.payload.espErrName}`, "camera");
+      }
+    } catch (error) {
+      appendLog("error", `摄像头安全探测失败：${toErrorMessage(error)}`, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  }, [appendLog, cameraBusy, connection]);
+
+  const toggleCameraLive = useCallback(() => {
+    if (!cameraLive) {
+      setCameraLiveFrames(0);
+      setCameraLiveLastAt("");
+      setCameraLiveError("");
+      appendLog("info", "摄像头低频实时预览已启动：约每 2 秒抓拍一帧。", "camera");
+      setCameraLive(true);
+      return;
+    }
+    setCameraLive(false);
+    appendLog("info", "摄像头实时预览已停止。", "camera");
+  }, [appendLog, cameraLive]);
+
+  const analyzeCameraFrame = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再识别照片。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      appendLog("info", "开始拍摄 OV3660 XGA 高分辨率图片并提交 AI；该路径为当前实测稳定成品链路，不会通过串口返回大图预览。", "camera");
+      const response = await transport.sendCommand<CameraAnalyzeResponse>("camera_analyze");
+      setCameraAnalyzeResult(response.payload);
+      appendLog("info", `摄像头 AI 识别完成：HTTP ${response.payload.httpStatus}，${response.payload.latencyMs} ms，提交图片 ${response.payload.width}x${response.payload.height} / ${response.payload.jpegBytes} B。`, "camera");
+    } catch (error) {
+      appendLog("error", String(error), "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  };
+
+  const runCameraRgb565Diag = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再执行 RGB565 诊断。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      setCameraLive(false);
+      setCameraPreview(null);
+      const response = await transport.sendCommand<CameraRgb565DiagResponse>("camera_rgb565_diag");
+      setCameraRgb565Diag(response.payload);
+      await refreshCameraStatus();
+      if (response.payload.ok) {
+        appendLog("info", `RGB565 诊断成帧：${response.payload.width}x${response.payload.height} / ${response.payload.bytes} B / checksum=0x${response.payload.checksum.toString(16).padStart(8, "0")}`, "camera");
+      } else {
+        appendLog("warn", `RGB565 诊断失败：${response.payload.lastError || response.payload.espErrName}`, "camera");
+      }
+    } catch (error) {
+      appendLog("error", `RGB565 诊断失败：${toErrorMessage(error)}`, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  };
+
+  const runCameraJpegDiag = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再执行硬件 JPEG 诊断。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      setCameraLive(false);
+      setCameraAnalyzeResult(null);
+      const response = await transport.sendCommand<CameraCaptureResponse>("camera_jpeg_diag");
+      setCameraStatus(response.payload.status);
+      setCameraPreview(response.payload.previewDataUrl);
+      if (response.payload.previewOmitted) {
+        appendLog("warn", `硬件 JPEG ${response.payload.status.jpegBytes} B 超过串口预览上限 ${response.payload.previewMaxBytes} B，已省略预览。`, "camera");
+      } else {
+        appendLog("info", `硬件 JPEG 码流诊断完成：${response.payload.status.width}x${response.payload.status.height} / ${response.payload.status.jpegBytes} B。注意：该片上 JPEG 路径当前仅看 SOI/码流稳定性，颜色可能不准。`, "camera");
+      }
+    } catch (error) {
+      appendLog("error", `硬件 JPEG 诊断失败：${toErrorMessage(error)}`, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  };
+
+  const resetCameraDevice = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再重置摄像头驱动。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      setCameraLive(false);
+      const response = await transport.sendCommand<CameraStatus>("camera_reset");
+      setCameraStatus(response.payload);
+      setCameraPreview(null);
+      setCameraAnalyzeResult(null);
+      appendLog("info", "摄像头驱动已反初始化，可重新安全探测或切换诊断模式。", "camera");
+    } catch (error) {
+      appendLog("error", `摄像头重置失败：${toErrorMessage(error)}`, "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
+    }
+  };
+
+  const clearCameraFrame = async () => {
+    const transport = transportRef.current;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再清除照片缓存。", "camera");
+      return;
+    }
+    if (cameraBusy || commandInFlightRef.current) {
+      appendLog("warn", "设备正在处理上一条命令，请稍后再试。", "camera");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      setCameraBusy(true);
+      const response = await transport.sendCommand<CameraStatus>("clear_camera_frame");
+      setCameraStatus(response.payload);
+      setCameraPreview(null);
+      setCameraAnalyzeResult(null);
+      setCameraLive(false);
+      setCameraLiveFrames(0);
+      setCameraLiveLastAt("");
+      setCameraLiveError("");
+      appendLog("info", "最近一张照片已从设备 RAM/PSRAM 清除。", "camera");
+    } catch (error) {
+      appendLog("error", String(error), "camera");
+    } finally {
+      commandInFlightRef.current = false;
+      setCameraBusy(false);
     }
   };
 
@@ -1118,6 +1928,31 @@ function App() {
   }, [activeSection, appendLog, connection, refreshAiProfiles, refreshDeviceChatHistory]);
 
   useEffect(() => {
+    if (connection === "connected" && activeSection === "camera") {
+      void refreshCameraStatus();
+    }
+  }, [activeSection, connection, refreshCameraStatus]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "camera" || !cameraLive) {
+      return undefined;
+    }
+    void captureCameraFrame("live");
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && !cameraBusy && !commandInFlightRef.current) {
+        void captureCameraFrame("live");
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [activeSection, cameraBusy, cameraLive, captureCameraFrame, connection]);
+
+  useEffect(() => {
+    if (connection !== "connected") {
+      setCameraLive(false);
+    }
+  }, [connection]);
+
+  useEffect(() => {
     if (connection !== "connected" || activeSection !== "mic" || micTestMode !== "hardware" || voiceStatus?.state !== "recording") {
       return undefined;
     }
@@ -1126,6 +1961,65 @@ function App() {
     }, 500);
     return () => window.clearInterval(timer);
   }, [activeSection, connection, micTestMode, voiceStatus?.state]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "mic") {
+      return undefined;
+    }
+    void refreshWakeStatus();
+    if (!wakeStatus?.enabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshWakeStatus();
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeSection, connection, refreshWakeStatus, wakeStatus?.enabled]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "speaker") {
+      return undefined;
+    }
+    void refreshTtsStatus();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && (ttsStatus?.state === "playing" || ttsStatus?.state === "synthesizing")) {
+        void refreshTtsStatus();
+      }
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [activeSection, connection, refreshTtsStatus, ttsStatus?.state]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "sensors") {
+      return undefined;
+    }
+    void refreshSensorsOnly();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshSensorsOnly();
+      }
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, [activeSection, connection, refreshSensorsOnly]);
+
+  useEffect(() => {
+    if (connection !== "connected" || activeSection !== "radar") {
+      return undefined;
+    }
+    void refreshRadarStatus();
+    const radarPollingActive = radarRunning || radarStatus?.mode === "report";
+    if (!radarPollingActive) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshRadarStatus();
+      }
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [activeSection, connection, radarRunning, radarStatus?.mode, refreshRadarStatus]);
 
   useEffect(() => {
     if (connection !== "connected") {
@@ -1259,7 +2153,7 @@ function App() {
             <div className="risk-list">
               {(diagnostics?.riskItems ?? [
                 "屏幕 VCC 为 5V，GPIO 逻辑为 3.3V。",
-                "GPIO0、GPIO35-37、GPIO45/46 不作为普通外设脚使用。",
+                "GPIO35-37 在 N8R8 上禁用；GPIO0 不接；GPIO3/45/46/48 属于摄像头高风险脚。",
                 "I2C 上拉必须到 3.3V。",
               ]).map((item) => (
                 <div className="risk-row" key={item}>
@@ -1297,8 +2191,14 @@ function App() {
             networkBusy={networkBusy}
             wifiNetworks={wifiNetworks}
             wifiScanState={wifiScanState}
+            mqttConfig={mqttConfig}
+            mqttTokenInput={mqttTokenInput}
+            setMqttTokenInput={setMqttTokenInput}
             setNetwork={setNetworkDraft}
+            setMqttConfig={setMqttConfig}
             saveNetwork={saveNetwork}
+            saveMqttConfig={saveMqttConfig}
+            publishMqttState={publishMqttState}
             scanWifi={scanWifi}
           />
         );
@@ -1361,10 +2261,78 @@ function App() {
             micTranscript={micTranscript}
             micAiReply={micAiReply}
             micAsrResult={micAsrResult}
+            wakeStatus={wakeStatus}
+            wakeBusy={wakeBusy}
+            wakeEvents={wakeEvents}
+            micPlayback={micPlayback}
             startHardwareTest={startMicHardwareTest}
             stopHardwareTest={stopMicHardwareTest}
             refreshHardwareStatus={refreshMicHardwareStatus}
             toggleVoiceChat={toggleVoiceChat}
+            startWakeListening={startWakeListening}
+            stopWakeListening={stopWakeListening}
+            refreshWakeStatus={refreshWakeStatus}
+            resetWakeStats={resetWakeStats}
+          />
+        );
+      case "speaker":
+        return (
+          <SpeakerTestPanel
+            connection={connection}
+            config={ttsConfig}
+            setConfig={setTtsConfigDraft}
+            keyInput={ttsKeyInput}
+            setKeyInput={setTtsKeyInput}
+            text={ttsText}
+            setText={setTtsText}
+            status={ttsStatus}
+            busy={ttsBusy}
+            browserBusy={browserTtsBusy}
+            saveConfig={saveTtsConfig}
+            clearKey={clearTtsKey}
+            playDevice={playDeviceTts}
+            stopDevice={stopDeviceTts}
+            playBrowser={playBrowserTts}
+            refreshStatus={refreshTtsStatus}
+          />
+        );
+      case "radar":
+        return (
+          <RadarTestPanel
+            connection={connection}
+            status={radarStatus}
+            samples={radarSamples}
+            running={radarRunning}
+            busy={radarBusy}
+            startTest={startRadarTest}
+            stopTest={stopRadarTest}
+            refreshStatus={refreshRadarStatus}
+          />
+        );
+      case "camera":
+        return (
+          <CameraTestPanel
+            connection={connection}
+            aiConfig={aiConfig}
+            status={cameraStatus}
+            probe={cameraProbe}
+            rgb565Diag={cameraRgb565Diag}
+            previewDataUrl={cameraPreview}
+            analyzeResult={cameraAnalyzeResult}
+            busy={cameraBusy}
+            live={cameraLive}
+            liveFrames={cameraLiveFrames}
+            liveLastAt={cameraLiveLastAt}
+            liveError={cameraLiveError}
+            refreshStatus={refreshCameraStatus}
+            probeCamera={probeCamera}
+            captureFrame={captureCameraFrame}
+            toggleLive={toggleCameraLive}
+            analyzeFrame={analyzeCameraFrame}
+            runJpegDiag={runCameraJpegDiag}
+            runRgb565Diag={runCameraRgb565Diag}
+            resetCamera={resetCameraDevice}
+            clearFrame={clearCameraFrame}
           />
         );
       case "pins":
@@ -1528,8 +2496,14 @@ function NetworkPanel({
   networkBusy,
   wifiNetworks,
   wifiScanState,
+  mqttConfig,
+  mqttTokenInput,
+  setMqttTokenInput,
   setNetwork,
+  setMqttConfig,
   saveNetwork,
+  saveMqttConfig,
+  publishMqttState,
   scanWifi,
 }: {
   mode: TransportMode;
@@ -1538,8 +2512,14 @@ function NetworkPanel({
   networkBusy: boolean;
   wifiNetworks: WifiNetwork[];
   wifiScanState: "idle" | "scanning" | "done" | "error";
+  mqttConfig: MQTTConfig | null;
+  mqttTokenInput: string;
+  setMqttTokenInput: (value: string) => void;
   setNetwork: (network: NetworkConfig) => void;
+  setMqttConfig: (config: MQTTConfig) => void;
   saveNetwork: (event: FormEvent<HTMLFormElement>) => void;
+  saveMqttConfig: (config: MQTTConfig, token: string) => Promise<void>;
+  publishMqttState: () => Promise<void>;
   scanWifi: () => Promise<void>;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -1559,6 +2539,24 @@ function NetworkPanel({
   const usableNetworks = [...wifiNetworks].sort((a, b) => b.signal - a.signal);
   const scanBusy = wifiScanState === "scanning";
   const canSubmit = connection === "connected" && !networkBusy && current.ssid.trim().length > 0;
+  const currentMqtt = mqttConfig ?? {
+    brokerUri: current.mqttHost || "",
+    homeId: "",
+    deviceId: "",
+    username: "",
+    hasPassword: false,
+    enabled: true,
+    configured: false,
+    connected: false,
+    reconnectCount: 0,
+    publishedCount: 0,
+    receivedCount: 0,
+    lastError: 0,
+    statusText: "not configured",
+  };
+  const updateMqtt = (key: keyof MQTTConfig, value: string | boolean | number) => {
+    setMqttConfig({ ...currentMqtt, [key]: value });
+  };
 
   return (
     <form className="section-flow" onSubmit={saveNetwork}>
@@ -1661,6 +2659,68 @@ function NetworkPanel({
       <div className="warning-line">
         <Info size={16} />
         像手机联网一样先选 Wi-Fi、输密码、点连接。AI API 地址和 Key 请到 AI 助手页面的“AI 设置”里配置。
+      </div>
+
+      <div className="settings-card">
+        <div className="section-heading compact-heading">
+          <div>
+            <p className="eyebrow">云端 MQTT</p>
+            <h3>后端绑定与状态上报</h3>
+          </div>
+          <span className={`status-pill ${currentMqtt.connected ? "ok" : currentMqtt.configured ? "warn" : "offline"}`}>
+            {currentMqtt.connected ? "已连接" : currentMqtt.configured ? "已配置" : "未配置"}
+          </span>
+        </div>
+        <div className="form-grid">
+          <label>
+            <span>Broker URI</span>
+            <input value={currentMqtt.brokerUri} placeholder="mqtts://你的域名:8883" onChange={(event) => updateMqtt("brokerUri", event.target.value)} />
+          </label>
+          <label>
+            <span>Home ID</span>
+            <input value={currentMqtt.homeId} placeholder="home_xxx" onChange={(event) => updateMqtt("homeId", event.target.value)} />
+          </label>
+          <label>
+            <span>Device ID</span>
+            <input value={currentMqtt.deviceId} placeholder="s3_xxx" onChange={(event) => updateMqtt("deviceId", event.target.value)} />
+          </label>
+          <label>
+            <span>Username</span>
+            <input value={currentMqtt.username} placeholder="device_s3_xxx" onChange={(event) => updateMqtt("username", event.target.value)} />
+          </label>
+          <label>
+            <span>Token / Password</span>
+            <input
+              type="password"
+              value={mqttTokenInput}
+              placeholder={currentMqtt.hasPassword ? "已保存，留空不覆盖" : "输入后写入设备 NVS"}
+              onChange={(event) => setMqttTokenInput(event.target.value)}
+            />
+          </label>
+          <label>
+            <span>Keepalive 秒</span>
+            <input
+              type="number"
+              min={15}
+              max={300}
+              value={currentMqtt.keepaliveSeconds ?? 60}
+              onChange={(event) => updateMqtt("keepaliveSeconds", Number(event.target.value))}
+            />
+          </label>
+        </div>
+        <div className="button-row">
+          <button className="action-button" type="button" disabled={connection !== "connected"} onClick={() => void saveMqttConfig(currentMqtt, mqttTokenInput)}>
+            <KeyRound size={17} />
+            写入绑定
+          </button>
+          <button className="action-button secondary" type="button" disabled={connection !== "connected" || !currentMqtt.configured} onClick={() => void publishMqttState()}>
+            <Send size={17} />
+            发布状态
+          </button>
+        </div>
+        <p className="muted-copy">
+          状态：{currentMqtt.statusText || "unknown"}；发布 {currentMqtt.publishedCount}；接收 {currentMqtt.receivedCount}；重连 {currentMqtt.reconnectCount}。
+        </p>
       </div>
     </form>
   );
@@ -2137,6 +3197,344 @@ const micQualityText: Record<string, string> = {
   too_short: "录音太短或没有有效样本：至少录 1-2 秒再判断。",
 };
 
+function SpeakerTestPanel({
+  connection,
+  config,
+  setConfig,
+  keyInput,
+  setKeyInput,
+  text,
+  setText,
+  status,
+  busy,
+  browserBusy,
+  saveConfig,
+  clearKey,
+  playDevice,
+  stopDevice,
+  playBrowser,
+  refreshStatus,
+}: {
+  connection: ConnectionState;
+  config: TTSConfig | null;
+  setConfig: (value: TTSConfig) => void;
+  keyInput: string;
+  setKeyInput: (value: string) => void;
+  text: string;
+  setText: (value: string) => void;
+  status: TTSStatus | null;
+  busy: boolean;
+  browserBusy: boolean;
+  saveConfig: () => Promise<void>;
+  clearKey: () => Promise<void>;
+  playDevice: () => Promise<void>;
+  stopDevice: () => Promise<void>;
+  playBrowser: () => Promise<void>;
+  refreshStatus: () => Promise<void>;
+}) {
+  const connected = connection === "connected";
+  const current = config ?? defaultTtsConfig;
+  const statusState: "ok" | "warn" | "danger" | "offline" =
+    status?.state === "error" ? "danger" : status?.state === "playing" || status?.state === "done" ? "ok" : current.ready ? "warn" : "offline";
+  const progress = status?.audioBytes ? Math.min(100, Math.round((status.playedBytes / status.audioBytes) * 100)) : 0;
+  const update = (patch: Partial<TTSConfig>) => setConfig({ ...current, ...patch });
+
+  return (
+    <div className="section-flow">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">MAX98357 / I2S TX / 云端 TTS</p>
+          <h2>扬声器测试</h2>
+        </div>
+        <StatusPill state={statusState}>{status?.state ?? (current.ready ? "ready" : "need key")}</StatusPill>
+      </div>
+
+      <div className="warning-line">
+        <ShieldAlert size={16} />
+        默认测试脚位：BCLK=GPIO40，LRC=GPIO41，DIN=GPIO39。BCLK/WS 与 INMP441 共用；MAX98357 可 5V 供电，但所有逻辑脚必须是 3.3V，首轮避免录音和播放同时进行。
+      </div>
+
+      <div className="speaker-layout">
+        <form className="project-ai-card" onSubmit={(event) => { event.preventDefault(); void saveConfig(); }}>
+          <div className="ai-chat-head compact-head">
+            <h3>TTS 配置</h3>
+            <StatusPill state={current.ready ? "ok" : current.hasApiKey ? "warn" : "offline"}>{current.ready ? "ready" : "need key"}</StatusPill>
+          </div>
+          <div className="form-grid single">
+            <label>
+              <span>TTS URL</span>
+              <input value={current.apiBaseUrl} inputMode="url" required onChange={(event) => update({ apiBaseUrl: event.target.value })} />
+            </label>
+            <label>
+              <span>模型</span>
+              <input value={current.model} required onChange={(event) => update({ model: event.target.value })} />
+            </label>
+            <label>
+              <span>音色</span>
+              <input value={current.voice} required onChange={(event) => update({ voice: event.target.value })} />
+            </label>
+            <label>
+              <span>TTS Key</span>
+              <input
+                type="password"
+                value={keyInput}
+                placeholder={current.hasApiKey ? `已保存：${current.apiKeyPreview || "hidden"}` : "输入后保存到设备 NVS"}
+                maxLength={256}
+                autoComplete="new-password"
+                onChange={(event) => setKeyInput(event.target.value)}
+              />
+            </label>
+            <label>
+              <span>超时 ms</span>
+              <input type="number" min={5000} max={90000} value={current.timeoutMs} onChange={(event) => update({ timeoutMs: Number(event.target.value) })} />
+            </label>
+          </div>
+          <div className="button-row">
+            <button className="action-button" type="submit" disabled={!connected}>
+              <Check size={17} />
+              保存 TTS
+            </button>
+            <button className="action-button secondary danger-soft" type="button" disabled={!connected || !current.hasApiKey} onClick={() => void clearKey()}>
+              清除 TTS Key
+            </button>
+          </div>
+        </form>
+
+        <div className="project-ai-card speaker-control-card">
+          <div className="ai-chat-head compact-head">
+            <h3>播放测试</h3>
+            <span className="form-hint">设备 PCM / 浏览器 MP3</span>
+          </div>
+          <label>
+            <span>测试文本</span>
+            <textarea value={text} rows={5} maxLength={512} onChange={(event) => setText(event.target.value)} />
+          </label>
+          <div className="button-row">
+            <button className="action-button" type="button" disabled={!connected || busy || !text.trim()} onClick={() => void playDevice()}>
+              <Play size={17} />
+              设备播放
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy} onClick={() => void stopDevice()}>
+              停止
+            </button>
+            <button className="action-button secondary" type="button" disabled={browserBusy || !text.trim()} onClick={() => void playBrowser()}>
+              <Volume2 size={17} />
+              浏览器试听
+            </button>
+            <button className="icon-button" type="button" disabled={!connected || busy} onClick={() => void refreshStatus()} title="刷新扬声器状态">
+              <RotateCw size={17} className={busy ? "spin" : ""} />
+            </button>
+          </div>
+          <p className="form-hint">浏览器试听不会读取设备已保存的 Key；如果本页 Key 为空，点击后会提示重新输入，设备播放不受影响。</p>
+        </div>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>设备播放状态</h3>
+          <StatusPill state={statusState}>{status?.state ?? "idle"}</StatusPill>
+        </div>
+        <div className="speaker-progress" aria-label="扬声器播放进度">
+          <span style={{ width: `${progress}%` }} />
+        </div>
+        <div className="sensor-grid">
+          <GaugeBlock label="进度" value={status ? `${progress}%` : "--"} state={statusState} />
+          <GaugeBlock label="采样率" value={status ? `${status.sampleRate} Hz` : "--"} state="ok" />
+          <GaugeBlock label="音频大小" value={status ? `${status.audioBytes} B` : "--"} state={status?.audioBytes ? "ok" : "offline"} />
+          <GaugeBlock label="已播放" value={status ? `${status.playedBytes} B` : "--"} state={status?.playedBytes ? "ok" : "offline"} />
+          <GaugeBlock label="合成耗时" value={status ? `${status.latencyMs} ms` : "--"} state={status?.latencyMs ? "ok" : "offline"} />
+          <GaugeBlock label="HTTP" value={status ? `${status.httpStatus}` : "--"} state={status?.httpStatus && status.httpStatus >= 200 && status.httpStatus < 300 ? "ok" : status?.httpStatus ? "danger" : "offline"} />
+        </div>
+        <KeyValue title="当前播放参数" rows={[
+          ["模型", status?.model || current.model],
+          ["音色", status?.voice || current.voice],
+          ["时长估算", status?.durationMs ? `${status.durationMs} ms` : "--"],
+          ["错误", status?.error || current.lastError || "--"],
+        ]} />
+      </div>
+    </div>
+  );
+}
+
+function CameraTestPanel({
+  connection,
+  aiConfig,
+  status,
+  probe,
+  rgb565Diag,
+  previewDataUrl,
+  analyzeResult,
+  busy,
+  live,
+  liveFrames,
+  liveLastAt,
+  liveError,
+  refreshStatus,
+  probeCamera,
+  captureFrame,
+  toggleLive,
+  analyzeFrame,
+  runJpegDiag,
+  runRgb565Diag,
+  resetCamera,
+  clearFrame,
+}: {
+  connection: ConnectionState;
+  aiConfig: AIConfig | null;
+  status: CameraStatus | null;
+  probe: CameraProbeResponse | null;
+  rgb565Diag: CameraRgb565DiagResponse | null;
+  previewDataUrl: string | null;
+  analyzeResult: CameraAnalyzeResponse | null;
+  busy: boolean;
+  live: boolean;
+  liveFrames: number;
+  liveLastAt: string;
+  liveError: string;
+  refreshStatus: () => Promise<void>;
+  probeCamera: () => Promise<void>;
+  captureFrame: (source?: "manual" | "live") => Promise<void>;
+  toggleLive: () => void;
+  analyzeFrame: () => Promise<void>;
+  runJpegDiag: () => Promise<void>;
+  runRgb565Diag: () => Promise<void>;
+  resetCamera: () => Promise<void>;
+  clearFrame: () => Promise<void>;
+}) {
+  const connected = connection === "connected";
+  const readyForAi = Boolean(aiConfig?.ready);
+  const hasFrame = Boolean(status?.hasFrame);
+  const probeOk = Boolean(probe?.ok);
+  const statusState = !connected ? "offline" : status?.lastError ? "danger" : status?.initialized ? "ok" : "warn";
+
+  return (
+    <div className="section-flow">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">OV3660 / YUV422 到软件 JPEG / PSRAM</p>
+          <h2>摄像头测试</h2>
+        </div>
+        <StatusPill state={statusState}>{status?.initialized ? "camera ready" : connected ? "等待初始化" : "未连接"}</StatusPill>
+      </div>
+
+      <div className="warning-line">
+        <Info size={16} />
+        先用“安全探测”验证 XCLK + SCCB 是否能读到 OV3660 ID；正式拍照、预览和识别使用稳定的 YUV422 采集后软件 JPEG。
+      </div>
+
+      <div className="camera-layout">
+        <div className="camera-preview-panel">
+          <div className="ai-chat-head compact-head">
+            <h3>最近一张照片</h3>
+            <StatusPill state={hasFrame ? "ok" : "offline"}>{hasFrame ? `#${status?.frameId}` : "无缓存"}</StatusPill>
+          </div>
+          <div className="camera-preview">
+            {previewDataUrl ? (
+              <img src={previewDataUrl} alt="OV3660 最近一张 JPEG 预览" />
+            ) : (
+              <div>
+                <Camera size={38} />
+                <span>{hasFrame ? "设备有照片缓存，但本次未返回预览。" : "拍照后显示 QVGA 软件 JPEG 预览。"}</span>
+              </div>
+            )}
+          </div>
+          <div className="button-row">
+            <button className="action-button secondary" type="button" disabled={!connected || busy} onClick={() => void probeCamera()}>
+              <Search size={17} />
+              安全探测
+            </button>
+            <button className="action-button" type="button" disabled={!connected || busy || !probeOk} onClick={() => void captureFrame()} title={probeOk ? "完整 DVP 接线后抓拍一帧" : "请先完成安全探测并确认 PID=0x3660"}>
+              <Camera size={17} />
+              完整接线后拍照
+            </button>
+            <button className={`action-button ${live ? "danger-soft" : "secondary"}`} type="button" disabled={!connected || (busy && !live) || (!live && !probeOk)} onClick={toggleLive} title={live ? "停止实时预览" : probeOk ? "完整 DVP 接线后启动低频预览" : "请先完成安全探测并确认 PID=0x3660"}>
+              {live ? <Power size={17} /> : <Play size={17} />}
+              {live ? "停止实时预览" : "完整接线后预览"}
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy || !probeOk || !readyForAi} onClick={() => void analyzeFrame()} title="重新拍摄 OV3660 XGA 高分辨率照片并提交 AI；不依赖当前串口预览图">
+              <Sparkles size={17} />
+              拍高分辨率并识别
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy || !probeOk} onClick={() => void runJpegDiag()} title="仅验证 OV3660 片上 JPEG SOI/码流稳定性；当前颜色可能偏灰偏绿，不作为正式拍照路径">
+              片上JPEG码流诊断
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy || !probeOk} onClick={() => void runRgb565Diag()} title="抓一帧 QQVGA RGB565，只返回统计信息，用于判断 DVP 是否能成帧">
+              RGB565诊断
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy} onClick={() => void resetCamera()} title="反初始化摄像头驱动，释放 XCLK/SCCB/DMA 资源">
+              重置摄像头
+            </button>
+            <button className="action-button secondary danger-soft" type="button" disabled={!connected || busy || !hasFrame} onClick={() => void clearFrame()}>
+              清除照片
+            </button>
+            <button className="icon-button" type="button" disabled={!connected || busy} onClick={() => void refreshStatus()} title="刷新摄像头状态">
+              <RotateCw size={17} className={busy ? "spin" : ""} />
+            </button>
+          </div>
+          <div className={`camera-live-strip ${live ? "active" : ""}`}>
+            <span>{live ? "低频预览运行中" : "实时预览未启动"}</span>
+            <strong>{liveFrames} 帧</strong>
+            <em>{liveLastAt || "约 2 秒 / 帧，基于串口单帧软件 JPEG"}</em>
+          </div>
+          <p className="form-hint">AI 识别会重新拍摄 XGA YUV422 并软件压缩 JPEG，这是当前实测稳定的正式提交路径；片上 JPEG 码流诊断仍只用于排查，不作为正式提交图片。</p>
+          {liveError && <p className="form-hint danger">实时预览已停止：{liveError}</p>}
+          <p className="form-hint">当前只接 4/5/47 时请只点“安全探测”；拍照/预览需要 DVP 全部接好且避开启动复位问题后再做。</p>
+          {!readyForAi && <p className="form-hint danger">AI 配置未 ready：识别前需要在 AI 助手页保存支持视觉的模型、Base URL 和 API Key。</p>}
+        </div>
+
+        <div className="project-ai-card">
+          <div className="ai-chat-head compact-head">
+            <h3>采集状态</h3>
+            <StatusPill state={status?.lastError ? "danger" : status?.initialized ? "ok" : "offline"}>{status?.lastError || status?.frameSize || "未读取"}</StatusPill>
+          </div>
+          <div className="camera-metrics">
+            <GaugeBlock label="尺寸" value={status?.width ? `${status.width} x ${status.height}` : "--"} state={status?.width ? "ok" : "offline"} />
+            <GaugeBlock label="JPEG" value={status ? `${status.jpegBytes} B` : "--"} state={hasFrame ? "ok" : "offline"} />
+            <GaugeBlock label="路径" value={status?.pixelFormat || "--"} state={status?.pixelFormat ? "ok" : "offline"} />
+            <GaugeBlock label="耗时" value={status ? `${status.captureMs} ms` : "--"} state={hasFrame ? "ok" : "offline"} />
+            <GaugeBlock label="PSRAM" value={status ? `${status.freePsramKb} KB` : "--"} state="ok" />
+          </div>
+          <p className="form-hint">当前可用主路径：YUV422 原始帧 + 低光软件增亮 + 软件 JPEG；“片上 JPEG 码流诊断”仅用于排查 OV3660 内置压缩链路，不建议作为正式拍照结果。</p>
+          <KeyValue title="安全探测" rows={[
+            ["结果", probe ? (probe.ok ? "通过，读到 OV3660 ID" : "未通过") : "未执行"],
+            ["SCCB 地址", probe ? `0x${probe.address.toString(16).padStart(2, "0")}` : "--"],
+            ["PID", probe ? `0x${probe.pid.toString(16).padStart(4, "0")} / 期望 0x${probe.expectedPid.toString(16).padStart(4, "0")}` : "--"],
+            ["耗时", probe ? `${probe.durationMs} ms` : "--"],
+            ["错误", probe?.lastError || probe?.espErrName || "--"],
+          ]} />
+          <KeyValue title="RGB565 诊断" rows={[
+            ["结果", rgb565Diag ? (rgb565Diag.ok ? "成帧，DVP 同步至少部分可用" : "失败") : "未执行"],
+            ["尺寸/字节", rgb565Diag ? `${rgb565Diag.width}x${rgb565Diag.height} / ${rgb565Diag.bytes} B` : "--"],
+            ["耗时", rgb565Diag ? `${rgb565Diag.captureMs} ms` : "--"],
+            ["校验和", rgb565Diag ? `0x${rgb565Diag.checksum.toString(16).padStart(8, "0")}` : "--"],
+            ["前16字节", rgb565Diag?.firstBytes || "--"],
+            ["错误", rgb565Diag?.lastError || rgb565Diag?.espErrName || "--"],
+          ]} />
+          <KeyValue title="硬件约束" rows={[
+            ["供电", "VDD/DVDD1.5V=1.5V，VDD2.8V/IOVDD/AVDD=3V3，LED 不接"],
+            ["SCCB", "SDA=GPIO4 / SCL=GPIO5，上拉到 3.3V"],
+            ["XCLK/PWDN", "XCLK=GPIO47，PWDN 不接"],
+            ["DVP", "VSYNC=GPIO2，HREF=GPIO38，PCLK=GPIO19，D0-D7=GPIO17/18/8/3/46/48/45/16"],
+          ]} />
+        </div>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>AI 识别结果</h3>
+          <StatusPill state={analyzeResult ? "ok" : "offline"}>{analyzeResult ? `${analyzeResult.latencyMs} ms` : "未识别"}</StatusPill>
+        </div>
+        <pre className="json-preview tall">{analyzeResult?.reply || "识别后显示结构化候选。结果只用于确认页，不会直接写入库存。"}</pre>
+        {analyzeResult && (
+          <p className="form-hint">
+            HTTP {analyzeResult.httpStatus} / {analyzeResult.model} / {analyzeResult.width}x{analyzeResult.height} / {analyzeResult.jpegBytes} B / 需要确认：{analyzeResult.needsConfirmation ? "是" : "否"}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function MicrophoneTestPanel({
   connection,
   asrConfig,
@@ -2147,10 +3545,18 @@ function MicrophoneTestPanel({
   micTranscript,
   micAiReply,
   micAsrResult,
+  wakeStatus,
+  wakeBusy,
+  wakeEvents,
+  micPlayback,
   startHardwareTest,
   stopHardwareTest,
   refreshHardwareStatus,
   toggleVoiceChat,
+  startWakeListening,
+  stopWakeListening,
+  refreshWakeStatus,
+  resetWakeStats,
 }: {
   connection: ConnectionState;
   asrConfig: ASRConfig | null;
@@ -2161,17 +3567,28 @@ function MicrophoneTestPanel({
   micTranscript: string;
   micAiReply: string;
   micAsrResult: VoiceChatResponse | null;
+  wakeStatus: WakeStatus | null;
+  wakeBusy: boolean;
+  wakeEvents: WakeEventRecord[];
+  micPlayback: MicPlayback | null;
   startHardwareTest: () => Promise<void>;
   stopHardwareTest: () => Promise<void>;
   refreshHardwareStatus: () => Promise<void>;
   toggleVoiceChat: () => Promise<void>;
+  startWakeListening: () => Promise<void>;
+  stopWakeListening: () => Promise<void>;
+  refreshWakeStatus: () => Promise<void>;
+  resetWakeStats: () => Promise<void>;
 }) {
   const connected = connection === "connected";
   const recording = voiceStatus?.state === "recording";
+  const wakeListening = Boolean(wakeStatus?.enabled);
   const hardwareRecording = recording && micTestMode === "hardware";
   const asrRecording = recording && micTestMode === "asr";
   const hint = voiceStatus?.qualityHint ?? "too_short";
   const maxBar = Math.max(1, ...micSamples.map((item) => Math.max(item.rms ?? 0, item.peakAbs ?? 0)));
+  const wakeState = !connected ? "offline" : wakeStatus?.error ? "danger" : wakeListening ? "warn" : "ok";
+  const wakeDisabled = !connected || wakeBusy || recording || voiceBusy;
 
   return (
     <div className="section-flow">
@@ -2187,7 +3604,55 @@ function MicrophoneTestPanel({
 
       <div className="warning-line">
         <Info size={16} />
-        当前接线：VDD=3V3，GND=GND，SCK=GPIO40，WS=GPIO41，SD=GPIO42，L/R=GND。这里的硬件录音测试不会触发 ASR 或 AI。
+        当前接线：VDD=3V3，GND=GND，SCK=GPIO40，WS=GPIO41，SD=GPIO42，L/R=GND。GPIO40/41 同时也接到 MAX98357A 的 BCLK/LRC；这里的硬件录音测试不会触发 ASR 或 AI。
+      </div>
+
+      <div className="project-ai-card wake-card">
+        <div className="ai-chat-head compact-head">
+          <div>
+            <h3>WakeNet 唤醒词测试</h3>
+            <p className="form-hint">{wakeStatus?.wakeWord ?? "小冰小冰"} / {wakeStatus?.model ?? "wn9_xiaobinxiaobin_tts"}</p>
+          </div>
+          <StatusPill state={wakeState}>{wakeStatus?.state ?? "未读取"}</StatusPill>
+        </div>
+        <div className="button-row">
+          <button className="action-button" type="button" disabled={wakeDisabled || wakeListening} onClick={() => void startWakeListening()}>
+            <Mic size={17} />
+            启动监听
+          </button>
+          <button className="action-button secondary danger-soft" type="button" disabled={!connected || wakeBusy || !wakeListening} onClick={() => void stopWakeListening()}>
+            停止监听
+          </button>
+          <button className="action-button secondary" type="button" disabled={!connected || wakeBusy} onClick={() => void refreshWakeStatus()}>
+            <RotateCw size={17} className={wakeBusy ? "spin" : ""} />
+            刷新状态
+          </button>
+          <button className="action-button secondary" type="button" disabled={!connected || wakeBusy} onClick={() => void resetWakeStats()}>
+            <Trash2 size={17} />
+            清空统计
+          </button>
+        </div>
+        <div className="mic-metrics-grid wake-metrics-grid">
+          <GaugeBlock label="触发次数" value={`${wakeStatus?.triggerCount ?? 0}`} state={wakeStatus?.triggerCount ? "warn" : "ok"} />
+          <GaugeBlock label="最近触发" value={wakeStatus?.lastTriggerMs ? `${wakeStatus.lastTriggerMs} ms` : "--"} state={wakeStatus?.lastTriggerMs ? "warn" : "offline"} />
+          <GaugeBlock label="VAD" value={`${wakeStatus?.vadState ?? -1}`} state={(wakeStatus?.vadState ?? -1) > 0 ? "warn" : "ok"} />
+          <GaugeBlock label="RMS / Peak" value={`${wakeStatus?.rms ?? 0} / ${wakeStatus?.peakAbs ?? 0}`} state={(wakeStatus?.rms ?? 0) > 0 ? "ok" : "offline"} />
+          <GaugeBlock label="Timeout" value={`${wakeStatus?.timeoutCount ?? 0}`} state={(wakeStatus?.timeoutCount ?? 0) > 0 ? "danger" : "ok"} />
+          <GaugeBlock label="错误" value={wakeStatus?.error || "无"} state={wakeStatus?.error ? "danger" : "ok"} />
+        </div>
+        <div className="wake-event-list" aria-label="最近唤醒事件">
+          {wakeEvents.length === 0 ? (
+            <span>等待 wake_word_detected 事件</span>
+          ) : (
+            wakeEvents.map((event) => (
+              <span key={event.id}>
+                <strong>{event.receivedAt}</strong>
+                <em>{event.wakeWord}</em>
+                <b>#{event.triggerCount}</b>
+              </span>
+            ))
+          )}
+        </div>
       </div>
 
       <div className="mic-test-grid">
@@ -2199,7 +3664,7 @@ function MicrophoneTestPanel({
             </StatusPill>
           </div>
           <div className="button-row">
-            <button className="action-button" type="button" disabled={!connected || voiceBusy || recording} onClick={() => void startHardwareTest()}>
+            <button className="action-button" type="button" disabled={!connected || voiceBusy || recording || wakeListening} onClick={() => void startHardwareTest()}>
               <Mic size={17} />
               开始硬件录音
             </button>
@@ -2212,6 +3677,18 @@ function MicrophoneTestPanel({
             </button>
           </div>
           <p className="form-hint">录音中会每 500 ms 自动刷新状态；停止后只保留诊断结果，不上传音频。</p>
+          {micPlayback && (
+            <div className="mic-playback-box">
+              <div className="ai-chat-head compact-head">
+                <h4>开发板录音回放</h4>
+                <span className="form-hint">{micPlayback.createdAt}</span>
+              </div>
+              <audio controls src={micPlayback.url} />
+              <p className="form-hint">
+                {micPlayback.sampleRate} Hz / {micPlayback.channels} ch / {micPlayback.bitsPerSample} bit / {micPlayback.durationMs} ms / PCM {micPlayback.pcmBytes} B / WAV {micPlayback.wavBytes} B
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="project-ai-card">
@@ -2222,7 +3699,7 @@ function MicrophoneTestPanel({
             </StatusPill>
           </div>
           <div className="button-row">
-            <button className={asrRecording ? "action-button danger-soft" : "action-button secondary"} type="button" disabled={!connected || voiceBusy || (recording && !asrRecording)} onClick={() => void toggleVoiceChat()}>
+            <button className={asrRecording ? "action-button danger-soft" : "action-button secondary"} type="button" disabled={!connected || voiceBusy || (recording && !asrRecording) || (!asrRecording && wakeListening)} onClick={() => void toggleVoiceChat()}>
               <Mic size={17} />
               {asrRecording ? "停止并识别" : "开始 ASR 测试"}
             </button>
@@ -2300,11 +3777,420 @@ function MicrophoneTestPanel({
   );
 }
 
+function RadarTestPanel({
+  connection,
+  status,
+  samples,
+  running,
+  busy,
+  startTest,
+  stopTest,
+  refreshStatus,
+}: {
+  connection: ConnectionState;
+  status: RadarSnapshot | null;
+  samples: RadarSnapshot[];
+  running: boolean;
+  busy: boolean;
+  startTest: () => Promise<void>;
+  stopTest: () => Promise<void>;
+  refreshStatus: () => Promise<void>;
+}) {
+  const connected = connection === "connected";
+  const gateEnergy = status?.gateEnergy ?? Array.from({ length: 16 }, () => 0);
+  const maxEnergy = Math.max(1, ...gateEnergy);
+  const totalEnergy = Math.max(1, gateEnergy.reduce((sum, value) => sum + value, 0));
+  const peakIndex = gateEnergy.reduce((bestIndex, value, index, values) => (value > values[bestIndex] ? index : bestIndex), 0);
+  const peakValue = gateEnergy[peakIndex] ?? 0;
+  const nearEnergy = status?.nearEnergy ?? gateEnergy.slice(0, 4).reduce((sum, value) => sum + value, 0);
+  const midEnergy = status?.midEnergy ?? gateEnergy.slice(4, 9).reduce((sum, value) => sum + value, 0);
+  const farEnergy = status?.farEnergy ?? gateEnergy.slice(9).reduce((sum, value) => sum + value, 0);
+  const nearShare = Math.round((nearEnergy / totalEnergy) * 100);
+  const midShare = Math.round((midEnergy / totalEnergy) * 100);
+  const farShare = Math.round((farEnergy / totalEnergy) * 100);
+  const estimatedGate = status?.estimatedGate ?? peakIndex;
+  const stableGate = status?.stableGate ?? estimatedGate;
+  const confidence = status?.confidence ?? 0;
+  const stability = status?.stability ?? 0;
+  const motionScore = status?.motionScore ?? 0;
+  const staticScore = status?.staticScore ?? 0;
+  const humanScore = status?.humanScore ?? 0;
+  const staticClutter = Boolean(status?.staticClutter);
+  const humanCandidate = Boolean(status?.humanCandidate);
+  const stableTarget = Boolean(status?.stablePresence);
+  const within1m = Boolean(status?.within1m);
+  const approaching = Boolean(status?.approaching);
+  const approachScore = status?.approachScore ?? 0;
+  const approachFrames = status?.approachFrames ?? 0;
+  const approachDistanceDelta = status?.approachDistanceDelta ?? 0;
+  const thresholdScore = status?.thresholdScore ?? 0;
+  const radarPresenceText = !status ? "等待测试" : status.presence ? "模块上报有目标" : "模块上报无目标";
+  const zoneLabel = status?.stableZone === "near" ? "近区" : status?.stableZone === "mid" ? "中区" : status?.stableZone === "far" ? "远区" : "未稳定";
+  const semanticStateLabel = !status
+      ? "等待测试"
+    : status.targetClass === "reliable_approaching"
+      ? "可靠靠近人体"
+      : status.targetClass === "reliable_within_1m"
+        ? "可靠 1 米内人体"
+      : status.targetClass === "reliable_human" || stableTarget
+          ? "可靠人体"
+          : status.targetClass === "human_candidate" || humanCandidate
+            ? "人体候选"
+            : status.targetClass === "static_reflection" || staticClutter
+              ? "静态反射"
+              : status.targetClass === "near_clutter" || status.nearClutter
+                ? "近场杂波"
+                : status.presence
+                  ? "原始目标"
+                  : "无目标";
+  const within1mText = !status ? "--" : status.nearClutter ? "近场杂波，不计入人体" : staticClutter ? "静态反射，不计入人体" : within1m ? "可靠 1 米内人体" : humanCandidate ? "人体候选，未确认 1 米内" : "未确认";
+  const approachingText = !status ? "--" : status.nearClutter ? "近场杂波，不判断" : staticClutter ? "静态反射，不判断" : approaching ? "可靠靠近" : humanCandidate ? "人体候选，靠近证据不足" : "未确认";
+  const targetLabel = !status
+    ? "等待测试"
+    : status.lastError || status.mode === "error"
+      ? "诊断异常"
+      : stableTarget
+        ? `${zoneLabel}可靠人体`
+        : humanCandidate
+          ? "人体候选，待连续靠近/微动确认"
+        : status.nearClutter
+          ? "近场杂波，未计为人体"
+        : staticClutter
+          ? "静态反射，疑似墙面/柜体"
+        : status.presence
+          ? "原始上报有目标，距离未稳定"
+          : "未见稳定目标";
+  const targetState: "ok" | "warn" | "danger" | "offline" = !status
+    ? "offline"
+    : status.lastError || status.mode === "error"
+      ? "danger"
+      : stableTarget
+        ? "warn"
+        : humanCandidate
+          ? "warn"
+        : staticClutter
+          ? "danger"
+        : "ok";
+  const timeline = samples.slice(-60);
+  const healthState = !status ? "offline" : status.lastError || status.mode === "error" || staticClutter ? "danger" : stableTarget || humanCandidate ? "warn" : "ok";
+  const latestTrend = timeline.slice(-8);
+  const recentSamples = timeline.slice(-12);
+  const distanceOf = (sample?: RadarSnapshot | null) => {
+    if (!sample) {
+      return 0;
+    }
+    return sample.smoothedDistanceRaw && sample.smoothedDistanceRaw > 0 ? sample.smoothedDistanceRaw : sample.distanceRaw ?? 0;
+  };
+  const latestSample = recentSamples.length > 0 ? recentSamples[recentSamples.length - 1] : status;
+  const previousSample = recentSamples.length > 1 ? recentSamples[recentSamples.length - 2] : null;
+  const latestDistance = distanceOf(latestSample);
+  const previousDistance = distanceOf(previousSample);
+  const distanceDelta = latestSample ? latestDistance - previousDistance : 0;
+  const distanceTrendLabel = !status
+    ? "--"
+    : distanceDelta <= -25
+      ? `靠近 ${Math.abs(distanceDelta)}`
+      : distanceDelta >= 25
+        ? `远离 ${distanceDelta}`
+        : "平稳";
+  const distanceBandLabel = !status
+    ? "--"
+    : latestDistance === 0
+      ? "无原始目标"
+      : latestDistance <= 120
+        ? "1 米内候选"
+        : latestDistance <= 300
+          ? "近距离候选"
+          : latestDistance <= 700
+            ? "中距离候选"
+            : "远距离候选";
+  const motionHintText = !status
+    ? "--"
+    : status.nearClutter || staticClutter
+      ? status.nearClutter ? "近场杂波" : "静态反射"
+      : distanceDelta <= -25
+        ? "目标在靠近"
+        : distanceDelta >= 25
+          ? "目标在远离"
+          : status.presence
+            ? "目标距离平稳"
+            : "无目标";
+  const latestRawDistanceText = !status ? "--" : `${latestSample?.distanceRaw ?? status.distanceRaw}`;
+  const latestSmoothedDistanceText = !status ? "--" : `${latestSample?.smoothedDistanceRaw ?? status.smoothedDistanceRaw ?? 0}`;
+
+  return (
+    <div className="section-flow">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">HMMD / 24GHz / UART</p>
+          <h2>雷达测试</h2>
+        </div>
+        <StatusPill state={healthState}>{status ? `${radarPresenceText} / ${status.mode}` : "等待测试"}</StatusPill>
+      </div>
+
+      <div className="warning-line">
+        <Info size={16} />
+        当前测试接线：3V3、GND、雷达 TX 接 GPIO21、雷达 RX 接 GPIO20，OT2 不接。模块和 UART 均为 3.3V 逻辑，雷达结果只作为靠近/有人上下文，不单独判定开门。
+      </div>
+
+      <div className="mic-test-grid">
+        <div className="project-ai-card mic-control-card">
+          <div className="ai-chat-head compact-head">
+            <h3>上报模式</h3>
+            <StatusPill state={running ? "warn" : connected ? "ok" : "offline"}>
+              {running ? "轮询中" : connected ? "可测试" : "未连接"}
+            </StatusPill>
+          </div>
+          <div className="button-row">
+            <button className="action-button" type="button" disabled={!connected || busy || running} onClick={() => void startTest()}>
+              <Radio size={17} />
+              开始雷达测试
+            </button>
+            <button className="action-button secondary danger-soft" type="button" disabled={!connected || busy || !running} onClick={() => void stopTest()}>
+              停止测试
+            </button>
+            <button className="action-button secondary" type="button" disabled={!connected || busy} onClick={() => void refreshStatus()}>
+              <RotateCw size={17} />
+              刷新
+            </button>
+          </div>
+          <p className="form-hint">开始后固件会进入上报模式。页面优先看多帧稳定结果；原始门值只用于排查杂波和安装角度。</p>
+        </div>
+
+        <div className="project-ai-card">
+          <div className="ai-chat-head compact-head">
+            <h3>串口诊断</h3>
+            <StatusPill state={status?.ready ? "ok" : "offline"}>{status?.ready ? "UART ready" : "no data"}</StatusPill>
+          </div>
+          <KeyValue title="原始计数" rows={[
+            ["frame", `${status?.frameCount ?? 0}`],
+            ["parse error", `${status?.parseErrorCount ?? 0}`],
+            ["timeout", `${status?.timeoutCount ?? 0}`],
+            ["last", status?.lastText || "--"],
+            ["error", status?.lastError || "无"],
+          ]} />
+        </div>
+      </div>
+
+      <div className="mic-metrics-grid">
+        <GaugeBlock label="模块上报" value={status ? radarPresenceText : "--"} state={status?.presence ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="目标状态" value={status ? targetLabel : "--"} state={targetState} />
+        <GaugeBlock label="1米内人体" value={within1mText} state={status?.nearClutter || staticClutter ? "danger" : within1m ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="正在靠近" value={approachingText} state={approaching ? "warn" : status?.nearClutter || staticClutter ? "danger" : status ? "ok" : "offline"} />
+        <GaugeBlock label="语义分类" value={semanticStateLabel} state={staticClutter || status?.nearClutter ? "danger" : stableTarget || humanCandidate ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="人体评分" value={status ? `${humanScore}%` : "--"} state={humanScore >= 45 ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="静态评分" value={status ? `${staticScore}%` : "--"} state={staticScore >= 70 ? "danger" : status ? "ok" : "offline"} />
+        <GaugeBlock label="近场杂波" value={status ? (status.nearClutter ? "疑似" : "否") : "--"} state={status?.nearClutter ? "danger" : status ? "ok" : "offline"} />
+        <GaugeBlock label="静态反射" value={status ? (staticClutter ? "疑似墙面" : "否") : "--"} state={staticClutter ? "danger" : status ? "ok" : "offline"} />
+        <GaugeBlock label="稳定区域" value={status ? zoneLabel : "--"} state={stableTarget ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="可信度" value={status ? `${confidence}%` : "--"} state={confidence >= 70 ? "warn" : "ok"} />
+        <GaugeBlock label="稳定度" value={status ? `${stability}%` : "--"} state={stability >= 60 ? "warn" : "ok"} />
+        <GaugeBlock label="微动评分" value={status ? `${motionScore}%` : "--"} state={motionScore >= 28 ? "warn" : staticClutter ? "danger" : "ok"} />
+        <GaugeBlock label="距离抖动" value={status ? `${status.distanceSpan ?? 0}` : "--"} state="ok" />
+        <GaugeBlock label="能量变化" value={status ? `${status.energyChangeScore ?? 0}%` : "--"} state="ok" />
+        <GaugeBlock label="靠近评分" value={status ? `${approachScore}%` : "--"} state={approaching ? "warn" : "ok"} />
+        <GaugeBlock label="靠近帧/距离" value={status ? `${approachFrames} / ${approachDistanceDelta}` : "--"} state={approaching ? "warn" : "ok"} />
+        <GaugeBlock label="厂家阈值" value={status ? (status.thresholdPresence ? `命中 ${thresholdScore}%` : "未命中") : "--"} state={status?.thresholdPresence ? "warn" : status ? "ok" : "offline"} />
+        <GaugeBlock label="拒绝原因" value={status?.rejectionReason || "无"} state={status?.rejectionReason ? (staticClutter || status?.nearClutter ? "danger" : "ok") : "ok"} />
+        <GaugeBlock label="阈值门" value={status ? `门 ${status.thresholdGate ?? "--"}` : "--"} state="ok" />
+        <GaugeBlock label="保持帧数" value={status ? `${status.holdFramesRemaining ?? 0}` : "--"} state={(status?.holdFramesRemaining ?? 0) > 0 ? "warn" : "ok"} />
+        <GaugeBlock label="稳定门" value={status ? `门 ${stableGate}` : "--"} state="ok" />
+        <GaugeBlock label="估计门" value={status ? `门 ${estimatedGate}` : "--"} state="ok" />
+        <GaugeBlock label="最强门/值" value={status ? `门 ${status.peakGate ?? peakIndex} / ${status.peakEnergy ?? peakValue}` : "--"} state="ok" />
+        <GaugeBlock label="原始距离值" value={status ? `${status.distanceRaw}` : "--"} state="ok" />
+        <GaugeBlock label="平滑距离值" value={status ? `${status.smoothedDistanceRaw ?? 0}` : "--"} state="ok" />
+        <GaugeBlock label="OT2 接线" value="不接" state="offline" />
+        <GaugeBlock label="更新时间" value={status ? `${status.updatedAtMs} ms` : "--"} state={status ? "ok" : "offline"} />
+      </div>
+
+      <div className="project-ai-card radar-distance-card">
+        <div className="ai-chat-head compact-head">
+          <h3>距离理解</h3>
+          <span className="form-hint">按连续帧估算</span>
+        </div>
+        <div className="radar-summary-grid">
+          <div className={`radar-summary-item ${distanceDelta <= -25 || approaching ? "warn" : distanceDelta >= 25 ? "ok" : ""}`}>
+            <span>当前距离</span>
+            <strong>{status ? latestRawDistanceText : "--"}</strong>
+            <em>{status ? `平滑 ${latestSmoothedDistanceText}` : "--"}</em>
+          </div>
+          <div className={`radar-summary-item ${distanceDelta <= -25 || approaching ? "warn" : distanceDelta >= 25 ? "ok" : ""}`}>
+            <span>距离趋势</span>
+            <strong>{distanceTrendLabel}</strong>
+            <em>{motionHintText}</em>
+          </div>
+          <div className="radar-summary-item">
+            <span>门位判断</span>
+            <strong>{status ? `估计 ${estimatedGate} / 稳定 ${stableGate}` : "--"}</strong>
+            <em>{status ? `阈值 ${status.thresholdGate ?? "--"} · ${distanceBandLabel}` : "--"}</em>
+          </div>
+          <div className={`radar-summary-item ${staticClutter ? "danger" : ""}`}>
+            <span>语义状态</span>
+            <strong>{semanticStateLabel}</strong>
+            <em>{status ? `人体 ${humanScore}% · 静态 ${staticScore}% · 微动 ${motionScore}%` : "--"}</em>
+          </div>
+        </div>
+        <div className="radar-semantic-grid">
+          <div className={within1m ? "active" : status?.nearClutter || staticClutter ? "blocked" : ""}>
+            <strong>1 米内人体</strong>
+            <span>{within1mText}</span>
+          </div>
+          <div className={approaching ? "active" : status?.nearClutter || staticClutter ? "blocked" : ""}>
+            <strong>靠近趋势</strong>
+            <span>{approachingText}</span>
+          </div>
+        </div>
+        <div className="radar-distance-track" aria-label="雷达稳定距离区间">
+          {[
+            { key: "near", label: "近", range: "门 0-3 / 约 0-2.8 m" },
+            { key: "mid", label: "中", range: "门 4-8 / 约 2.8-6.3 m" },
+            { key: "far", label: "远", range: "门 9-12 / 约 6.3-9.1 m" },
+          ].map((item) => (
+            <span className={status?.stableZone === item.key && stableTarget ? "active" : ""} key={item.key}>
+              <strong>{item.label}</strong>
+              <em>{item.range}</em>
+            </span>
+          ))}
+        </div>
+        {recentSamples.length > 0 && (
+          <div className="radar-distance-mini" aria-label="最近距离变化">
+            {(() => {
+              const maxDistance = Math.max(1, ...recentSamples.map((sample) => distanceOf(sample)));
+              return recentSamples.map((sample, index) => {
+                const distance = distanceOf(sample);
+                const height = distance > 0 ? Math.max(10, Math.round((distance / maxDistance) * 100)) : 10;
+                return (
+                  <span
+                    key={`${sample.frameCount}-${index}`}
+                    style={{ height: `${height}%` }}
+                    title={`raw=${sample.distanceRaw} smooth=${sample.smoothedDistanceRaw ?? 0} gate=${sample.stableGate ?? sample.estimatedGate ?? "--"}`}
+                  />
+                );
+              });
+            })()}
+          </div>
+        )}
+        <p className="form-hint">已参考厂家上位机：每门按触发/保持双阈值判断，目标短暂丢失时保留约 3 秒保持态。手册说明一个距离门约 70cm；1 米内仍按“疑似”展示。</p>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>回波区域</h3>
+          <span className="form-hint">近 / 中 / 远</span>
+        </div>
+        <div className="radar-zone-grid" aria-label="雷达回波区域">
+          {[
+            { label: "近区", gates: "0-3", value: nearEnergy, share: nearShare, state: (stableGate <= 3 && stableTarget ? "warn" : "ok") as "ok" | "warn" },
+            { label: "中区", gates: "4-8", value: midEnergy, share: midShare, state: (stableGate >= 4 && stableGate <= 8 && stableTarget ? "warn" : "ok") as "ok" | "warn" },
+            { label: "远区", gates: "9-15", value: farEnergy, share: farShare, state: (stableGate >= 9 && stableTarget ? "warn" : "ok") as "ok" | "warn" },
+          ].map((band) => (
+            <div className="radar-zone" key={band.label}>
+              <div className="radar-zone-head">
+                <strong>{band.label}</strong>
+                <span>{band.gates}</span>
+              </div>
+              <div className="radar-zone-bar">
+                <i style={{ width: `${Math.max(6, Math.round((band.value / totalEnergy) * 100))}%` }} />
+              </div>
+              <div className="radar-zone-foot">
+                <b>{band.value}</b>
+                <em>{band.share}%</em>
+                <StatusDot state={band.state} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>原始门值</h3>
+          <span className="form-hint">0-15</span>
+        </div>
+        <div className="radar-raw-grid" aria-label="雷达原始距离门">
+          {gateEnergy.map((value, index) => {
+            const active = index === estimatedGate || index === stableGate;
+            const height = Math.max(6, Math.round((value / maxEnergy) * 100));
+            return (
+              <span className={`radar-raw-cell ${active ? "active" : ""} ${index === peakIndex ? "peak" : ""}`} key={index}>
+                <i style={{ height: `${height}%` }} />
+                <b>{index}</b>
+                <em>{value}</em>
+              </span>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="project-ai-card">
+        <div className="ai-chat-head compact-head">
+          <h3>存在时间线</h3>
+          <span className="form-hint">最近 {timeline.length}/60 帧</span>
+        </div>
+        <div className="radar-timeline" aria-label="雷达存在时间线">
+          {Array.from({ length: 60 }).map((_, index) => {
+            const sample = timeline[index];
+            return (
+              <span
+                className={sample?.staticClutter || sample?.nearClutter ? "blocked" : sample?.stablePresence ? "active stable" : sample?.humanCandidate ? "active candidate" : sample?.presence ? "active" : ""}
+                key={index}
+                title={sample ? `class=${sample.targetClass ?? "--"} raw=${sample.distanceRaw} gate=${sample.stableGate ?? sample.estimatedGate ?? "--"} human=${sample.humanScore ?? 0} static=${sample.staticScore ?? 0}` : "--"}
+              />
+            );
+          })}
+        </div>
+        {latestTrend.length > 0 && (
+          <div className="radar-trend-row">
+            {latestTrend.map((sample, index) => (
+              <span key={`${sample.frameCount}-${index}`}>
+                <b>{sample.stableGate ?? sample.estimatedGate ?? "-"}</b>
+                <em>{sample.confidence ?? 0}%</em>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SensorsPanel({ sensors }: { sensors: SensorSnapshot | null }) {
   const light10 = sensors?.lightValue10bit ?? sensors?.lux;
   const lightRaw = sensors?.lightRaw12bit;
   const lightPercent = sensors?.lightPercent;
   const lightPolarityLabel = sensors?.lightPolarity === "raw_high_dark" ? "高=暗 / 低=亮" : "按设备上报";
+  const radarLabel = !sensors?.radar
+    ? "--"
+    : sensors.radar.targetClass === "reliable_approaching"
+      ? "可靠靠近人体"
+      : sensors.radar.stablePresence
+        ? "可靠人体"
+        : sensors.radar.humanCandidate
+          ? "人体候选"
+          : sensors.radar.staticClutter
+        ? "静态反射"
+        : sensors.radar.nearClutter
+          ? "近场杂波"
+          : sensors.radar.presence
+            ? "模块有目标"
+            : "无目标";
+  const radarState: "ok" | "warn" | "danger" | "offline" = !sensors?.radar
+    ? "offline"
+    : sensors.radar.staticClutter || sensors.radar.nearClutter
+      ? "danger"
+      : sensors.radar.stablePresence || sensors.radar.humanCandidate
+        ? "warn"
+        : "ok";
+  const imuAddress = sensors?.imuAddress !== undefined ? `0x${sensors.imuAddress.toString(16).toUpperCase()}` : "--";
+  const imuWhoAmI = sensors?.imuWhoAmI !== undefined ? `0x${sensors.imuWhoAmI.toString(16).toUpperCase()}` : "--";
+  const accelMagnitude =
+    sensors?.accelXG !== undefined && sensors?.accelYG !== undefined && sensors?.accelZG !== undefined
+      ? Math.sqrt((sensors.accelXG * sensors.accelXG) + (sensors.accelYG * sensors.accelYG) + (sensors.accelZG * sensors.accelZG)).toFixed(3)
+      : "--";
+  const gyroMagnitude =
+    sensors?.gyroXDps !== undefined && sensors?.gyroYDps !== undefined && sensors?.gyroZDps !== undefined
+      ? Math.sqrt((sensors.gyroXDps * sensors.gyroXDps) + (sensors.gyroYDps * sensors.gyroYDps) + (sensors.gyroZDps * sensors.gyroZDps)).toFixed(2)
+      : "--";
   return (
     <div className="section-flow">
       <div className="section-heading">
@@ -2322,9 +4208,25 @@ function SensorsPanel({ sensors }: { sensors: SensorSnapshot | null }) {
         <GaugeBlock label="PIR" value={sensors?.pir ? "触发" : "未触发"} state={sensors?.pir ? "warn" : "ok"} />
         <GaugeBlock label="亮度突变" value={sensors ? `${sensors.lightDelta}` : "--"} state="warn" />
         <GaugeBlock label="姿态变化" value={sensors ? `${sensors.angleDelta}°` : "--"} state="ok" />
-        <GaugeBlock label="震动峰值" value={sensors ? `${sensors.vibrationPeak} g` : "--"} state="ok" />
+        <GaugeBlock label="震动峰值" value={sensors ? `${sensors.vibrationPeak.toFixed(4)} g` : "--"} state="ok" />
         <GaugeBlock label="门状态" value={sensors?.doorState ?? "--"} state="ok" />
+        <GaugeBlock label="雷达" value={radarLabel} state={radarState} />
       </div>
+      <div className="sensor-grid">
+        <GaugeBlock label="IMU 就绪" value={sensors?.imuReady ? "是" : "否"} state={sensors?.imuReady ? "ok" : "offline"} />
+        <GaugeBlock label="IMU 地址" value={imuAddress} state="ok" />
+        <GaugeBlock label="WHO_AM_I" value={imuWhoAmI} state="ok" />
+        <GaugeBlock label="温度" value={sensors?.imuTemperatureC !== undefined ? `${sensors.imuTemperatureC.toFixed(2)} °C` : "--"} state="ok" />
+        <GaugeBlock label="Pitch" value={sensors?.pitchDeg !== undefined ? `${sensors.pitchDeg.toFixed(2)}°` : "--"} state="ok" />
+        <GaugeBlock label="Roll" value={sensors?.rollDeg !== undefined ? `${sensors.rollDeg.toFixed(2)}°` : "--"} state="ok" />
+        <GaugeBlock label="加速度模长" value={accelMagnitude} state="ok" />
+        <GaugeBlock label="陀螺仪模长" value={gyroMagnitude !== "--" ? `${gyroMagnitude} °/s` : "--"} state="ok" />
+        <GaugeBlock label="I2C 错误" value={sensors?.imuError !== undefined ? `${sensors.imuError}` : "--"} state={sensors?.imuError ? "danger" : "ok"} />
+      </div>
+      <KeyValue title="MPU6050 原始读数" rows={[
+        ["Accel X/Y/Z", sensors?.accelXG !== undefined ? `${sensors.accelXG.toFixed(4)} / ${sensors.accelYG?.toFixed(4)} / ${sensors.accelZG?.toFixed(4)} g` : "--"],
+        ["Gyro X/Y/Z", sensors?.gyroXDps !== undefined ? `${sensors.gyroXDps.toFixed(3)} / ${sensors.gyroYDps?.toFixed(3)} / ${sensors.gyroZDps?.toFixed(3)} °/s` : "--"],
+      ]} />
       <KeyValue title="外设状态" rows={[
         ["触摸", sensors?.touch ?? "--"],
         ["屏幕", sensors?.display ?? "--"],

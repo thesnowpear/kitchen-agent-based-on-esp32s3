@@ -98,3 +98,35 @@
 - 已确认一次真实 400 根因为：`messages[0].content: invalid unicode code point`，通常是固定长度缓冲或 `strlcpy` 按字节截断中文 UTF-8，导致半个汉字进入 AI 请求 JSON。
 - AI 客户端 `json_escape_alloc()` 已增加 UTF-8 校验与清洗，所有 system/context/history/user 文本在出网前都会把非法 UTF-8 字节替换为 `?`，避免 OpenAI-compatible 服务拒绝解析请求体。
 - 如果后续仍出现 400，优先查看 Web/串口返回的服务端错误摘要；常见方向是模型名不兼容、Base URL 不匹配、服务不支持 `max_tokens/temperature` 参数、或单次上下文仍然过长。
+
+----
+
+## 2026-05-23 Web Serial `get_status` 超时排查
+
+- 现象：Web 面板发起 `get_status` 时偶发显示“请求超时”，但设备端串口并未表现出明显异常。
+- 根因：`WebSerialTransport` 之前是先把 JSON 消息分发给前端消息处理器，再清理 `pending` 请求；一旦某个消息处理器抛异常，响应可能来不及完成匹配，看起来就像 `get_status` 超时。
+- 修复：调整为先完成 `response -> pending` 的确认，再分发消息；同时给消息处理器加 try/catch，避免单个前端异常拖垮整条串口请求链路。
+- 经验：`get_status` 这类基础命令应优先保证“先回包再渲染”，不要让 UI 事件处理路径反过来影响协议时序。
+- 二次复测发现另一类根因：`sdkconfig` 里残留 `CONFIG_FRIDGE_SCREEN_TEST=y` 时，`app_main()` 会进入独立屏幕测试分支，只启动 `display_test`，不会初始化 NVS/Wi-Fi/传感器/音频，也不会调用 `fridge_usb_protocol_start()`，因此 Web 面板所有 USB JSON 命令都会超时。
+- 修复后 `sdkconfig` 与 `sdkconfig.defaults` 都应为 `CONFIG_FRIDGE_SCREEN_TEST=n`；切换后必须执行 `idf.py reconfigure build`，确认 `build/config/sdkconfig.h` 不再定义 `CONFIG_FRIDGE_SCREEN_TEST`，再烧录。
+- 真机验证：2026-05-23 已刷入正常 USB 运维固件，`COM16` 直发 `{"type":"request","request_id":"...","command":"get_status"}` 可收到 `ok=true` 响应；启动日志应出现 `usb_protocol: USB JSON Lines protocol task started`。
+
+----
+
+## 2026-05-23 Web 陀螺仪面板不变化排查
+
+- COM16 直发 `get_sensors` 已验证 MPU6050 工作正常：`imuReady=true`、`imuError=0`、`WHO_AM_I=0x68`，并且 `accelXG/Y/Z`、`gyroXDps/Y/Z`、`pitchDeg`、`rollDeg` 都会返回真实数值。
+- 如果 Web 面板看起来“陀螺仪没变化”，先不要直接判断为接线或 I2C 故障；需要确认传感器页是否展示了原始 `Gyro X/Y/Z` 字段，以及页面是否在高频刷新。
+- 本次根因是 Web 传感器页之前主要展示 `angleDelta`、`vibrationPeak` 等聚合值，全局刷新间隔较慢，短时间晃动 MPU6050 时不容易看到原始陀螺仪变化。
+- 修复：传感器页激活时单独以约 `300 ms` 间隔轮询 `get_sensors`，并增加 `IMU 就绪`、`WHO_AM_I`、`Accel X/Y/Z`、`Gyro X/Y/Z`、`陀螺仪模长` 等字段；使用独立 in-flight 标记避免高频轮询堆积串口请求。
+- 验证：`npm run build` 通过；COM16 连续读取 `get_sensors` 通过，gyro 三轴均有读数。实测 Web 时应进入“传感器”页面后再轻晃/转动 MPU6050，观察 `Gyro X/Y/Z` 和 `陀螺仪模长` 快速变化。
+
+----
+
+## 2026-05-23 24G 雷达测试页调试认知
+
+- COM16 实测确认 HMMD 24G 雷达当前可同时返回文本与上报快照：正常模式会回 `Range xx`，上报模式会回二进制帧并在 USB 协议里汇总为 `radar_test_status`。
+- 实测上报帧尾不止一种写法，当前设备回包里既可能出现示例尾 `08070605`，也可能出现 `F8F7F6F5`，不能把尾帧写死成单一值。
+- 实测 `presence=true` 只是模块原始上报，不应在 Web 上直接翻译成“冰箱前一定有人”，更适合展示为“模块上报有目标”。
+- 距离门一共有 16 个原始门，但在调试页面里直接平铺 16 根柱子不够直观；更适合拆成近 / 中 / 远 三段区域，并单独保留原始门值用于排查。
+- 2026-05-23 已将 Web 雷达页改为“模块上报 + 目标状态 + 近/中/远区域 + 原始门值 + 时间线”的组合展示，并通过 `npm run build` 验证。

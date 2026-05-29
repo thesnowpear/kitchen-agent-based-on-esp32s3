@@ -1,12 +1,17 @@
 import {
   createMockAIConfig,
   createMockASRConfig,
+  createMockCameraStatus,
   createMockDiagnostics,
   createMockLogs,
+  createMockMQTTConfig,
   createMockNetwork,
   createMockPins,
+  createMockRadar,
   createMockSensors,
   createMockStatus,
+  createMockTTSConfig,
+  createMockWakeStatus,
   createMockWifiNetworks,
 } from "../data/mockData";
 import type {
@@ -17,25 +22,103 @@ import type {
   AIContextPreview,
   AIProfilesResponse,
   ASRConfig,
+  CameraAnalyzeResponse,
+  CameraCaptureResponse,
+  CameraProbeResponse,
+  CameraRgb565DiagResponse,
+  CameraStatus,
   DeviceChatHistory,
   DeviceCommand,
   DeviceResponse,
   MemorySummary,
+  MQTTConfig,
   NetworkConfig,
   ProjectAITaskRequest,
   ProjectAITaskResponse,
+  RadarSnapshot,
+  TTSConfig,
+  TTSStatus,
+  WakeStatus,
   VoiceChatResponse,
   VoiceChatStatus,
 } from "../types";
 import { BaseTransport } from "./DeviceTransport";
 
+function createMockWavBase64(durationMs: number) {
+  const sampleRate = 16000;
+  const pcmBytes = Math.max(32000, Math.round((sampleRate * 2 * durationMs) / 1000));
+  const wavBytes = pcmBytes + 44;
+  const buffer = new ArrayBuffer(wavBytes);
+  const view = new DataView(buffer);
+  const writeAscii = (offset: number, text: string) => {
+    for (let index = 0; index < text.length; index += 1) {
+      view.setUint8(offset + index, text.charCodeAt(index));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, wavBytes - 8, true);
+  writeAscii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, pcmBytes, true);
+
+  for (let offset = 44; offset < wavBytes; offset += 2) {
+    const sampleIndex = (offset - 44) / 2;
+    const tone = Math.sin((2 * Math.PI * 440 * sampleIndex) / sampleRate);
+    const noise = (Math.random() - 0.5) * 0.12;
+    view.setInt16(offset, Math.round((tone * 0.32 + noise) * 32767), true);
+  }
+
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let offset = 0; offset < bytes.length; offset += 8192) {
+    binary += String.fromCharCode(...bytes.slice(offset, offset + 8192));
+  }
+  return {
+    sampleRate,
+    channels: 1,
+    bitsPerSample: 16,
+    durationMs,
+    pcmBytes,
+    wavBytes,
+    wavBase64: window.btoa(binary),
+  };
+}
+
 export class MockTransport extends BaseTransport {
   private timer: number | undefined;
+  private wakeTimer: number | undefined;
+  private connectedAt = Date.now();
   private connected = false;
   private network = createMockNetwork();
+  private mqttConfig: MQTTConfig = createMockMQTTConfig();
   private aiConfig = createMockAIConfig();
   private aiProfiles: AIConfig[] = [this.aiConfig];
   private asrConfig: ASRConfig = createMockASRConfig();
+  private ttsConfig: TTSConfig = createMockTTSConfig();
+  private ttsStatus: TTSStatus = {
+    state: "idle",
+    sampleRate: 24000,
+    audioBytes: 0,
+    playedBytes: 0,
+    durationMs: 0,
+    latencyMs: 0,
+    httpStatus: 0,
+    model: "",
+    voice: "",
+    error: "",
+  };
+  private wakeStatus: WakeStatus = createMockWakeStatus();
+  private cameraStatus: CameraStatus = createMockCameraStatus(false);
+  private cameraPreviewDataUrl: string | null = null;
+  private radar: RadarSnapshot = createMockRadar(null);
   private voiceStatus: VoiceChatStatus = {
     state: "idle",
     durationMs: 0,
@@ -82,6 +165,7 @@ export class MockTransport extends BaseTransport {
 
   async connect() {
     this.connected = true;
+    this.connectedAt = Date.now();
     this.emitLog("info", "Mock 设备已连接，当前使用模拟数据。", "mock");
     this.timer = window.setInterval(() => {
       this.emitMessage({
@@ -101,6 +185,10 @@ export class MockTransport extends BaseTransport {
     if (this.timer) {
       window.clearInterval(this.timer);
     }
+    if (this.wakeTimer) {
+      window.clearInterval(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
     this.emitLog("info", "Mock 设备已断开。", "mock");
   }
 
@@ -119,6 +207,46 @@ export class MockTransport extends BaseTransport {
         break;
       case "get_network":
         responsePayload = this.network;
+        break;
+      case "get_mqtt_config":
+      case "get_mqtt_status":
+        responsePayload = this.mqttConfig;
+        break;
+      case "set_mqtt_config": {
+        const update = payload as Partial<MQTTConfig> & { password?: string; token?: string };
+        const secret = update.password?.trim() || update.token?.trim();
+        this.mqttConfig = {
+          ...this.mqttConfig,
+          ...update,
+          password: undefined,
+          token: undefined,
+          hasPassword: secret ? true : this.mqttConfig.hasPassword,
+          configured: Boolean((update.brokerUri ?? this.mqttConfig.brokerUri) && (update.homeId ?? this.mqttConfig.homeId) && (update.deviceId ?? this.mqttConfig.deviceId)),
+          statusText: "mock configured",
+        };
+        this.emitLog("info", "MQTT 云端绑定配置已写入 Mock 设备缓存，token 不会回显。", "mqtt");
+        responsePayload = this.mqttConfig;
+        break;
+      }
+      case "clear_mqtt_secret":
+        this.mqttConfig = {
+          ...this.mqttConfig,
+          hasPassword: false,
+          connected: false,
+          statusText: "secret cleared",
+        };
+        this.emitLog("warn", "Mock MQTT token 已清除。", "mqtt");
+        responsePayload = this.mqttConfig;
+        break;
+      case "mqtt_publish_state":
+        this.mqttConfig = {
+          ...this.mqttConfig,
+          connected: true,
+          publishedCount: this.mqttConfig.publishedCount + 1,
+          statusText: "mock state published",
+        };
+        this.emitLog("info", "Mock 设备状态已发布到 MQTT。", "mqtt");
+        responsePayload = this.mqttConfig;
         break;
       case "scan_wifi":
         responsePayload = createMockWifiNetworks();
@@ -210,6 +338,38 @@ export class MockTransport extends BaseTransport {
         };
         responsePayload = this.asrConfig;
         break;
+      case "get_tts_config":
+        responsePayload = this.ttsConfig;
+        break;
+      case "set_tts_config": {
+        const update = payload as Partial<TTSConfig> & { apiKey?: string };
+        const apiKey = update.apiKey?.trim();
+        this.ttsConfig = {
+          ...this.ttsConfig,
+          ...update,
+          apiKey: undefined,
+          apiBaseUrl: update.apiBaseUrl?.trim() || this.ttsConfig.apiBaseUrl,
+          model: update.model?.trim() || this.ttsConfig.model,
+          voice: update.voice?.trim() || this.ttsConfig.voice,
+          hasApiKey: apiKey ? true : this.ttsConfig.hasApiKey,
+          apiKeyPreview: apiKey ? `${apiKey.slice(0, 3)}...${apiKey.slice(-4)}` : this.ttsConfig.apiKeyPreview,
+          ready: Boolean((update.apiBaseUrl ?? this.ttsConfig.apiBaseUrl) && (update.model ?? this.ttsConfig.model) && (update.voice ?? this.ttsConfig.voice) && (apiKey || this.ttsConfig.hasApiKey)),
+          lastError: "",
+        };
+        this.emitLog("info", "Mock TTS 配置已保存，Key 不会回显。", "tts");
+        responsePayload = this.ttsConfig;
+        break;
+      }
+      case "clear_tts_key":
+        this.ttsConfig = {
+          ...this.ttsConfig,
+          hasApiKey: false,
+          apiKeyPreview: "",
+          ready: false,
+          lastError: "TTS Key 已清除",
+        };
+        responsePayload = this.ttsConfig;
+        break;
       case "create_ai_profile": {
         const nextId = Math.max(...this.aiProfiles.map((item) => item.profileId ?? 0)) + 1;
         this.aiConfig = {
@@ -285,8 +445,57 @@ export class MockTransport extends BaseTransport {
         this.emitLog("info", `Mock AI 助手已注入上下文并完成：${request.taskType}`, "ai");
         break;
       }
+      case "wake_start":
+        this.wakeStatus = createMockWakeStatus({
+          ...this.wakeStatus,
+          enabled: true,
+          state: "listening",
+          error: "",
+          rms: 120 + Math.round(Math.random() * 80),
+          peakAbs: 900 + Math.round(Math.random() * 600),
+        });
+        this.startMockWakeEvents();
+        this.emitLog("info", "Mock WakeNet 监听已启动。", "wake");
+        responsePayload = this.wakeStatus;
+        break;
+      case "wake_stop":
+        this.stopMockWakeEvents();
+        this.wakeStatus = createMockWakeStatus({
+          ...this.wakeStatus,
+          enabled: false,
+          state: "idle",
+          error: "",
+        });
+        this.emitLog("info", "Mock WakeNet 监听已停止。", "wake");
+        responsePayload = this.wakeStatus;
+        break;
+      case "wake_status":
+        if (this.wakeStatus.enabled) {
+          this.wakeStatus = createMockWakeStatus({
+            ...this.wakeStatus,
+            state: "listening",
+            vadState: Math.random() > 0.72 ? 1 : 0,
+            rms: 110 + Math.round(Math.random() * 260),
+            peakAbs: 600 + Math.round(Math.random() * 1800),
+          });
+        }
+        responsePayload = this.wakeStatus;
+        break;
+      case "wake_reset_stats":
+        this.wakeStatus = createMockWakeStatus({
+          ...this.wakeStatus,
+          triggerCount: 0,
+          lastTriggerMs: 0,
+          timeoutCount: 0,
+          error: "",
+        });
+        responsePayload = this.wakeStatus;
+        break;
       case "mic_record_start":
       case "voice_chat_start":
+        if (this.wakeStatus.enabled) {
+          throw new Error("audio busy");
+        }
         this.voiceStatus = this.withVoiceDiagnostics({
           state: "recording",
           durationMs: 0,
@@ -317,6 +526,31 @@ export class MockTransport extends BaseTransport {
         });
         this.emitLog("info", "Mock microphone recording stopped without ASR.", "asr");
         responsePayload = this.voiceStatus;
+        break;
+      case "mic_record_wav":
+        if (this.voiceStatus.state !== "ready" || this.voiceStatus.pcmBytes <= 0) {
+          throw new Error("no recorded PCM ready");
+        }
+        responsePayload = createMockWavBase64(Math.max(this.voiceStatus.durationMs, 1000));
+        break;
+      case "radar_test_start":
+        this.radar = createMockRadar(this.radar);
+        this.radar.mode = "report";
+        this.emitLog("info", "Mock radar report mode started.", "radar");
+        responsePayload = this.radar;
+        break;
+      case "radar_test_status":
+        this.radar = createMockRadar(this.radar);
+        responsePayload = this.radar;
+        break;
+      case "radar_test_stop":
+        this.radar = {
+          ...createMockRadar(this.radar),
+          mode: "normal",
+          lastText: "normal mode",
+        };
+        this.emitLog("info", "Mock radar returned to normal mode.", "radar");
+        responsePayload = this.radar;
         break;
       case "voice_chat_stop": {
         if (!this.asrConfig.hasApiKey) {
@@ -355,6 +589,172 @@ export class MockTransport extends BaseTransport {
         } satisfies VoiceChatResponse;
         break;
       }
+      case "tts_play": {
+        const text = (payload as { text?: string })?.text ?? "";
+        if (!this.ttsConfig.hasApiKey) {
+          throw new Error("Mock TTS 缺少 API Key，请先保存 TTS Key。");
+        }
+        this.stopMockWakeEvents();
+        this.wakeStatus = createMockWakeStatus({
+          ...this.wakeStatus,
+          enabled: false,
+          state: "idle",
+        });
+        const audioBytes = Math.max(24000, Math.min(240000, text.length * 1800));
+        this.ttsStatus = {
+          state: "playing",
+          sampleRate: 24000,
+          audioBytes,
+          playedBytes: Math.round(audioBytes * 0.18),
+          durationMs: Math.round(audioBytes / 48),
+          latencyMs: 520,
+          httpStatus: 200,
+          model: this.ttsConfig.model,
+          voice: this.ttsConfig.voice,
+          error: "",
+        };
+        this.emitLog("info", `Mock TTS 已合成并开始播放：${text.slice(0, 24)}`, "tts");
+        responsePayload = this.ttsStatus;
+        break;
+      }
+      case "tts_status":
+        if (this.ttsStatus.state === "playing") {
+          const playedBytes = Math.min(this.ttsStatus.audioBytes, this.ttsStatus.playedBytes + 24000);
+          this.ttsStatus = {
+            ...this.ttsStatus,
+            playedBytes,
+            state: playedBytes >= this.ttsStatus.audioBytes ? "done" : "playing",
+          };
+        }
+        responsePayload = this.ttsStatus;
+        break;
+      case "tts_stop":
+        this.ttsStatus = {
+          ...this.ttsStatus,
+          state: "idle",
+        };
+        this.emitLog("info", "Mock TTS 播放已停止。", "tts");
+        responsePayload = this.ttsStatus;
+        break;
+      case "get_camera_status":
+        responsePayload = this.cameraStatus;
+        break;
+      case "camera_probe":
+        responsePayload = {
+          ok: true,
+          xclkEnabled: false,
+          sccbReady: true,
+          address: 0x3c,
+          pidHigh: 0x36,
+          pidLow: 0x60,
+          pid: 0x3660,
+          expectedPid: 0x3660,
+          durationMs: 42,
+          espErr: 0,
+          espErrName: "ESP_OK",
+          lastError: "",
+        } satisfies CameraProbeResponse;
+        this.emitLog("info", "Mock OV3660 probe ok: PID=0x3660.", "camera");
+        break;
+      case "camera_capture":
+        this.cameraStatus = {
+          ...createMockCameraStatus(true),
+          frameId: this.cameraStatus.frameId + 1,
+          jpegBytes: 18000 + Math.round(Math.random() * 9000),
+          captureMs: 240 + Math.round(Math.random() * 180),
+          freePsramKb: 6100 - Math.round(Math.random() * 120),
+        };
+        this.cameraPreviewDataUrl = this.createMockCameraPreview();
+        responsePayload = {
+          status: this.cameraStatus,
+          previewDataUrl: this.cameraPreviewDataUrl,
+          previewOmitted: false,
+          previewMaxBytes: 65536,
+        } satisfies CameraCaptureResponse;
+        this.emitLog("info", `Mock OV3660 captured frame ${this.cameraStatus.frameId}.`, "camera");
+        break;
+      case "camera_jpeg_diag":
+        this.cameraStatus = {
+          ...createMockCameraStatus(true),
+          frameId: this.cameraStatus.frameId + 1,
+          jpegBytes: 12000 + Math.round(Math.random() * 8000),
+          captureMs: 120 + Math.round(Math.random() * 100),
+          pixelFormat: "JPEG",
+          frameSize: "QVGA",
+          freePsramKb: 6150 - Math.round(Math.random() * 80),
+        };
+        this.cameraPreviewDataUrl = this.createMockCameraPreview();
+        responsePayload = {
+          status: this.cameraStatus,
+          previewDataUrl: this.cameraPreviewDataUrl,
+          previewOmitted: false,
+          previewMaxBytes: 65536,
+        } satisfies CameraCaptureResponse;
+        this.emitLog("info", `Mock OV3660 hardware JPEG diag frame ${this.cameraStatus.frameId}.`, "camera");
+        break;
+      case "camera_rgb565_diag":
+        responsePayload = {
+          ok: true,
+          width: 160,
+          height: 120,
+          bytes: 38400,
+          captureMs: 180,
+          checksum: 0x36a5c021,
+          firstBytes: "102030405060708090a0b0c0d0e0f000",
+          espErr: 0,
+          espErrName: "ESP_OK",
+          lastError: "",
+        } satisfies CameraRgb565DiagResponse;
+        this.cameraStatus = {
+          ...this.cameraStatus,
+          initialized: true,
+          pixelFormat: "RGB565",
+          frameSize: "QQVGA",
+        };
+        this.emitLog("info", "Mock RGB565 诊断成帧。", "camera");
+        break;
+      case "camera_analyze":
+        if (!this.cameraStatus.hasFrame) {
+          throw new Error("没有最近照片，请先拍照。");
+        }
+        if (!this.aiConfig.hasApiKey) {
+          throw new Error("Mock AI 缺少 API Key，请先保存一个测试 Key。");
+        }
+        responsePayload = {
+          taskType: "recognize_ingredients",
+          reply: JSON.stringify({
+            schema_version: 1,
+            type: "recognize_ingredients",
+            candidates: [
+              { name: "番茄", quantity: "约2个", confidence: 0.82, doubt: "Mock 预览图，仅验证流程" },
+              { name: "鸡蛋", quantity: "可能有1枚", confidence: 0.54, doubt: "边缘区域不清晰，需要用户确认" },
+            ],
+            needs_confirmation: true,
+            confirm_fields: ["名称", "数量", "保质期", "存放位置"],
+            safety_note: "识别结果不会直接入库，请人工确认。",
+          }, null, 2),
+          model: this.aiConfig.model,
+          status: "mock_ok",
+          httpStatus: 200,
+          latencyMs: 980,
+          width: this.cameraStatus.width,
+          height: this.cameraStatus.height,
+          jpegBytes: this.cameraStatus.jpegBytes,
+          needsConfirmation: true,
+        } satisfies CameraAnalyzeResponse;
+        this.emitLog("info", "Mock 摄像头图片识别已返回候选结果。", "camera");
+        break;
+      case "clear_camera_frame":
+        this.cameraStatus = createMockCameraStatus(false);
+        this.cameraPreviewDataUrl = null;
+        responsePayload = this.cameraStatus;
+        break;
+      case "camera_reset":
+        this.cameraStatus = createMockCameraStatus(false);
+        this.cameraPreviewDataUrl = null;
+        responsePayload = this.cameraStatus;
+        this.emitLog("info", "Mock 摄像头驱动已重置。", "camera");
+        break;
       case "get_ai_context_preview": {
         const request = this.normalizeProjectAiRequest(payload);
         responsePayload = this.createContextPreview(request);
@@ -443,6 +843,53 @@ export class MockTransport extends BaseTransport {
       activeProfileId: this.aiConfig.profileId ?? 0,
       profiles: this.aiProfiles,
     };
+  }
+
+  private startMockWakeEvents() {
+    if (this.wakeTimer) {
+      return;
+    }
+    this.wakeTimer = window.setInterval(() => {
+      if (!this.connected || !this.wakeStatus.enabled) {
+        return;
+      }
+      const elapsedMs = Date.now() - this.connectedAt;
+      this.wakeStatus = createMockWakeStatus({
+        ...this.wakeStatus,
+        enabled: true,
+        state: "listening",
+        triggerCount: this.wakeStatus.triggerCount + 1,
+        lastTriggerMs: elapsedMs,
+        vadState: 1,
+        rms: 420 + Math.round(Math.random() * 220),
+        peakAbs: 2600 + Math.round(Math.random() * 1800),
+      });
+      this.emitMessage({
+        type: "event",
+        event: "wake_word_detected",
+        payload: this.wakeStatus,
+      });
+    }, 5200);
+  }
+
+  private stopMockWakeEvents() {
+    if (this.wakeTimer) {
+      window.clearInterval(this.wakeTimer);
+      this.wakeTimer = undefined;
+    }
+  }
+
+  private createMockCameraPreview() {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240">
+      <rect width="320" height="240" fill="#f5faf9"/>
+      <rect x="18" y="24" width="284" height="192" rx="8" fill="#dfeceb" stroke="#9db8ba"/>
+      <circle cx="110" cy="126" r="42" fill="#d9473f"/>
+      <circle cx="118" cy="116" r="10" fill="#ef7267"/>
+      <ellipse cx="206" cy="126" rx="46" ry="34" fill="#f1d073"/>
+      <circle cx="206" cy="126" r="18" fill="#fff4c7"/>
+      <text x="22" y="34" font-size="13" fill="#173236">Mock OV3660 QVGA JPEG</text>
+    </svg>`;
+    return `data:image/svg+xml;base64,${window.btoa(unescape(encodeURIComponent(svg)))}`;
   }
 
   private normalizeProjectAiRequest(payload: unknown): ProjectAITaskRequest {

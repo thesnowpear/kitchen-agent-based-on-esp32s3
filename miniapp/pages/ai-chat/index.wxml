@@ -1,0 +1,26 @@
+<view class="page chat-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">设备转发优先 · 云端降级</view>
+      <view class="title">AI 助手</view>
+    </view>
+    <view class="pill" bindtap="onClear">清空对话</view>
+  </view>
+
+  <scroll-view class="chat-list" scroll-y="true" scroll-into-view="{{scrollIntoView}}" scroll-with-animation="true" enhanced="true" show-scrollbar="false">
+    <view wx:for="{{messages}}" wx:key="id" id="{{item.id}}" class="msg-row {{item.role === 'user' ? 'me' : 'ai'}}">
+      <view class="msg-bubble {{item.role === 'user' ? 'me' : ''}} {{item.source === 'cloud_fallback' ? 'cloud' : ''}} {{item.source === 'device' ? 'device' : ''}}">
+        <view class="msg-content">{{item.content}}</view>
+        <view wx:if="{{item.role === 'assistant' && item.source}}" class="msg-source">
+          <text wx:if="{{item.source === 'device'}}">来自冰箱贴本地 AI · {{item.deviceSn || ''}}</text>
+          <text wx:else>云端降级 · {{item.fallbackReason || ''}}{{item.modelUsed ? ' · ' + item.modelUsed : ''}}</text>
+        </view>
+      </view>
+    </view>
+  </scroll-view>
+
+  <view class="composer">
+    <input class="input" value="{{input}}" placeholder="{{placeholder}}" disabled="{{sending}}" bindinput="onInput" confirm-type="send" bindconfirm="onSend" />
+    <button class="btn" loading="{{sending}}" bindtap="onSend">发送</button>
+  </view>
+</view>

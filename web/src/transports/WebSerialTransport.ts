@@ -126,6 +126,11 @@ export class WebSerialTransport extends BaseTransport {
       command === "test_ai_chat" ||
       command === "ai_assistant_chat" ||
       command === "voice_chat_stop" ||
+      command === "mic_record_wav" ||
+      command === "camera_capture" ||
+      command === "camera_jpeg_diag" ||
+      command === "camera_rgb565_diag" ||
+      command === "camera_analyze" ||
       command === "get_ai_context_preview" ||
       command === "test_ai_task"
     ) {
@@ -226,19 +231,19 @@ export class WebSerialTransport extends BaseTransport {
   private handleLine(line: string) {
     try {
       const message = JSON.parse(line);
-      this.emitMessage(message);
       if (message.type === "response" && message.request_id) {
         const pending = this.pending.get(message.request_id);
         if (pending) {
           window.clearTimeout(pending.timeout);
           this.pending.delete(message.request_id);
-          if (message.ok === false) {
+          if (message.ok === false && message.command !== "camera_probe") {
             pending.reject(new Error(message.error ?? `${message.command ?? "request"} 请求失败`));
           } else {
             pending.resolve(message);
           }
         }
       }
+      this.emitMessage(message);
     } catch {
       this.emitLog("info", line, "serial-log");
     }

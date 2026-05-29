@@ -1,0 +1,155 @@
+<view class="page home-page rise">
+  <!-- 顶部状态条：与 ui-reference 的 app-status 对齐；点击展开设备状态面板 -->
+  <view class="app-status" bindtap="onTapStatus">
+    <view class="brand">
+      <view class="mascot">^_^</view>
+      <view class="brand-name">小精灵</view>
+    </view>
+    <view class="clock">{{clockText}}</view>
+    <view class="device-pill {{deviceStatusClass}}">
+      <view class="device-dot"></view>
+      <text>{{deviceShortText}}</text>
+    </view>
+  </view>
+
+  <!-- 问候 + 主标题 -->
+  <view class="home-head">
+    <view class="kicker">{{greetingKicker}}</view>
+    <view class="h2">{{greetingTitle}}</view>
+  </view>
+
+  <!-- 异常态：登录失败 / 网络失败 优先级高于"未绑设备"提示 -->
+  <view wx:if="{{loginErrorText}}" class="panel" style="border-color: var(--color-tomato-soft);">
+    <view class="kicker" style="color: var(--color-tomato);">登录失败</view>
+    <view class="subtitle">{{loginErrorText}}</view>
+    <view class="row" style="gap: var(--space-3); margin-top: var(--space-3);">
+      <button class="btn ghost" bindtap="onTapRetryLogin" style="flex: 1;">重试登录</button>
+      <button class="btn secondary" bindtap="onTapSettings" style="flex: 1;">改 API 地址</button>
+    </view>
+  </view>
+
+  <view wx:elif="{{errorText}}" class="panel" style="border-color: var(--color-tomato-soft);">
+    <view class="kicker" style="color: var(--color-tomato);">加载失败</view>
+    <view class="subtitle">{{errorText}}</view>
+    <view class="row" style="gap: var(--space-3); margin-top: var(--space-3);">
+      <button class="btn ghost" bindtap="refresh" style="flex: 1;">重试</button>
+      <button class="btn secondary" bindtap="onTapSettings" style="flex: 1;">改 API 地址</button>
+    </view>
+  </view>
+
+  <!-- 未绑定设备：内嵌"一键绑定 DEMO"，让用户不用跳到 bind 页就能起步 -->
+  <view wx:elif="{{!hasDevice}}" class="panel bind-prompt">
+    <view class="kicker">第一步</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">绑定演示冰箱贴</view>
+    <view class="subtitle">绑定码 DEMO 已经预置在后端 lifespan 里，点下面就能直接进入演示；也可以点击顶部状态进入手动绑定。</view>
+    <button class="btn" loading="{{binding}}" bindtap="onTapBindDemo" style="margin-top: var(--space-5);">一键绑定 DEMO</button>
+  </view>
+
+  <!-- 数字行：库存 / 临期 / 待办 -->
+  <view wx:if="{{hasDevice}}" class="stat-row">
+    <view class="stat" bindtap="onTapInventoryAll">
+      <view class="stat-num">{{inventoryCount}}</view>
+      <view class="stat-label">总库存</view>
+    </view>
+    <view class="stat" bindtap="onTapExpiring">
+      <view class="stat-num {{expiringCount > 0 ? 'danger' : ''}}">{{expiringCount}}</view>
+      <view class="stat-label">临期</view>
+    </view>
+    <view class="stat" bindtap="onTapReminders">
+      <view class="stat-num">{{reminderCount}}</view>
+      <view class="stat-label">待办</view>
+    </view>
+  </view>
+
+  <!-- 冰箱分布图：与 ui-reference 一致的非对称三列网格
+       row1: zone-freezer 跨 col1+col2；col3 由 zone-door 占满整列；
+       row2-3: col1 = zone-left，col2 = zone-right。 -->
+  <view class="fridge-head">
+    <view class="kicker fridge-kicker">分区导航</view>
+    <view class="pill edit-pill {{spaceEditing ? 'active' : ''}}" bindtap="toggleSpaceEditing">{{spaceEditing ? '完成编辑' : '编辑空间'}}</view>
+  </view>
+  <view class="fridge-map {{spaceEditing ? 'is-space-editing' : ''}} {{customZones.length > 0 ? 'has-custom-zones' : ''}}">
+    <view wx:for="{{standardZones}}" wx:key="key" class="zone zone-{{item.key}} {{item.spanClass}} {{spaceEditing && item.selected ? 'is-edit-target' : ''}}" data-zone="{{item.key}}" bindtap="onTapZone">
+      <text class="zone-label">{{item.label}}</text>
+      <text class="zone-strong">{{item.count}} 件</text>
+    </view>
+    <view
+      wx:for="{{customZones}}"
+      wx:key="key"
+      class="zone zone-custom {{item.spanClass}} {{spaceEditing && item.selected ? 'is-edit-target' : ''}}"
+      data-zone="{{item.key}}"
+      bindtap="onSelectCustomZone"
+    >
+      <text class="zone-label">{{item.label}}</text>
+      <text class="zone-strong">{{item.count}} 件</text>
+    </view>
+    <view class="zone zone-add" bindtap="onAddZone">
+      <text class="zone-label">添加区域</text>
+      <text class="zone-strong">+</text>
+    </view>
+  </view>
+
+  <view class="space-editor {{spaceEditing && selectedZoneKey ? 'is-open' : ''}}">
+      <label>
+        <text>区域名称</text>
+        <input value="{{selectedZoneLabel}}" data-field="label" bindinput="onSelectedZoneInput" bindblur="saveSelectedZoneText" />
+      </label>
+      <label>
+        <text>宽度</text>
+        <slider min="1" max="3" step="1" value="{{selectedZoneWidth}}" data-field="width" activeColor="#2f6047" bindchange="onSelectedZoneSize" />
+      </label>
+      <label>
+        <text>高度</text>
+        <slider min="1" max="3" step="1" value="{{selectedZoneHeight}}" data-field="height" activeColor="#2f6047" bindchange="onSelectedZoneSize" />
+      </label>
+      <label class="space-note">
+        <text>备注</text>
+        <input value="{{selectedZoneHint}}" data-field="hint" bindinput="onSelectedZoneInput" bindblur="saveSelectedZoneText" />
+      </label>
+      <button wx:if="{{selectedZoneIsCustom}}" class="space-delete" bindtap="onDeleteSelectedZone">删除当前区域</button>
+  </view>
+
+  <!-- 临期清单：跟 ui-reference 的 door 页同样的卡片样式，最多 5 条 -->
+  <block wx:if="{{expiringList.length > 0}}">
+    <view class="kicker" style="margin-top: var(--space-4);">临期清单</view>
+    <view class="expiring-list">
+      <view wx:for="{{expiringList}}" wx:key="id" class="panel expiring-card" data-id="{{item.id}}" bindtap="onTapExpiringItem">
+        <view class="row">
+          <view class="col">
+            <view class="title" style="font-size: var(--text-md); margin: 0;">{{item.name}}</view>
+            <view class="subtitle">{{item.quantityText}} · {{item.locationText}}</view>
+          </view>
+          <view class="tag {{item.level}}">{{item.expireText}}</view>
+        </view>
+      </view>
+    </view>
+  </block>
+
+  <!-- 设备状态面板（点 app-status 触发） -->
+  <view wx:if="{{statusPanelOpen}}" class="status-mask" bindtap="onTapStatusClose">
+    <view class="status-panel" catchtap="onStatusPanelTap">
+      <view class="status-handle"></view>
+      <view class="kicker">设备状态</view>
+      <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0 var(--space-4);">{{deviceName}}</view>
+      <view class="status-row">
+        <text class="muted">SN</text><text class="value">{{deviceSn || '—'}}</text>
+      </view>
+      <view class="status-row">
+        <text class="muted">状态</text><view class="tag {{statusTagClass}}">{{deviceStatus}}</view>
+      </view>
+      <view class="status-row">
+        <text class="muted">最近同步</text><text class="value">{{lastSyncText}}</text>
+      </view>
+      <view wx:if="{{deviceFirmware}}" class="status-row">
+        <text class="muted">固件</text><text class="value">{{deviceFirmware}}</text>
+      </view>
+      <view class="row" style="gap: var(--space-3); margin-top: var(--space-6);">
+        <button class="btn ghost" style="flex: 1;" loading="{{refreshing}}" bindtap="onTapRefreshDevice">刷新冰箱</button>
+        <button class="btn secondary" style="flex: 1;" bindtap="onTapBindManual">换设备</button>
+      </view>
+      <button class="btn ghost" style="margin-top: var(--space-3); width: 100%;" bindtap="onTapOffline">查看离线缓存</button>
+    </view>
+  </view>
+
+  <!-- AI 入口已迁移到底部 dock，不再放悬浮 fab，避免和分区图右下角重叠 -->
+</view>

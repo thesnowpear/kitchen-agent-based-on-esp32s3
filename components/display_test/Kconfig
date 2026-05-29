@@ -16,4 +16,30 @@ menu "Fridge Spirit screen test"
             屏幕 QSPI 测试时钟。首次松散插线测试建议保持 10 MHz，
             确认供电、排线和 WAIT# 稳定后再逐步提高。
 
+    config FRIDGE_SCREEN_TEST_COLOR_HOLD_MS
+        int "Screen test color hold time in ms"
+        depends on FRIDGE_SCREEN_TEST
+        default 3000
+        range 500 60000
+        help
+            每个全屏色块保持的时间。默认 3 秒用于长时间稳定性观察，
+            避免 1 秒循环导致串口日志和主机终端刷新过密。
+
+    config FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES
+        int "Screen test report interval in color cycles"
+        depends on FRIDGE_SCREEN_TEST
+        default 10
+        range 1 1000
+        help
+            每完成多少轮白/红/绿/蓝/黑循环后打印一次存活日志。
+            默认 10 轮约 150 秒打印一次，适合长时间运行。
+
+    config FRIDGE_SCREEN_TEST_VERBOSE_LOG
+        bool "Enable verbose screen test loop logs"
+        depends on FRIDGE_SCREEN_TEST
+        default n
+        help
+            启用后会在每个色块、每次 SPI 总线占用和首尾数据块写入时打印详细日志。
+            只建议排查点亮失败时开启；长时间测试应保持关闭，避免主机串口终端堆积输出。
+
 endmenu

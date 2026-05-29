@@ -1,0 +1,78 @@
+<view class="page recipe-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">AI 菜谱</view>
+      <view class="title">今晚吃什么</view>
+    </view>
+    <view class="pill" bindtap="onTapRefresh">{{loading ? '生成中' : '换一批'}}</view>
+  </view>
+
+  <view wx:if="{{errorText}}" class="panel" style="border-color: var(--color-tomato-soft);">
+    <view class="kicker" style="color: var(--color-tomato);">生成失败</view>
+    <view class="subtitle">{{errorText}}</view>
+  </view>
+
+  <view class="panel meal-summary">
+    <view class="kicker">{{summary.kicker}}</view>
+    <view class="meal-summary-title">{{summary.title}}</view>
+    <view class="meal-summary-hint">{{summary.hint}}</view>
+    <view class="meal-summary-meta">{{summary.duration}}</view>
+    <button class="btn" wx:if="{{cards.length === 0}}" style="margin-top: var(--space-5);" loading="{{loading}}" bindtap="onTapRefresh">按库存生成菜谱</button>
+  </view>
+
+  <view class="meal-cards">
+    <view
+      wx:for="{{cards}}"
+      wx:key="id"
+      class="meal-card"
+      data-id="{{item.id}}"
+      bindtap="onTapCard"
+      hover-class="meal-card-hover"
+      hover-stay-time="80"
+    >
+      <view class="meal-card-head">
+        <view class="meal-card-title">{{item.title}}</view>
+        <view class="meal-card-duration">{{item.durationText}}</view>
+      </view>
+      <view class="meal-card-desc">{{item.desc}}</view>
+      <view class="ingredient-line">{{item.ingredientText || '点击查看详情'}}</view>
+      <view class="meal-card-tags">
+        <view wx:for="{{item.tags}}" wx:for-item="t" wx:key="*this" class="tag mint">{{t}}</view>
+        <view wx:if="{{item.missingCount > 0}}" class="tag warn">缺 {{item.missingCount}} 项</view>
+      </view>
+      <button wx:if="{{item.missingCount > 0}}" class="btn ghost add-missing" data-id="{{item.id}}" catchtap="addMissingToShopping">缺料加入购物清单</button>
+    </view>
+  </view>
+
+  <view wx:if="{{selected}}" class="sheet-mask" catchtap="closeDetail">
+    <view class="recipe-sheet" catchtap="noop">
+      <view class="sheet-handle"></view>
+      <view class="kicker">菜谱详情</view>
+      <view class="sheet-title">{{selected.title}}</view>
+      <view class="subtitle">{{selected.desc}}</view>
+
+      <view class="detail-section">
+        <view class="kicker">食材</view>
+        <view class="ingredient-list">
+          <view wx:for="{{selected.ingredients}}" wx:key="name" class="ingredient {{item.missing ? 'missing' : ''}}">
+            <text>{{item.name}}</text>
+            <text>{{item.quantityText}}</text>
+          </view>
+        </view>
+      </view>
+
+      <view class="detail-section">
+        <view class="kicker">步骤</view>
+        <view wx:for="{{selected.steps}}" wx:key="*this" wx:for-index="idx" class="step-row">
+          <text class="step-index">{{idx + 1}}</text>
+          <text>{{item}}</text>
+        </view>
+      </view>
+
+      <view class="row sheet-actions">
+        <button class="btn ghost" style="flex: 1;" bindtap="closeDetail">关闭</button>
+        <button class="btn" style="flex: 2;" data-id="{{selected.id}}" bindtap="addMissingToShopping">缺料入清单</button>
+      </view>
+    </view>
+  </view>
+</view>

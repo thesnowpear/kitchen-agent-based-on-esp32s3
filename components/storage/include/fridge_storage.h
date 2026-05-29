@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define FRIDGE_STORAGE_MAX_JSON_LEN 4096
+#define FRIDGE_STORAGE_MAX_JSON_LEN 8192
 #define FRIDGE_STORAGE_MAX_MEMORY_LEN 1024
 #define FRIDGE_STORAGE_MAX_STATUS_LEN 384
 #define FRIDGE_STORAGE_MAX_CHAT_ROUNDS 15
@@ -55,6 +55,13 @@ esp_err_t fridge_storage_init(void);
 
 // 读取库存快照 JSON；包含少量演示食材、位置、保质期和版本号。
 esp_err_t fridge_storage_get_inventory_snapshot(char *out, size_t out_size);
+
+// 读取屏幕 UI 的本地库存快照 JSON；用于 LVGL 九宫格、编辑、拍照确认等本地交互。
+esp_err_t fridge_storage_get_ui_inventory_snapshot(char *out, size_t out_size);
+
+// 保存屏幕 UI 的本地库存快照 JSON。
+// 注意：该接口会写入 Flash，UI 应只在用户明确保存/确认时调用，避免高频磨损。
+esp_err_t fridge_storage_set_ui_inventory_snapshot(const char *inventory_json);
 
 // 读取提醒队列 JSON；用于 AI 上下文和开门时本地提醒。
 esp_err_t fridge_storage_get_reminder_queue(char *out, size_t out_size);

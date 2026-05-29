@@ -1,0 +1,17 @@
+<!-- 自定义 tabBar：5 按钮 dock，中间登记抬起。
+     结构对齐 ui-reference/WLW 的 <nav class="dock">：
+     [home] [AI] [camera-main] [settings] [more] -->
+<view class="dock">
+  <block wx:for="{{buttons}}" wx:key="pagePath">
+    <view
+      class="dock-btn {{item.isMain ? 'camera-main' : ''}} {{selected === index ? 'is-selected' : ''}}"
+      data-index="{{index}}"
+      bindtap="onSwitch"
+      hover-class="dock-btn-hover"
+      hover-stay-time="80"
+    >
+      <view class="dock-icon {{item.iconClass}}"></view>
+      <text class="dock-text">{{item.text}}</text>
+    </view>
+  </block>
+</view>

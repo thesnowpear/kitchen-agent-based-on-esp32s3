@@ -1,0 +1,36 @@
+Command: cmake -G Ninja -B D:\esp-IDF\Project\fridge_spirit\build_camera_test -DPYTHON_DEPS_CHECKED=1 -DPYTHON=D:\esp-IDF\.espressif\python_env\idf6.0_py3.14_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=True D:\esp-IDF\Project\fridge_spirit
+info: C:\Users\123\AppData\Local\Temp\kconfgen_tmptwxnuo6y:13 CONFIG_APP_ROLLBACK_ENABLE was replaced with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+Configuration Report                                                           
++-----------------------------------------------------------------------------+
+|  Parser Version: 1                                                          |
+|  Verbosity: default                                                         |
+|  Defaults policy: sdkconfig                                                 |
+|  Status: Finished with notifications                                        |
+|                                                                             |
+| Multiple Assignments                                                        |
+| +-----------------------------------------+                                 |
+| | Symbol BOOTLOADER_APP_ROLLBACK_ENABLE:  |                                 |
+| |     y (user-set value)                  |                                 |
+| |     y (user-set value)                  |                                 |
+| |     -> using y                          |                                 |
+| +-----------------------------------------+                                 |
+| Disabled Symbols/Choices With User-Set Value                                |
+| +-------------------------------------------------------------------------+ |
+| | * FRIDGE_SCREEN_TEST_PCLK_HZ (defined at                                | |
+| | D:/esp-IDF/Project/fridge_spirit/components/display_test/Kconfig:10)    | |
+| | with user-set value 10000000 from                                       | |
+| | C:\Users\123\AppData\Local\Temp\kconfgen_tmptwxnuo6y                    | |
+| | * FRIDGE_SCREEN_TEST_COLOR_HOLD_MS (defined at                          | |
+| | D:/esp-IDF/Project/fridge_spirit/components/display_test/Kconfig:19)    | |
+| | with user-set value 3000 from                                           | |
+| | C:\Users\123\AppData\Local\Temp\kconfgen_tmptwxnuo6y                    | |
+| | * FRIDGE_SCREEN_TEST_REPORT_EVERY_CYCLES (defined at                    | |
+| | D:/esp-IDF/Project/fridge_spirit/components/display_test/Kconfig:28)    | |
+| | with user-set value 10 from                                             | |
+| | C:\Users\123\AppData\Local\Temp\kconfgen_tmptwxnuo6y                    | |
+| | * FRIDGE_SCREEN_TEST_VERBOSE_LOG (defined at                            | |
+| | D:/esp-IDF/Project/fridge_spirit/components/display_test/Kconfig:37)    | |
+| | with user-set value n from                                              | |
+| | C:\Users\123\AppData\Local\Temp\kconfgen_tmptwxnuo6y                    | |
+| +-------------------------------------------------------------------------+ |
++-----------------------------------------------------------------------------+

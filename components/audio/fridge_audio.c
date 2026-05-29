@@ -19,6 +19,7 @@
 #define AUDIO_DMA_DESC_NUM 4
 #define AUDIO_DMA_FRAME_NUM 256
 #define AUDIO_READ_FRAMES 256
+#define AUDIO_WAKE_READ_FRAMES 256
 #define AUDIO_PCM_SHIFT 14
 #define AUDIO_CLIP_THRESHOLD 32000
 
@@ -27,6 +28,7 @@ static const char *TAG = "fridge_audio";
 static i2s_chan_handle_t s_rx_chan;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_record_task;
+static bool s_wake_stream_active;
 static int16_t *s_pcm;
 static size_t s_pcm_capacity;
 static size_t s_pcm_bytes;
@@ -173,7 +175,7 @@ static void record_task(void *arg)
 
     bool should_disable = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_state == FRIDGE_AUDIO_STATE_RECORDING) {
+    if (s_state == FRIDGE_AUDIO_STATE_RECORDING || s_state == FRIDGE_AUDIO_STATE_WAKE_LISTENING || s_wake_stream_active) {
         s_state = s_pcm_bytes > 0 ? FRIDGE_AUDIO_STATE_READY : FRIDGE_AUDIO_STATE_IDLE;
     }
     if (s_i2s_enabled) {
@@ -254,7 +256,8 @@ esp_err_t fridge_audio_start_recording(void)
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_state == FRIDGE_AUDIO_STATE_RECORDING) {
+    if (s_state == FRIDGE_AUDIO_STATE_RECORDING || s_state == FRIDGE_AUDIO_STATE_WAKE_LISTENING ||
+        s_wake_stream_active || s_i2s_enabled) {
         xSemaphoreGive(s_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -309,6 +312,121 @@ esp_err_t fridge_audio_stop_recording(void)
     if (s_record_task) {
         set_state(FRIDGE_AUDIO_STATE_ERROR, "audio record task stop timeout");
         return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t fridge_audio_wake_stream_start(void)
+{
+    esp_err_t err = fridge_audio_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_state == FRIDGE_AUDIO_STATE_RECORDING || s_wake_stream_active || s_i2s_enabled) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_wake_stream_active = true;
+    s_i2s_enabled = true;
+    s_state = FRIDGE_AUDIO_STATE_WAKE_LISTENING;
+    s_error[0] = '\0';
+    reset_stats_locked();
+    xSemaphoreGive(s_lock);
+
+    // 唤醒监听长期占用 I2S RX，只输出短帧 PCM 给 ESP-SR，不缓存完整语音，避免长期占用 PSRAM。
+    err = i2s_channel_enable(s_rx_chan);
+    if (err != ESP_OK) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_wake_stream_active = false;
+        s_i2s_enabled = false;
+        s_state = FRIDGE_AUDIO_STATE_ERROR;
+        strlcpy(s_error, "wake i2s enable failed", sizeof(s_error));
+        xSemaphoreGive(s_lock);
+        ESP_LOGE(TAG, "wake i2s enable failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t fridge_audio_wake_stream_read(int16_t *out_samples, size_t max_samples, size_t *sample_count, TickType_t timeout_ticks)
+{
+    if (!out_samples || !sample_count || max_samples == 0 || !s_initialized) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *sample_count = 0;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool active = s_wake_stream_active && s_state == FRIDGE_AUDIO_STATE_WAKE_LISTENING;
+    xSemaphoreGive(s_lock);
+    if (!active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int32_t raw[AUDIO_WAKE_READ_FRAMES];
+    size_t total_frames = 0;
+    while (total_frames < max_samples) {
+        size_t wanted = max_samples - total_frames;
+        if (wanted > AUDIO_WAKE_READ_FRAMES) {
+            wanted = AUDIO_WAKE_READ_FRAMES;
+        }
+        size_t bytes_read = 0;
+        esp_err_t err = i2s_channel_read(s_rx_chan, raw, wanted * sizeof(raw[0]), &bytes_read, timeout_ticks);
+        if (err != ESP_OK) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            if (err == ESP_ERR_TIMEOUT) {
+                s_i2s_timeout_count++;
+            } else {
+                strlcpy(s_error, esp_err_to_name(err), sizeof(s_error));
+            }
+            xSemaphoreGive(s_lock);
+            if (total_frames > 0) {
+                break;
+            }
+            return err;
+        }
+
+        size_t frames = bytes_read / sizeof(raw[0]);
+        if (frames == 0) {
+            break;
+        }
+        for (size_t i = 0; i < frames; i++) {
+            out_samples[total_frames + i] = raw_to_pcm16(raw[i]);
+        }
+        total_frames += frames;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    update_stats_locked(out_samples, total_frames);
+    s_duration_ms = (uint32_t)(s_sample_count * 1000 / FRIDGE_AUDIO_SAMPLE_RATE);
+    xSemaphoreGive(s_lock);
+    *sample_count = total_frames;
+    return ESP_OK;
+}
+
+esp_err_t fridge_audio_wake_stream_stop(void)
+{
+    if (!s_initialized || !s_lock) {
+        return ESP_OK;
+    }
+
+    bool should_disable = false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_wake_stream_active) {
+        s_wake_stream_active = false;
+        should_disable = s_i2s_enabled;
+        s_i2s_enabled = false;
+        s_state = FRIDGE_AUDIO_STATE_IDLE;
+    }
+    xSemaphoreGive(s_lock);
+
+    if (should_disable) {
+        esp_err_t err = i2s_channel_disable(s_rx_chan);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "wake i2s disable failed: %s", esp_err_to_name(err));
+            return err;
+        }
     }
     return ESP_OK;
 }

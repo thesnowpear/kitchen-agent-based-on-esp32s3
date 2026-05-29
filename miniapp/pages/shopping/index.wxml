@@ -1,0 +1,68 @@
+<view class="page shopping-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">购物清单</view>
+      <view class="title">未勾选项</view>
+    </view>
+    <view class="pill" bindtap="onExport">导出</view>
+  </view>
+
+  <view class="toolbar">
+    <button class="btn secondary" bindtap="openAdd">新增</button>
+    <button class="btn ghost" loading="{{seeding}}" bindtap="seedFromExpiring">临期生成</button>
+    <button class="btn ghost danger-text" bindtap="clearChecked">清除已购</button>
+  </view>
+
+  <scroll-view class="filter-tabs" scroll-x="true" enhanced="true" show-scrollbar="false">
+    <view
+      wx:for="{{filters}}"
+      wx:key="key"
+      class="filter-tab {{filter === item.key ? 'active' : ''}}"
+      data-key="{{item.key}}"
+      bindtap="onTapFilter"
+    >{{item.label}}</view>
+  </scroll-view>
+
+  <view wx:if="{{visibleItems.length === 0}}" class="empty">清单还是空的，可以手动新增，或从临期库存生成。</view>
+
+  <view class="shop-list">
+    <view
+      wx:for="{{visibleItems}}"
+      wx:key="id"
+      class="shop-row {{item.checked ? 'done' : ''}} {{item.source}}"
+      data-id="{{item.id}}"
+      bindtap="onToggle"
+      bindlongpress="onLongPressItem"
+    >
+      <view class="shop-check {{item.checked ? 'on' : ''}}"></view>
+      <view class="shop-main">
+        <view class="shop-name">{{item.name}}</view>
+        <view class="shop-sub">{{item.sourceText}}</view>
+      </view>
+      <view class="shop-qty">{{item.quantityText}}</view>
+    </view>
+  </view>
+
+  <view wx:if="{{addOpen}}" class="sheet-mask" catchtap="closeAdd">
+    <view class="edit-sheet" catchtap="noop">
+      <view class="sheet-handle"></view>
+      <view class="kicker">{{editingId ? '编辑购物项' : '新增购物项'}}</view>
+      <view class="field-block">
+        <view class="field-label">名称</view>
+        <input class="input" value="{{inputName}}" data-field="name" bindinput="onInput" placeholder="例如 鸡蛋" />
+      </view>
+      <view class="field-block">
+        <view class="field-label">数量</view>
+        <input class="input" value="{{inputQuantity}}" data-field="quantity" bindinput="onInput" placeholder="例如 1 盒" />
+      </view>
+      <view class="field-block">
+        <view class="field-label">来源备注</view>
+        <input class="input" value="{{inputSourceText}}" data-field="sourceText" bindinput="onInput" placeholder="例如 手动添加" />
+      </view>
+      <view class="row sheet-actions">
+        <button class="btn ghost" style="flex: 1;" bindtap="closeAdd">取消</button>
+        <button class="btn" style="flex: 2;" bindtap="saveManualItem">保存</button>
+      </view>
+    </view>
+  </view>
+</view>

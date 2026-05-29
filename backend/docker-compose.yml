@@ -1,0 +1,50 @@
+services:
+  api:
+    build:
+      context: .
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - emqx
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fridge_spirit
+      POSTGRES_USER: fridge
+      POSTGRES_PASSWORD: fridge_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  emqx:
+    image: emqx/emqx:5.8.3
+    environment:
+      EMQX_NAME: fridge_spirit_emqx
+      EMQX_HOST: 127.0.0.1
+    ports:
+      - "1883:1883"
+      - "8083:8083"
+      - "18083:18083"
+    volumes:
+      - ./deploy/emqx/emqx.conf:/opt/emqx/etc/emqx.conf:ro
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    ports:
+      - "6005:80"
+    volumes:
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

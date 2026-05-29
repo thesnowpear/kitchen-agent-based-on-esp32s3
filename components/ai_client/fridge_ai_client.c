@@ -10,6 +10,7 @@
 #include <string.h>
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -26,6 +27,7 @@
 #define AI_HTTP_RESPONSE_CAP 8192
 #define AI_TEST_MAX_TOKENS 128
 #define AI_ASSISTANT_MAX_TOKENS 512
+#define AI_IMAGE_MAX_TOKENS 700
 #define AI_COMPLETIONS_PATH "/chat/completions"
 
 static const char *TAG = "fridge_ai";
@@ -39,6 +41,15 @@ typedef struct {
     size_t cap;
     bool overflow;
 } ai_http_buffer_t;
+
+static void *ai_large_alloc(size_t size)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    return ptr;
+}
 
 static void set_last_error(const char *message)
 {
@@ -749,6 +760,99 @@ static char *build_assistant_request(const fridge_ai_config_update_t *config, co
     return body;
 }
 
+static char *base64_encode_alloc(const uint8_t *data, size_t len)
+{
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!data || len == 0) {
+        return NULL;
+    }
+    size_t out_len = ((len + 2) / 3) * 4;
+    char *out = ai_large_alloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t i = 0;
+    size_t j = 0;
+    while (i < len) {
+        uint32_t octet_a = i < len ? data[i++] : 0;
+        uint32_t octet_b = i < len ? data[i++] : 0;
+        uint32_t octet_c = i < len ? data[i++] : 0;
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        out[j++] = table[(triple >> 18) & 0x3F];
+        out[j++] = table[(triple >> 12) & 0x3F];
+        out[j++] = table[(triple >> 6) & 0x3F];
+        out[j++] = table[triple & 0x3F];
+    }
+
+    size_t mod = len % 3;
+    if (mod) {
+        out[out_len - 1] = '=';
+        if (mod == 1) {
+            out[out_len - 2] = '=';
+        }
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
+static char *build_image_request(const fridge_ai_config_update_t *config, const fridge_ai_image_request_t *request)
+{
+    char *model = json_escape_alloc(config->model);
+    char *task_type = json_escape_alloc(request->task_type[0] ? request->task_type : "recognize_ingredients");
+    char *image_b64 = base64_encode_alloc(request->jpeg, request->jpeg_len);
+    if (!model || !task_type || !image_b64) {
+        free(model);
+        free(task_type);
+        free(image_b64);
+        return NULL;
+    }
+
+    const char *system_prompt =
+        "你是冰箱小精灵的食材识别助手。图片识别结果只能作为候选，不能直接写入库存。"
+        "请用中文输出紧凑 JSON：schema_version、type、candidates、needs_confirmation、confirm_fields、safety_note。"
+        "candidates 每项包含 name、quantity、confidence、doubt；不确定时降低 confidence 并说明疑点。";
+    char *system = json_escape_alloc(system_prompt);
+    if (!system) {
+        free(model);
+        free(task_type);
+        free(image_b64);
+        return NULL;
+    }
+
+    size_t body_len = strlen(model) + strlen(task_type) + strlen(system) + strlen(image_b64) + 1024;
+    char *body = ai_large_alloc(body_len);
+    if (body) {
+        int written = snprintf(body,
+                               body_len,
+                               "{\"model\":\"%s\",\"messages\":["
+                               "{\"role\":\"system\",\"content\":\"%s\"},"
+                               "{\"role\":\"user\",\"content\":["
+                               "{\"type\":\"text\",\"text\":\"任务类型：%s。请识别这张冰箱/食材照片，输出待用户确认的结构化候选。图像尺寸 %dx%d，JPEG %u 字节。\"},"
+                               "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,%s\"}}"
+                               "]}],\"temperature\":0.1,\"max_tokens\":%d,\"stream\":false}",
+                               model,
+                               system,
+                               task_type,
+                               request->width,
+                               request->height,
+                               (unsigned)request->jpeg_len,
+                               image_b64,
+                               AI_IMAGE_MAX_TOKENS);
+        if (written < 0 || (size_t)written >= body_len) {
+            free(body);
+            body = NULL;
+        }
+    }
+
+    free(model);
+    free(task_type);
+    free(system);
+    free(image_b64);
+    return body;
+}
+
 static esp_err_t parse_chat_response(const char *response, fridge_ai_chat_result_t *out)
 {
     if (!response || response[0] == '\0') {
@@ -1334,6 +1438,156 @@ esp_err_t fridge_ai_client_assistant_chat(const fridge_ai_assistant_request_t *r
     }
     ESP_LOGI(TAG,
              "AI assistant HTTP done: status=%d, response=%u bytes, latency=%lu ms",
+             out->chat.http_status,
+             (unsigned)rx.len,
+             (unsigned long)out->chat.latency_ms);
+    if (rx.overflow) {
+        strlcpy(out->chat.error, "AI 响应过长，串口测试缓冲已截断", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        free(response_body);
+        return ESP_FAIL;
+    }
+    if (out->chat.http_status < 200 || out->chat.http_status >= 300) {
+        set_http_status_error(response_body, &out->chat);
+        free(response_body);
+        return ESP_FAIL;
+    }
+
+    err = parse_chat_response(response_body, &out->chat);
+    free(response_body);
+    return err;
+}
+
+esp_err_t fridge_ai_client_analyze_image(const fridge_ai_image_request_t *request, fridge_ai_image_result_t *out)
+{
+    ESP_RETURN_ON_FALSE(request && request->jpeg && request->jpeg_len > 0 && out,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid image analyze args");
+    memset(out, 0, sizeof(*out));
+    int64_t start_us = esp_timer_get_time();
+
+    strlcpy(out->task_type, request->task_type[0] ? request->task_type : "recognize_ingredients", sizeof(out->task_type));
+    out->width = request->width;
+    out->height = request->height;
+    out->jpeg_bytes = request->jpeg_len;
+    out->needs_confirmation = true;
+
+    fridge_network_status_t net = {0};
+    fridge_network_get_status(&net);
+    if (!net.connected) {
+        strlcpy(out->chat.error, "Wi-Fi 未连接，请先在 Web 面板完成配网", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!net.internet_ready) {
+        esp_err_t sync_err = fridge_network_sync_time();
+        fridge_network_get_status(&net);
+        if (sync_err != ESP_OK || !net.internet_ready) {
+            strlcpy(out->chat.error, "网络未校时或外网不可用，请确认 SNTP/互联网连接", sizeof(out->chat.error));
+            set_last_error(out->chat.error);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI config allocation failed");
+    esp_err_t load_err = load_full_config(config);
+    if (load_err != ESP_OK) {
+        free(config);
+        ESP_RETURN_ON_ERROR(load_err, TAG, "load AI config failed");
+    }
+    if (config->api_base_url[0] == '\0') {
+        free(config);
+        strlcpy(out->chat.error, "缺少 API Base URL", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (config->api_key[0] == '\0') {
+        free(config);
+        strlcpy(out->chat.error, "缺少 API Key，请先在 AI 设置中保存", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char url[FRIDGE_AI_MAX_BASE_URL_LEN + sizeof(AI_COMPLETIONS_PATH) + 8] = {0};
+    esp_err_t err = compose_chat_url(config->api_base_url, url, sizeof(url));
+    if (err != ESP_OK) {
+        free(config);
+        strlcpy(out->chat.error, "API Base URL 必须使用 https://，并建议以 /v1 结尾", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return err;
+    }
+
+    char *request_body = build_image_request(config, request);
+    if (!request_body) {
+        free(config);
+        strlcpy(out->chat.error, "构造图片 AI 请求 JSON 失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG,
+             "AI image request prepared: task=%s, jpeg=%u bytes, body=%u bytes",
+             out->task_type,
+             (unsigned)request->jpeg_len,
+             (unsigned)strlen(request_body));
+
+    char *response_body = calloc(1, AI_HTTP_RESPONSE_CAP);
+    if (!response_body) {
+        free(config);
+        free(request_body);
+        strlcpy(out->chat.error, "分配 AI 响应缓冲失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ai_http_buffer_t rx = {
+        .data = response_body,
+        .len = 0,
+        .cap = AI_HTTP_RESPONSE_CAP,
+        .overflow = false,
+    };
+    esp_http_client_config_t http_config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = (int)clamp_timeout_ms(config->timeout_ms),
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = ai_http_event_handler,
+        .user_data = &rx,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&http_config);
+    if (!client) {
+        free(config);
+        free(request_body);
+        free(response_body);
+        strlcpy(out->chat.error, "初始化 HTTP 客户端失败", sizeof(out->chat.error));
+        set_last_error(out->chat.error);
+        return ESP_FAIL;
+    }
+
+    char auth_header[FRIDGE_AI_MAX_API_KEY_LEN + 16] = {0};
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", config->api_key);
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_http_client_set_header(client, "Accept-Encoding", "identity");
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_post_field(client, request_body, (int)strlen(request_body));
+
+    err = esp_http_client_perform(client);
+    out->chat.http_status = esp_http_client_get_status_code(client);
+    out->chat.latency_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+    strlcpy(out->chat.model, config->model, sizeof(out->chat.model));
+    esp_http_client_cleanup(client);
+    free(config);
+    free(request_body);
+
+    if (err != ESP_OK) {
+        snprintf(out->chat.error, sizeof(out->chat.error), "HTTP 请求失败：%s", esp_err_to_name(err));
+        set_last_error(out->chat.error);
+        free(response_body);
+        return err;
+    }
+    ESP_LOGI(TAG,
+             "AI image HTTP done: status=%d, response=%u bytes, latency=%lu ms",
              out->chat.http_status,
              (unsigned)rx.len,
              (unsigned long)out->chat.latency_ms);

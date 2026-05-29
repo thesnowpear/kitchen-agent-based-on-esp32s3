@@ -10,16 +10,24 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "driver/i2c.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "fridge_ai_client.h"
 #include "fridge_ai_context.h"
 #include "fridge_asr.h"
 #include "fridge_audio.h"
+#include "fridge_camera.h"
 #include "fridge_diagnostics.h"
+#include "fridge_mqtt_protocol.h"
 #include "fridge_network.h"
+#include "fridge_radar.h"
 #include "fridge_sensors.h"
+#include "fridge_speaker.h"
 #include "fridge_storage.h"
+#include "fridge_touch.h"
+#include "fridge_wake_word.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -29,6 +37,7 @@
 #define USB_SCAN_MAX_AP 50
 #define USB_PROTOCOL_TASK_STACK 12288
 #define USB_AI_WORKER_TASK_STACK 32768
+#define USB_CAMERA_WORKER_TASK_STACK 32768
 
 static const char *TAG = "usb_protocol";
 static char s_usb_line_buffer[USB_LINE_BUFFER_SIZE];
@@ -58,6 +67,106 @@ typedef struct {
     esp_err_t err;
     SemaphoreHandle_t done;
 } usb_voice_chat_job_t;
+
+#if CONFIG_FRIDGE_CAMERA_TEST
+typedef struct {
+    fridge_ai_image_result_t *result;
+    esp_err_t err;
+    SemaphoreHandle_t done;
+} usb_camera_analyze_job_t;
+#endif
+
+static void *usb_large_alloc(size_t size)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    return ptr;
+}
+
+static char *base64_encode_alloc(const uint8_t *data, size_t len)
+{
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!data || len == 0) {
+        return NULL;
+    }
+
+    size_t out_len = ((len + 2) / 3) * 4;
+    char *out = usb_large_alloc(out_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t i = 0;
+    size_t j = 0;
+    while (i < len) {
+        uint32_t octet_a = i < len ? data[i++] : 0;
+        uint32_t octet_b = i < len ? data[i++] : 0;
+        uint32_t octet_c = i < len ? data[i++] : 0;
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        out[j++] = table[(triple >> 18) & 0x3F];
+        out[j++] = table[(triple >> 12) & 0x3F];
+        out[j++] = table[(triple >> 6) & 0x3F];
+        out[j++] = table[triple & 0x3F];
+    }
+
+    size_t mod = len % 3;
+    if (mod) {
+        out[out_len - 1] = '=';
+        if (mod == 1) {
+            out[out_len - 2] = '=';
+        }
+    }
+    out[out_len] = '\0';
+    return out;
+}
+
+// 生成 16 kHz / mono / signed 16-bit PCM 的 WAV 头。
+// Web 面板用它直接播放开发板麦克风采到的原始声音，便于判断噪声、增益和接线问题。
+static void write_wav_header(uint8_t *header, size_t pcm_bytes)
+{
+    const uint32_t sample_rate = FRIDGE_AUDIO_SAMPLE_RATE;
+    const uint16_t channels = 1;
+    const uint16_t bits_per_sample = 16;
+    const uint32_t byte_rate = sample_rate * channels * bits_per_sample / 8;
+    const uint16_t block_align = channels * bits_per_sample / 8;
+    const uint32_t riff_size = (uint32_t)(36 + pcm_bytes);
+    const uint32_t data_size = (uint32_t)pcm_bytes;
+
+    memcpy(header + 0, "RIFF", 4);
+    header[4] = (uint8_t)(riff_size & 0xFF);
+    header[5] = (uint8_t)((riff_size >> 8) & 0xFF);
+    header[6] = (uint8_t)((riff_size >> 16) & 0xFF);
+    header[7] = (uint8_t)((riff_size >> 24) & 0xFF);
+    memcpy(header + 8, "WAVEfmt ", 8);
+    header[16] = 16;
+    header[17] = 0;
+    header[18] = 0;
+    header[19] = 0;
+    header[20] = 1;
+    header[21] = 0;
+    header[22] = (uint8_t)(channels & 0xFF);
+    header[23] = (uint8_t)((channels >> 8) & 0xFF);
+    header[24] = (uint8_t)(sample_rate & 0xFF);
+    header[25] = (uint8_t)((sample_rate >> 8) & 0xFF);
+    header[26] = (uint8_t)((sample_rate >> 16) & 0xFF);
+    header[27] = (uint8_t)((sample_rate >> 24) & 0xFF);
+    header[28] = (uint8_t)(byte_rate & 0xFF);
+    header[29] = (uint8_t)((byte_rate >> 8) & 0xFF);
+    header[30] = (uint8_t)((byte_rate >> 16) & 0xFF);
+    header[31] = (uint8_t)((byte_rate >> 24) & 0xFF);
+    header[32] = (uint8_t)(block_align & 0xFF);
+    header[33] = (uint8_t)((block_align >> 8) & 0xFF);
+    header[34] = (uint8_t)(bits_per_sample & 0xFF);
+    header[35] = (uint8_t)((bits_per_sample >> 8) & 0xFF);
+    memcpy(header + 36, "data", 4);
+    header[40] = (uint8_t)(data_size & 0xFF);
+    header[41] = (uint8_t)((data_size >> 8) & 0xFF);
+    header[42] = (uint8_t)((data_size >> 16) & 0xFF);
+    header[43] = (uint8_t)((data_size >> 24) & 0xFF);
+}
 
 static void json_print_escaped(const char *text)
 {
@@ -378,6 +487,20 @@ static void response_end(void)
     funlockfile(stdout);
 }
 
+static void event_begin(const char *event)
+{
+    flockfile(stdout);
+    fputs("{\"type\":\"event\",\"event\":", stdout);
+    json_print_escaped(event);
+}
+
+static void event_end(void)
+{
+    fputs("}\n", stdout);
+    fflush(stdout);
+    funlockfile(stdout);
+}
+
 static void send_error(const char *request_id, const char *command, const char *error)
 {
     response_begin(request_id, command, false);
@@ -391,10 +514,14 @@ static void print_network_payload(void)
 {
     fridge_network_status_t status = {0};
     fridge_network_get_status(&status);
+    fridge_mqtt_status_t mqtt_status = {0};
+    fridge_mqtt_get_status(&mqtt_status);
 
     fputs("{\"ssid\":", stdout);
     json_print_escaped(status.ssid);
-    fputs(",\"wifiPassword\":\"\",\"mqttHost\":\"\",\"apiBaseUrl\":\"\",\"ntpServer\":", stdout);
+    fputs(",\"wifiPassword\":\"\",\"mqttHost\":", stdout);
+    json_print_escaped(mqtt_status.broker_uri);
+    fputs(",\"apiBaseUrl\":\"\",\"ntpServer\":", stdout);
     json_print_escaped(status.ntp_server);
     fputs(",\"saveAiKey\":false,\"connected\":", stdout);
     fputs(status.connected ? "true" : "false", stdout);
@@ -478,6 +605,105 @@ static void handle_set_network(const char *line, const char *request_id, const c
     response_end();
 }
 
+static void print_mqtt_config_payload(const fridge_mqtt_status_t *status)
+{
+    fputs("{\"brokerUri\":", stdout);
+    json_print_escaped(status->broker_uri);
+    fputs(",\"homeId\":", stdout);
+    json_print_escaped(status->home_id);
+    fputs(",\"deviceId\":", stdout);
+    json_print_escaped(status->device_id);
+    fputs(",\"username\":", stdout);
+    json_print_escaped(status->username);
+    fputs(",\"hasPassword\":", stdout);
+    fputs(status->has_password ? "true" : "false", stdout);
+    fputs(",\"enabled\":", stdout);
+    fputs(status->enabled ? "true" : "false", stdout);
+    fputs(",\"configured\":", stdout);
+    fputs(status->configured ? "true" : "false", stdout);
+    fputs(",\"connected\":", stdout);
+    fputs(status->connected ? "true" : "false", stdout);
+    printf(",\"reconnectCount\":%lu,\"publishedCount\":%lu,\"receivedCount\":%lu,\"lastError\":%d",
+           (unsigned long)status->reconnect_count,
+           (unsigned long)status->published_count,
+           (unsigned long)status->received_count,
+           status->last_error);
+    fputs(",\"statusText\":", stdout);
+    json_print_escaped(status->status_text);
+    fputs("}", stdout);
+}
+
+static void handle_get_mqtt_config(const char *request_id, const char *command)
+{
+    fridge_mqtt_status_t status = {0};
+    esp_err_t err = fridge_mqtt_get_status(&status);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_mqtt_config_payload(&status);
+    response_end();
+}
+
+static void handle_set_mqtt_config(const char *line, const char *request_id, const char *command)
+{
+    fridge_mqtt_config_t config = {0};
+    fridge_mqtt_get_config(&config);
+    json_get_string(line, "brokerUri", config.broker_uri, sizeof(config.broker_uri));
+    json_get_string(line, "mqttHost", config.broker_uri, sizeof(config.broker_uri));
+    json_get_string(line, "homeId", config.home_id, sizeof(config.home_id));
+    json_get_string(line, "deviceId", config.device_id, sizeof(config.device_id));
+    json_get_string(line, "username", config.username, sizeof(config.username));
+    bool update_password = json_has_key(line, "password") || json_has_key(line, "token");
+    if (json_has_key(line, "password")) {
+        json_get_string(line, "password", config.password, sizeof(config.password));
+    } else if (json_has_key(line, "token")) {
+        json_get_string(line, "token", config.password, sizeof(config.password));
+    }
+    config.enabled = json_get_bool(line, "enabled", true);
+    config.keepalive_seconds = (uint16_t)json_get_u32(line, "keepaliveSeconds", FRIDGE_MQTT_DEFAULT_KEEPALIVE_SECONDS);
+
+    esp_err_t err = fridge_mqtt_set_config(&config, update_password);
+    if (err == ESP_OK && config.enabled) {
+        esp_err_t start_err = fridge_mqtt_start();
+        if (start_err != ESP_OK && start_err != ESP_ERR_INVALID_STATE) {
+            err = start_err;
+        }
+    }
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+
+    handle_get_mqtt_config(request_id, command);
+}
+
+static void handle_clear_mqtt_secret(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_mqtt_clear_secret();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_mqtt_config(request_id, command);
+}
+
+static void handle_mqtt_publish_state(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_mqtt_start();
+    if (err == ESP_OK) {
+        err = fridge_mqtt_publish_state(true);
+    }
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_mqtt_config(request_id, command);
+}
+
 static void print_ai_config_payload(const fridge_ai_config_view_t *config)
 {
     printf("{\"profileId\":%u,\"profileName\":", (unsigned)config->profile_id);
@@ -506,6 +732,26 @@ static void print_asr_config_payload(const fridge_asr_config_view_t *config)
     json_print_escaped(config->api_base_url);
     fputs(",\"model\":", stdout);
     json_print_escaped(config->model);
+    printf(",\"timeoutMs\":%lu", (unsigned long)config->timeout_ms);
+    fputs(",\"hasApiKey\":", stdout);
+    fputs(config->has_api_key ? "true" : "false", stdout);
+    fputs(",\"apiKeyPreview\":", stdout);
+    json_print_escaped(config->api_key_preview);
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(config->last_error);
+    fputs(",\"ready\":", stdout);
+    fputs(config->ready ? "true" : "false", stdout);
+    fputs("}", stdout);
+}
+
+static void print_tts_config_payload(const fridge_tts_config_view_t *config)
+{
+    fputs("{\"apiBaseUrl\":", stdout);
+    json_print_escaped(config->api_base_url);
+    fputs(",\"model\":", stdout);
+    json_print_escaped(config->model);
+    fputs(",\"voice\":", stdout);
+    json_print_escaped(config->voice);
     printf(",\"timeoutMs\":%lu", (unsigned long)config->timeout_ms);
     fputs(",\"hasApiKey\":", stdout);
     fputs(config->has_api_key ? "true" : "false", stdout);
@@ -885,6 +1131,61 @@ static void handle_clear_asr_key(const char *request_id, const char *command)
     handle_get_asr_config(request_id, command);
 }
 
+static void handle_get_tts_config(const char *request_id, const char *command)
+{
+    fridge_tts_config_view_t config = {0};
+    esp_err_t err = fridge_tts_get_config(&config);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_tts_config_payload(&config);
+    response_end();
+}
+
+static void handle_set_tts_config(const char *line, const char *request_id, const char *command)
+{
+    fridge_tts_config_view_t current = {0};
+    fridge_tts_config_update_t update = {0};
+    esp_err_t err = fridge_tts_get_config(&current);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+
+    strlcpy(update.api_base_url, current.api_base_url[0] ? current.api_base_url : FRIDGE_TTS_DEFAULT_URL, sizeof(update.api_base_url));
+    strlcpy(update.model, current.model[0] ? current.model : FRIDGE_TTS_DEFAULT_MODEL, sizeof(update.model));
+    strlcpy(update.voice, current.voice[0] ? current.voice : FRIDGE_TTS_DEFAULT_VOICE, sizeof(update.voice));
+    update.timeout_ms = current.timeout_ms ? current.timeout_ms : FRIDGE_TTS_DEFAULT_TIMEOUT_MS;
+    json_get_string(line, "apiBaseUrl", update.api_base_url, sizeof(update.api_base_url));
+    json_get_string(line, "model", update.model, sizeof(update.model));
+    json_get_string(line, "voice", update.voice, sizeof(update.voice));
+    update.timeout_ms = json_get_u32(line, "timeoutMs", update.timeout_ms);
+    if (json_has_key(line, "apiKey")) {
+        json_get_string(line, "apiKey", update.api_key, sizeof(update.api_key));
+        update.update_api_key = update.api_key[0] != '\0';
+    }
+
+    err = fridge_tts_set_config(&update);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_tts_config(request_id, command);
+}
+
+static void handle_clear_tts_key(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_tts_clear_key();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_tts_config(request_id, command);
+}
+
 static void handle_create_ai_profile(const char *line, const char *request_id, const char *command)
 {
     char profile_name[FRIDGE_AI_MAX_PROFILE_NAME_LEN + 1] = {0};
@@ -1021,6 +1322,32 @@ static void voice_chat_worker_task(void *arg)
     xSemaphoreGive(job->done);
     vTaskDelete(NULL);
 }
+
+#if CONFIG_FRIDGE_CAMERA_TEST
+static void camera_analyze_worker_task(void *arg)
+{
+    usb_camera_analyze_job_t *job = (usb_camera_analyze_job_t *)arg;
+    esp_err_t err = fridge_camera_capture_ai_fullres();
+    fridge_camera_frame_view_t frame = {0};
+    if (err == ESP_OK) {
+        err = fridge_camera_get_frame(&frame);
+    }
+    if (err == ESP_OK) {
+        fridge_ai_image_request_t request = {
+            .jpeg = frame.data,
+            .jpeg_len = frame.len,
+            .width = frame.width,
+            .height = frame.height,
+        };
+        strlcpy(request.task_type, "recognize_ingredients", sizeof(request.task_type));
+        err = fridge_ai_client_analyze_image(&request, job->result);
+    }
+    job->err = err;
+    (void)fridge_camera_clear_frame();
+    xSemaphoreGive(job->done);
+    vTaskDelete(NULL);
+}
+#endif
 
 static void handle_test_ai_chat(const char *line, const char *request_id, const char *command)
 {
@@ -1260,6 +1587,8 @@ static void handle_ai_assistant_chat(const char *line, const char *request_id, c
 static const char *audio_state_text(fridge_audio_state_t state)
 {
     switch (state) {
+    case FRIDGE_AUDIO_STATE_WAKE_LISTENING:
+        return "wake_listening";
     case FRIDGE_AUDIO_STATE_RECORDING:
         return "recording";
     case FRIDGE_AUDIO_STATE_READY:
@@ -1270,6 +1599,78 @@ static const char *audio_state_text(fridge_audio_state_t state)
     default:
         return "idle";
     }
+}
+
+static void print_wake_status_payload(void)
+{
+    fridge_wake_word_status_t status = {0};
+    (void)fridge_wake_word_get_status(&status);
+    fputs("{\"enabled\":", stdout);
+    fputs(status.enabled ? "true" : "false", stdout);
+    fputs(",\"state\":", stdout);
+    json_print_escaped(fridge_wake_word_state_text(status.state));
+    fputs(",\"wakeWord\":", stdout);
+    json_print_escaped(status.wake_word);
+    fputs(",\"model\":", stdout);
+    json_print_escaped(status.model);
+    printf(",\"triggerCount\":%lu,\"lastTriggerMs\":%lu,\"vadState\":%ld,"
+           "\"rms\":%ld,\"peakAbs\":%ld,\"timeoutCount\":%lu",
+           (unsigned long)status.trigger_count,
+           (unsigned long)status.last_trigger_ms,
+           (long)status.vad_state,
+           (long)status.rms,
+           (long)status.peak_abs,
+           (unsigned long)status.timeout_count);
+    fputs(",\"error\":", stdout);
+    json_print_escaped(status.error);
+    fputs("}", stdout);
+}
+
+static void emit_wake_detected_event(void *user_ctx)
+{
+    (void)user_ctx;
+    event_begin("wake_word_detected");
+    fputs(",\"payload\":", stdout);
+    print_wake_status_payload();
+    event_end();
+}
+
+static void handle_wake_status(const char *request_id, const char *command)
+{
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_wake_status_payload();
+    response_end();
+}
+
+static void handle_wake_start(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_wake_word_start();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_wake_status(request_id, command);
+}
+
+static void handle_wake_stop(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_wake_word_stop();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_wake_status(request_id, command);
+}
+
+static void handle_wake_reset_stats(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_wake_word_reset_stats();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_wake_status(request_id, command);
 }
 
 static void print_voice_status_payload(void)
@@ -1306,11 +1707,107 @@ static void handle_voice_chat_status(const char *request_id, const char *command
     response_end();
 }
 
+static const char *speaker_state_text(fridge_speaker_state_t state)
+{
+    switch (state) {
+    case FRIDGE_SPEAKER_STATE_SYNTHESIZING:
+        return "synthesizing";
+    case FRIDGE_SPEAKER_STATE_PLAYING:
+        return "playing";
+    case FRIDGE_SPEAKER_STATE_DONE:
+        return "done";
+    case FRIDGE_SPEAKER_STATE_ERROR:
+        return "error";
+    case FRIDGE_SPEAKER_STATE_IDLE:
+    default:
+        return "idle";
+    }
+}
+
+static void print_tts_status_payload(const fridge_speaker_status_t *status)
+{
+    fputs("{\"state\":", stdout);
+    json_print_escaped(speaker_state_text(status->state));
+    printf(",\"sampleRate\":%lu,\"audioBytes\":%u,\"playedBytes\":%u,\"durationMs\":%lu,"
+           "\"latencyMs\":%lu,\"httpStatus\":%d",
+           (unsigned long)status->sample_rate,
+           (unsigned)status->audio_bytes,
+           (unsigned)status->played_bytes,
+           (unsigned long)status->duration_ms,
+           (unsigned long)status->latency_ms,
+           status->http_status);
+    fputs(",\"model\":", stdout);
+    json_print_escaped(status->model);
+    fputs(",\"voice\":", stdout);
+    json_print_escaped(status->voice);
+    fputs(",\"error\":", stdout);
+    json_print_escaped(status->error);
+    fputs("}", stdout);
+}
+
+static void handle_tts_status(const char *request_id, const char *command)
+{
+    fridge_speaker_status_t status = {0};
+    esp_err_t err = fridge_speaker_get_status(&status);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_tts_status_payload(&status);
+    response_end();
+}
+
+static void handle_tts_stop(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_speaker_stop();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_tts_status(request_id, command);
+}
+
+static void handle_tts_play(const char *line, const char *request_id, const char *command)
+{
+    char text[FRIDGE_TTS_MAX_TEXT_LEN + 1] = {0};
+    json_get_string(line, "text", text, sizeof(text));
+    if (text[0] == '\0') {
+        send_error(request_id, command, "text is required");
+        return;
+    }
+
+    // TTS 播放会通过扬声器回灌到麦克风；播放前暂停本地唤醒监听，避免误触发和 I2S 资源争用。
+    esp_err_t wake_err = fridge_wake_word_stop();
+    if (wake_err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(wake_err));
+        return;
+    }
+
+    fridge_speaker_status_t status = {0};
+    esp_err_t err = fridge_speaker_synthesize_and_play(text, &status);
+    if (err != ESP_OK) {
+        fridge_speaker_get_status(&status);
+        response_begin(request_id, command, false);
+        fputs(",\"error\":", stdout);
+        json_print_escaped(status.error[0] ? status.error : esp_err_to_name(err));
+        fputs(",\"payload\":", stdout);
+        print_tts_status_payload(&status);
+        response_end();
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_tts_status_payload(&status);
+    response_end();
+}
+
 static void handle_voice_chat_start(const char *request_id, const char *command)
 {
     esp_err_t err = fridge_audio_start_recording();
     if (err != ESP_OK) {
-        send_error(request_id, command, esp_err_to_name(err));
+        send_error(request_id, command, err == ESP_ERR_INVALID_STATE ? "audio busy" : esp_err_to_name(err));
         return;
     }
     response_begin(request_id, command, true);
@@ -1330,6 +1827,49 @@ static void handle_mic_record_stop(const char *request_id, const char *command)
     fputs(",\"payload\":", stdout);
     print_voice_status_payload();
     response_end();
+}
+
+static void handle_mic_record_wav(const char *request_id, const char *command)
+{
+    const int16_t *pcm = NULL;
+    size_t pcm_bytes = 0;
+    uint32_t duration_ms = 0;
+    esp_err_t err = fridge_audio_get_pcm(&pcm, &pcm_bytes, &duration_ms);
+    if (err != ESP_OK) {
+        send_error(request_id, command, err == ESP_ERR_INVALID_STATE ? "no recorded PCM ready" : esp_err_to_name(err));
+        return;
+    }
+    if (!pcm || pcm_bytes == 0 || pcm_bytes > FRIDGE_AUDIO_MAX_PCM_BYTES) {
+        send_error(request_id, command, "recorded PCM size invalid");
+        return;
+    }
+
+    const size_t wav_bytes = pcm_bytes + 44;
+    uint8_t *wav = usb_large_alloc(wav_bytes);
+    if (!wav) {
+        send_error(request_id, command, "WAV allocation failed");
+        return;
+    }
+
+    write_wav_header(wav, pcm_bytes);
+    memcpy(wav + 44, pcm, pcm_bytes);
+    char *wav_b64 = base64_encode_alloc(wav, wav_bytes);
+    free(wav);
+    if (!wav_b64) {
+        send_error(request_id, command, "WAV base64 allocation failed");
+        return;
+    }
+
+    response_begin(request_id, command, true);
+    printf(",\"payload\":{\"sampleRate\":%d,\"channels\":1,\"bitsPerSample\":16,\"durationMs\":%lu,\"pcmBytes\":%u,\"wavBytes\":%u,\"wavBase64\":\"",
+           FRIDGE_AUDIO_SAMPLE_RATE,
+           (unsigned long)duration_ms,
+           (unsigned)pcm_bytes,
+           (unsigned)wav_bytes);
+    fputs(wav_b64, stdout);
+    fputs("\"}", stdout);
+    response_end();
+    free(wav_b64);
 }
 
 static void handle_voice_chat_stop(const char *request_id, const char *command)
@@ -1434,10 +1974,319 @@ static void handle_voice_chat_stop(const char *request_id, const char *command)
     free(persisted_messages);
 }
 
+#if CONFIG_FRIDGE_CAMERA_TEST
+static void print_camera_status_payload(const fridge_camera_status_t *status)
+{
+    fputs("{\"initialized\":", stdout);
+    fputs(status->initialized ? "true" : "false", stdout);
+    fputs(",\"hasFrame\":", stdout);
+    fputs(status->has_frame ? "true" : "false", stdout);
+    printf(",\"width\":%d,\"height\":%d,\"jpegBytes\":%u,\"captureMs\":%lu,\"frameId\":%lu,"
+           "\"freeHeapKb\":%lu,\"freePsramKb\":%lu",
+           status->width,
+           status->height,
+           (unsigned)status->jpeg_bytes,
+           (unsigned long)status->capture_ms,
+           (unsigned long)status->frame_id,
+           (unsigned long)status->free_heap_kb,
+           (unsigned long)status->free_psram_kb);
+    fputs(",\"pixelFormat\":", stdout);
+    json_print_escaped(status->pixel_format);
+    fputs(",\"frameSize\":", stdout);
+    json_print_escaped(status->frame_size);
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(status->last_error);
+    fputs("}", stdout);
+}
+#endif
+
+static void handle_get_camera_status(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera commands require CONFIG_FRIDGE_CAMERA_TEST=y");
+    return;
+#else
+    fridge_camera_status_t status = {0};
+    fridge_camera_get_status(&status);
+
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_camera_status_payload(&status);
+    response_end();
+#endif
+}
+
+static void handle_camera_probe(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_probe is disabled outside camera-only mode");
+    return;
+#else
+    fridge_camera_probe_result_t result = {0};
+    esp_err_t err = fridge_camera_probe(&result);
+
+    response_begin(request_id, command, err == ESP_OK);
+    fputs(",\"payload\":{", stdout);
+    fputs("\"ok\":", stdout);
+    fputs(result.ok ? "true" : "false", stdout);
+    fputs(",\"xclkEnabled\":", stdout);
+    fputs(result.xclk_enabled ? "true" : "false", stdout);
+    fputs(",\"sccbReady\":", stdout);
+    fputs(result.sccb_ready ? "true" : "false", stdout);
+    printf(",\"address\":%u", (unsigned)result.sccb_address);
+    printf(",\"pidHigh\":%u", (unsigned)result.pid_high);
+    printf(",\"pidLow\":%u", (unsigned)result.pid_low);
+    printf(",\"pid\":%u", (unsigned)result.pid);
+    printf(",\"expectedPid\":%u", (unsigned)result.expected_pid);
+    printf(",\"durationMs\":%lu", (unsigned long)result.duration_ms);
+    printf(",\"espErr\":%d", (int)err);
+    fputs(",\"espErrName\":", stdout);
+    json_print_escaped(esp_err_to_name(err));
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(result.last_error);
+    fputs("}", stdout);
+    response_end();
+#endif
+}
+
+static void handle_camera_capture(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_capture is disabled outside camera-only mode");
+    return;
+#else
+    esp_err_t err = fridge_camera_capture();
+    fridge_camera_status_t status = {0};
+    fridge_camera_get_status(&status);
+    if (err != ESP_OK) {
+        send_error(request_id, command, status.last_error[0] ? status.last_error : esp_err_to_name(err));
+        return;
+    }
+
+    fridge_camera_frame_view_t frame = {0};
+    err = fridge_camera_get_frame(&frame);
+    if (err != ESP_OK) {
+        send_error(request_id, command, status.last_error[0] ? status.last_error : esp_err_to_name(err));
+        return;
+    }
+
+    char *image_b64 = NULL;
+    bool preview_omitted = frame.len > CONFIG_FRIDGE_CAMERA_PREVIEW_MAX_BYTES;
+    if (!preview_omitted) {
+        image_b64 = base64_encode_alloc(frame.data, frame.len);
+        if (!image_b64) {
+            send_error(request_id, command, "camera preview base64 allocation failed");
+            return;
+        }
+    }
+
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":{", stdout);
+    fputs("\"status\":", stdout);
+    print_camera_status_payload(&status);
+    fputs(",\"previewDataUrl\":", stdout);
+    if (image_b64) {
+        putchar('"');
+        fputs(FRIDGE_CAMERA_DATA_URL_PREFIX, stdout);
+        fputs(image_b64, stdout);
+        putchar('"');
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"previewOmitted\":", stdout);
+    fputs(preview_omitted ? "true" : "false", stdout);
+    printf(",\"previewMaxBytes\":%d", CONFIG_FRIDGE_CAMERA_PREVIEW_MAX_BYTES);
+    fputs("}", stdout);
+    response_end();
+    free(image_b64);
+#endif
+}
+
+static void handle_camera_jpeg_diag(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_jpeg_diag is disabled outside camera-only mode");
+    return;
+#else
+    esp_err_t err = fridge_camera_capture_hardware_jpeg_diag();
+    fridge_camera_status_t status = {0};
+    fridge_camera_get_status(&status);
+    if (err != ESP_OK) {
+        send_error(request_id, command, status.last_error[0] ? status.last_error : esp_err_to_name(err));
+        return;
+    }
+
+    fridge_camera_frame_view_t frame = {0};
+    err = fridge_camera_get_frame(&frame);
+    if (err != ESP_OK) {
+        send_error(request_id, command, status.last_error[0] ? status.last_error : esp_err_to_name(err));
+        return;
+    }
+
+    char *image_b64 = NULL;
+    bool preview_omitted = frame.len > CONFIG_FRIDGE_CAMERA_PREVIEW_MAX_BYTES;
+    if (!preview_omitted) {
+        image_b64 = base64_encode_alloc(frame.data, frame.len);
+        if (!image_b64) {
+            send_error(request_id, command, "hardware jpeg preview base64 allocation failed");
+            return;
+        }
+    }
+
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":{", stdout);
+    fputs("\"status\":", stdout);
+    print_camera_status_payload(&status);
+    fputs(",\"previewDataUrl\":", stdout);
+    if (image_b64) {
+        putchar('"');
+        fputs(FRIDGE_CAMERA_DATA_URL_PREFIX, stdout);
+        fputs(image_b64, stdout);
+        putchar('"');
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"previewOmitted\":", stdout);
+    fputs(preview_omitted ? "true" : "false", stdout);
+    printf(",\"previewMaxBytes\":%d", CONFIG_FRIDGE_CAMERA_PREVIEW_MAX_BYTES);
+    fputs("}", stdout);
+    response_end();
+    free(image_b64);
+#endif
+}
+
+static void handle_camera_rgb565_diag(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_rgb565_diag is disabled outside camera-only mode");
+    return;
+#else
+    fridge_camera_diag_result_t result = {0};
+    esp_err_t err = fridge_camera_capture_rgb565_diag(&result);
+
+    response_begin(request_id, command, err == ESP_OK);
+    fputs(",\"payload\":{", stdout);
+    fputs("\"ok\":", stdout);
+    fputs(result.ok ? "true" : "false", stdout);
+    printf(",\"width\":%d,\"height\":%d,\"bytes\":%u,\"captureMs\":%lu,\"checksum\":%lu",
+           result.width,
+           result.height,
+           (unsigned)result.bytes,
+           (unsigned long)result.capture_ms,
+           (unsigned long)result.checksum);
+    fputs(",\"firstBytes\":\"", stdout);
+    for (size_t i = 0; i < result.first_len; i++) {
+        printf("%02x", result.first_bytes[i]);
+    }
+    fputs("\",\"espErr\":", stdout);
+    printf("%d", (int)err);
+    fputs(",\"espErrName\":", stdout);
+    json_print_escaped(esp_err_to_name(err));
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(result.last_error);
+    fputs("}", stdout);
+    response_end();
+#endif
+}
+
+static void handle_camera_analyze(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_analyze is disabled outside camera-only mode");
+    return;
+#else
+    fridge_ai_image_result_t *result = calloc(1, sizeof(*result));
+    if (!result) {
+        send_error(request_id, command, "camera analyze allocation failed");
+        return;
+    }
+
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) {
+        free(result);
+        send_error(request_id, command, "camera analyze sync object failed");
+        return;
+    }
+
+    usb_camera_analyze_job_t job = {
+        .result = result,
+        .err = ESP_FAIL,
+        .done = done,
+    };
+    BaseType_t task_ok = xTaskCreate(camera_analyze_worker_task, "camera_ai_worker", USB_CAMERA_WORKER_TASK_STACK, &job, 4, NULL);
+    if (task_ok != pdPASS) {
+        vSemaphoreDelete(done);
+        free(result);
+        send_error(request_id, command, "camera analyze worker create failed");
+        return;
+    }
+
+    xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    if (job.err != ESP_OK) {
+        const char *message = result->chat.error[0] ? result->chat.error : esp_err_to_name(job.err);
+        free(result);
+        send_error(request_id, command, message);
+        return;
+    }
+
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":{\"taskType\":", stdout);
+    json_print_escaped(result->task_type);
+    fputs(",\"reply\":", stdout);
+    json_print_escaped(result->chat.reply);
+    fputs(",\"model\":", stdout);
+    json_print_escaped(result->chat.model);
+    fputs(",\"status\":", stdout);
+    json_print_escaped(result->chat.status);
+    printf(",\"httpStatus\":%d,\"latencyMs\":%lu,\"width\":%d,\"height\":%d,\"jpegBytes\":%u,\"needsConfirmation\":%s}",
+           result->chat.http_status,
+           (unsigned long)result->chat.latency_ms,
+           result->width,
+           result->height,
+           (unsigned)result->jpeg_bytes,
+           result->needs_confirmation ? "true" : "false");
+    response_end();
+    free(result);
+#endif
+}
+
+static void handle_clear_camera_frame(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "clear_camera_frame is disabled outside camera-only mode");
+    return;
+#else
+    esp_err_t err = fridge_camera_clear_frame();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_camera_status(request_id, command);
+#endif
+}
+
+static void handle_camera_reset(const char *request_id, const char *command)
+{
+#if !CONFIG_FRIDGE_CAMERA_TEST
+    send_error(request_id, command, "camera_reset is disabled outside camera-only mode");
+    return;
+#else
+    esp_err_t err = fridge_camera_reset();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_camera_status(request_id, command);
+#endif
+}
+
 static void handle_get_status(const char *request_id, const char *command)
 {
     fridge_device_status_t status = {0};
     fridge_diagnostics_get_status(&status);
+    fridge_mqtt_status_t mqtt_status = {0};
+    fridge_mqtt_get_status(&mqtt_status);
 
     response_begin(request_id, command, true);
     fputs(",\"payload\":{\"model\":", stdout);
@@ -1459,7 +2308,7 @@ static void handle_get_status(const char *request_id, const char *command)
     fputs(",\"wifi\":", stdout);
     json_print_escaped(status.wifi_health);
     fputs(",\"mqtt\":", stdout);
-    json_print_escaped(status.mqtt_health);
+    json_print_escaped(mqtt_status.connected ? "ok" : (mqtt_status.configured ? "warn" : "offline"));
     fputs(",\"usb\":", stdout);
     json_print_escaped(status.usb_health);
     fputs(",\"ota\":", stdout);
@@ -1492,15 +2341,316 @@ static void handle_get_pins(const char *request_id, const char *command)
     static const char *live_pins =
         "["
         "{\"gpio\":\"GPIO1\",\"signal\":\"LIGHT_AO\",\"usage\":\"light sensor ADC\",\"level\":\"safe\",\"note\":\"AO uses 3.3V only, ADC1_CH0 input, do not feed 5V into GPIO.\",\"readonly\":true},"
-        "{\"gpio\":\"GPIO40\",\"signal\":\"MIC_SCK\",\"usage\":\"INMP441 I2S BCLK\",\"level\":\"safe\",\"note\":\"I2S microphone clock, keep wiring short and common GND.\",\"readonly\":true},"
-        "{\"gpio\":\"GPIO41\",\"signal\":\"MIC_WS\",\"usage\":\"INMP441 I2S WS\",\"level\":\"safe\",\"note\":\"Word select / LRCLK for 16kHz mono capture.\",\"readonly\":true},"
-        "{\"gpio\":\"GPIO42\",\"signal\":\"MIC_SD\",\"usage\":\"INMP441 I2S data\",\"level\":\"safe\",\"note\":\"Data output from microphone to ESP32-S3 input.\",\"readonly\":true},"
-        "{\"gpio\":\"GPIO10/12/11/13/14/9\",\"signal\":\"LCD_QSPI\",\"usage\":\"screen bus\",\"level\":\"caution\",\"note\":\"Screen pins remain reserved for TR230S QSPI.\",\"readonly\":true},"
-        "{\"gpio\":\"GPIO0/35-37/45/46\",\"signal\":\"RESERVED\",\"usage\":\"boot or flash/psram sensitive\",\"level\":\"danger\",\"note\":\"Do not connect new peripherals here before hardware review.\",\"readonly\":true}"
+        "{\"gpio\":\"GPIO4/5\",\"signal\":\"I2C_SCCB\",\"usage\":\"FT6336U touch / MPU6050 / OV3660 SCCB\",\"level\":\"caution\",\"note\":\"SDA=GPIO4, SCL=GPIO5; all pull-ups must go to 3.3V.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO6/7\",\"signal\":\"LCD_WAIT_RST\",\"usage\":\"TR230S WAIT# / RESET#\",\"level\":\"caution\",\"note\":\"WAIT#=GPIO6, RESET#=GPIO7; screen VCC is 5V but logic remains 3.3V.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO9/10/11/12/13/14\",\"signal\":\"LCD_QSPI\",\"usage\":\"TR230S QSPI bus\",\"level\":\"caution\",\"note\":\"D3=GPIO9, CS=GPIO10, D0=GPIO11, SCLK=GPIO12, D1=GPIO13, D2=GPIO14.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO15\",\"signal\":\"TOUCH_INT\",\"usage\":\"FT6336U touch interrupt\",\"level\":\"safe\",\"note\":\"TP_INT=GPIO15; TP_RST is not connected in the N8R8-safe wiring.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO17/18/8/3/46/48/45/16\",\"signal\":\"CAM_D0_D7\",\"usage\":\"OV3660 8-bit DVP data\",\"level\":\"caution\",\"note\":\"D0-D7=GPIO17/18/8/3/46/48/45/16; GPIO3/45/46 are strap-sensitive and GPIO48 shares the onboard RGB LED.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO2/38/19/47\",\"signal\":\"CAM_SYNC_CLK\",\"usage\":\"OV3660 VSYNC/HREF/PCLK/XCLK\",\"level\":\"caution\",\"note\":\"VSYNC=GPIO2, HREF=GPIO38, PCLK=GPIO19, XCLK=GPIO47; GPIO35/36/37 are forbidden on N8R8.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO40/41/42/39\",\"signal\":\"I2S_AUDIO\",\"usage\":\"INMP441 microphone and MAX98357A speaker\",\"level\":\"caution\",\"note\":\"BCLK=GPIO40 and WS=GPIO41 are shared; MIC_SD=GPIO42, SPK_DIN=GPIO39. Avoid simultaneous record/play in first bring-up.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO21/20\",\"signal\":\"RADAR_UART\",\"usage\":\"24GHz radar UART\",\"level\":\"safe\",\"note\":\"Radar TX -> GPIO21, ESP32 TX GPIO20 -> radar RX; OT2 is not connected because GPIO19 is camera PCLK.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO35/36/37\",\"signal\":\"FORBIDDEN\",\"usage\":\"N8R8 Flash/PSRAM related\",\"level\":\"danger\",\"note\":\"Do not connect peripherals here. These pins can cause MSPI tuning failure and boot reset loops.\",\"readonly\":true},"
+        "{\"gpio\":\"GPIO0\",\"signal\":\"RESERVED_STRAP\",\"usage\":\"reserved strapping pin\",\"level\":\"danger\",\"note\":\"Not used in the N8R8-safe wiring; avoid camera DVP here.\",\"readonly\":true}"
         "]";
     response_begin(request_id, command, true);
     fputs(",\"payload\":", stdout);
     fputs(live_pins, stdout);
+    response_end();
+}
+
+static esp_err_t i2c_probe_addr(uint8_t addr)
+{
+    // 只发送地址不写寄存器，用于判断 I2C 总线上是否有设备 ACK。
+    // 注意：GPIO4/GPIO5 总线同时可能挂 FT6336U、MPU6050 和 OV3660 SCCB，上拉必须到 3.3V。
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    if (!cmd) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t ret = i2c_master_start(cmd);
+    if (ret == ESP_OK) {
+        ret = i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+    }
+    if (ret == ESP_OK) {
+        ret = i2c_master_stop(cmd);
+    }
+    if (ret == ESP_OK) {
+        ret = i2c_master_cmd_begin(FRIDGE_IMU_I2C_PORT, cmd, pdMS_TO_TICKS(40));
+    }
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t i2c_read_u8(uint8_t addr, uint8_t reg, uint8_t *value)
+{
+    return i2c_master_write_read_device(FRIDGE_IMU_I2C_PORT,
+                                        addr,
+                                        &reg,
+                                        1,
+                                        value,
+                                        1,
+                                        pdMS_TO_TICKS(60));
+}
+
+static void print_i2c_reg_probe(uint8_t addr, uint8_t reg)
+{
+    uint8_t value = 0;
+    esp_err_t err = i2c_read_u8(addr, reg, &value);
+    fputs("{\"reg\":", stdout);
+    printf("%u,\"ok\":%s,\"value\":%u,\"hex\":\"0x%02X\",\"err\":",
+           (unsigned)reg,
+           err == ESP_OK ? "true" : "false",
+           (unsigned)(err == ESP_OK ? value : 0),
+           (unsigned)(err == ESP_OK ? value : 0));
+    json_print_escaped(esp_err_to_name(err));
+    fputs("}", stdout);
+}
+
+static void print_i2c_candidate_probe(uint8_t addr)
+{
+    static const uint8_t regs[] = {
+        0x00, // FT 系列模式寄存器，若读通可辅助判断是否真是触摸控制器。
+        0x02, // FT 系列触点状态寄存器。
+        0x03, // FT 系列第一触点 X 高位寄存器。
+        0x80, // FT 系列阈值/配置区常见寄存器。
+        0x88, // FT 系列中断模式常见寄存器。
+        0xA3, // FT6336U Chip ID。
+        0xA8, // FT6336U Vendor ID。
+    };
+
+    fputs("{\"addr\":", stdout);
+    printf("%u,\"hex\":\"0x%02X\",\"ack\":%s,\"regs\":[",
+           (unsigned)addr,
+           (unsigned)addr,
+           i2c_probe_addr(addr) == ESP_OK ? "true" : "false");
+    for (size_t i = 0; i < sizeof(regs); i++) {
+        if (i > 0) {
+            putchar(',');
+        }
+        print_i2c_reg_probe(addr, regs[i]);
+    }
+    fputs("]}", stdout);
+}
+
+static void handle_touch_i2c_diag(const char *request_id, const char *command)
+{
+    // 触摸诊断命令：扫描 I2C0，并重点读取 FT6336U/MPU6050 的身份寄存器。
+    // 它不改变业务状态，适合只接屏幕时判断触摸芯片是否真的在 GPIO4/GPIO5 上应答。
+    (void)fridge_sensors_init();
+
+    bool found_any = false;
+    response_begin(request_id, command, true);
+    printf(",\"payload\":{\"port\":%d,\"sda\":%d,\"scl\":%d,\"touchAddr\":%u,\"imuAddr\":%u,\"addresses\":[",
+           FRIDGE_IMU_I2C_PORT,
+           FRIDGE_IMU_I2C_SDA_GPIO,
+           FRIDGE_IMU_I2C_SCL_GPIO,
+           FRIDGE_TOUCH_I2C_ADDR,
+           FRIDGE_IMU_DEFAULT_ADDR);
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        if (i2c_probe_addr(addr) == ESP_OK) {
+            if (found_any) {
+                putchar(',');
+            }
+            printf("%u", (unsigned)addr);
+            found_any = true;
+        }
+    }
+    fputs("],\"foundAny\":", stdout);
+    fputs(found_any ? "true" : "false", stdout);
+
+    uint8_t value = 0;
+    esp_err_t touch_chip = i2c_read_u8(FRIDGE_TOUCH_I2C_ADDR, 0xA3, &value);
+    fputs(",\"ft6336u\":{\"chipIdOk\":", stdout);
+    fputs(touch_chip == ESP_OK ? "true" : "false", stdout);
+    printf(",\"chipId\":%u,\"chipIdErr\":", (unsigned)(touch_chip == ESP_OK ? value : 0));
+    json_print_escaped(esp_err_to_name(touch_chip));
+    value = 0;
+    esp_err_t touch_vendor = i2c_read_u8(FRIDGE_TOUCH_I2C_ADDR, 0xA8, &value);
+    printf(",\"vendorId\":%u,\"vendorErr\":", (unsigned)(touch_vendor == ESP_OK ? value : 0));
+    json_print_escaped(esp_err_to_name(touch_vendor));
+    value = 0;
+    esp_err_t touch_points = i2c_read_u8(FRIDGE_TOUCH_I2C_ADDR, 0x02, &value);
+    printf(",\"tdStatus\":%u,\"tdStatusErr\":", (unsigned)(touch_points == ESP_OK ? value : 0));
+    json_print_escaped(esp_err_to_name(touch_points));
+    fputs("}", stdout);
+
+    value = 0;
+    esp_err_t imu_who = i2c_read_u8(FRIDGE_IMU_DEFAULT_ADDR, 0x75, &value);
+    fputs(",\"mpu6050\":{\"whoAmIOk\":", stdout);
+    fputs(imu_who == ESP_OK ? "true" : "false", stdout);
+    printf(",\"whoAmI\":%u,\"err\":", (unsigned)(imu_who == ESP_OK ? value : 0));
+    json_print_escaped(esp_err_to_name(imu_who));
+    fputs("}", stdout);
+
+    static const uint8_t candidates[] = {
+        FRIDGE_TOUCH_I2C_ADDR,
+        FRIDGE_IMU_DEFAULT_ADDR,
+    };
+    fputs(",\"candidates\":[", stdout);
+    for (size_t i = 0; i < sizeof(candidates); i++) {
+        if (i > 0) {
+            putchar(',');
+        }
+        print_i2c_candidate_probe(candidates[i]);
+    }
+    fputs("]", stdout);
+
+    fputs(",\"hint\":", stdout);
+    if (!found_any) {
+        json_print_escaped("No I2C ACK on GPIO4/GPIO5. Check TP-VCC=3V3, TP-GND, SDA/SCL direction, and pull-ups to 3.3V.");
+    } else if (touch_chip != ESP_OK) {
+        json_print_escaped("I2C bus has devices, but the verified FT6336U/TRN0706B address 0x48 did not answer. Check panel touch pin order, FPC direction, TP_RST, and pull-ups.");
+    } else {
+        json_print_escaped("FT6336U/TRN0706B answered at verified addr 0x48; tap the UI to verify coordinate direction.");
+    }
+    fputs("}", stdout);
+    response_end();
+}
+
+static const char *radar_mode_label(fridge_radar_mode_t mode)
+{
+    switch (mode) {
+    case FRIDGE_RADAR_MODE_NORMAL:
+        return "normal";
+    case FRIDGE_RADAR_MODE_REPORT:
+        return "report";
+    case FRIDGE_RADAR_MODE_ERROR:
+        return "error";
+    case FRIDGE_RADAR_MODE_IDLE:
+    default:
+        return "idle";
+    }
+}
+
+static const char *radar_zone_label(fridge_radar_distance_zone_t zone)
+{
+    switch (zone) {
+    case FRIDGE_RADAR_DISTANCE_NEAR:
+        return "near";
+    case FRIDGE_RADAR_DISTANCE_MID:
+        return "mid";
+    case FRIDGE_RADAR_DISTANCE_FAR:
+        return "far";
+    case FRIDGE_RADAR_DISTANCE_UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
+static void print_radar_payload(const fridge_radar_snapshot_t *radar)
+{
+    fputs("{\"ready\":", stdout);
+    fputs(radar->ready ? "true" : "false", stdout);
+    fputs(",\"mode\":", stdout);
+    json_print_escaped(radar_mode_label(radar->mode));
+    fputs(",\"presence\":", stdout);
+    fputs(radar->presence ? "true" : "false", stdout);
+    fputs(",\"nearClutter\":", stdout);
+    fputs(radar->near_clutter ? "true" : "false", stdout);
+    fputs(",\"staticClutter\":", stdout);
+    fputs(radar->static_clutter ? "true" : "false", stdout);
+    fputs(",\"humanCandidate\":", stdout);
+    fputs(radar->human_candidate ? "true" : "false", stdout);
+    fputs(",\"stablePresence\":", stdout);
+    fputs(radar->stable_presence ? "true" : "false", stdout);
+    fputs(",\"within1m\":", stdout);
+    fputs(radar->within_1m ? "true" : "false", stdout);
+    fputs(",\"approaching\":", stdout);
+    fputs(radar->approaching ? "true" : "false", stdout);
+    fputs(",\"thresholdPresence\":", stdout);
+    fputs(radar->threshold_presence ? "true" : "false", stdout);
+    printf(",\"distanceRaw\":%u,\"smoothedDistanceRaw\":%u,"
+           "\"peakGate\":%u,\"peakEnergy\":%u,\"estimatedGate\":%u,\"stableGate\":%u,\"thresholdGate\":%u,"
+           "\"confidence\":%u,\"stability\":%u,\"approachScore\":%u,"
+           "\"approachFrames\":%u,\"approachDistanceDelta\":%u,"
+           "\"motionScore\":%u,\"distanceSpan\":%u,\"gateSpan\":%u,\"energyChangeScore\":%u,"
+           "\"staticScore\":%u,\"humanScore\":%u,"
+           "\"thresholdScore\":%u,\"holdFramesRemaining\":%u,"
+           "\"nearEnergy\":%u,\"midEnergy\":%u,\"farEnergy\":%u,"
+           "\"frameCount\":%lu,\"parseErrorCount\":%lu,\"timeoutCount\":%lu,\"ot2Level\":%d",
+           (unsigned)radar->distance_raw,
+           (unsigned)radar->smoothed_distance_raw,
+           (unsigned)radar->peak_gate,
+           (unsigned)radar->peak_energy,
+           (unsigned)radar->estimated_gate,
+           (unsigned)radar->stable_gate,
+           (unsigned)radar->threshold_gate,
+           (unsigned)radar->confidence,
+           (unsigned)radar->stability,
+           (unsigned)radar->approach_score,
+           (unsigned)radar->approach_frames,
+           (unsigned)radar->approach_distance_delta,
+           (unsigned)radar->motion_score,
+           (unsigned)radar->distance_span,
+           (unsigned)radar->gate_span,
+           (unsigned)radar->energy_change_score,
+           (unsigned)radar->static_score,
+           (unsigned)radar->human_score,
+           (unsigned)radar->threshold_score,
+           (unsigned)radar->hold_frames_remaining,
+           (unsigned)radar->near_energy,
+           (unsigned)radar->mid_energy,
+           (unsigned)radar->far_energy,
+           (unsigned long)radar->frame_count,
+           (unsigned long)radar->parse_error_count,
+           (unsigned long)radar->timeout_count,
+           radar->ot2_level);
+    fputs(",\"stableZone\":", stdout);
+    json_print_escaped(radar_zone_label(radar->stable_zone));
+    fputs(",\"gateEnergy\":[", stdout);
+    for (size_t i = 0; i < FRIDGE_RADAR_GATE_COUNT; i++) {
+        if (i > 0) {
+            putchar(',');
+        }
+        printf("%u", (unsigned)radar->gate_energy[i]);
+    }
+    fputs("],\"lastText\":", stdout);
+    json_print_escaped(radar->last_text);
+    fputs(",\"targetClass\":", stdout);
+    json_print_escaped(radar->target_class);
+    fputs(",\"rejectionReason\":", stdout);
+    json_print_escaped(radar->rejection_reason);
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(radar->last_error);
+    printf(",\"updatedAtMs\":%lld}", (long long)radar->updated_at_ms);
+}
+
+static void handle_radar_test_start(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_radar_start_report_mode();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    fridge_radar_snapshot_t radar = {0};
+    (void)fridge_radar_get_snapshot(&radar);
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_radar_payload(&radar);
+    response_end();
+}
+
+static void handle_radar_test_stop(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_radar_start_normal_mode();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    fridge_radar_snapshot_t radar = {0};
+    (void)fridge_radar_get_snapshot(&radar);
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_radar_payload(&radar);
+    response_end();
+}
+
+static void handle_radar_test_status(const char *request_id, const char *command)
+{
+    fridge_radar_snapshot_t radar = {0};
+    (void)fridge_radar_get_snapshot(&radar);
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_radar_payload(&radar);
     response_end();
 }
 
@@ -1513,12 +2663,34 @@ static void handle_get_sensors(const char *request_id, const char *command)
     // lux 字段为旧 Web 面板兼容值，实际不是 BH1750 物理 lux；当前按反向光敏 AO 换算后的亮度 0-1023 返回。
     printf(",\"payload\":{\"pir\":false,\"lux\":%u,\"lightRaw12bit\":%u,\"lightValue10bit\":%u,"
            "\"lightPercent\":%u,\"lightDelta\":%d,\"lightPolarity\":\"raw_high_dark\","
-           "\"angleDelta\":0,\"vibrationPeak\":0,",
+           "\"imuReady\":%s,\"imuAddress\":%u,\"imuWhoAmI\":%u,\"imuError\":%d,"
+           "\"accelXG\":%.4f,\"accelYG\":%.4f,\"accelZG\":%.4f,"
+           "\"gyroXDps\":%.4f,\"gyroYDps\":%.4f,\"gyroZDps\":%.4f,"
+           "\"imuTemperatureC\":%.2f,\"pitchDeg\":%.2f,\"rollDeg\":%.2f,"
+           "\"angleDelta\":%.2f,\"vibrationPeak\":%.4f,",
            (unsigned)sensors.light_value_10bit,
            (unsigned)sensors.light_raw_12bit,
            (unsigned)sensors.light_value_10bit,
            (unsigned)sensors.light_percent,
-           (int)sensors.light_delta);
+           (int)sensors.light_delta,
+           sensors.imu_ready ? "true" : "false",
+           (unsigned)sensors.imu_address,
+           (unsigned)sensors.imu_who_am_i,
+           sensors.imu_error,
+           (double)sensors.accel_x_g,
+           (double)sensors.accel_y_g,
+           (double)sensors.accel_z_g,
+           (double)sensors.gyro_x_dps,
+           (double)sensors.gyro_y_dps,
+           (double)sensors.gyro_z_dps,
+           (double)sensors.imu_temperature_c,
+           (double)sensors.pitch_deg,
+           (double)sensors.roll_deg,
+           (double)sensors.angle_delta,
+           (double)sensors.vibration_peak);
+    fputs("\"radar\":", stdout);
+    print_radar_payload(&sensors.radar);
+    putchar(',');
     fputs("\"touch\":\"not_connected\",\"display\":\"not_connected\",\"buzzer\":\"not_connected\",\"doorState\":\"IDLE\",\"updatedAt\":", stdout);
     if (sensors.ready) {
         printf("\"%lld ms\"", (long long)sensors.updated_at_ms);
@@ -1591,6 +2763,14 @@ static void handle_line(const char *line)
         handle_scan_wifi(request_id, command);
     } else if (strcmp(command, "set_network") == 0) {
         handle_set_network(line, request_id, command);
+    } else if (strcmp(command, "get_mqtt_config") == 0 || strcmp(command, "get_mqtt_status") == 0) {
+        handle_get_mqtt_config(request_id, command);
+    } else if (strcmp(command, "set_mqtt_config") == 0) {
+        handle_set_mqtt_config(line, request_id, command);
+    } else if (strcmp(command, "clear_mqtt_secret") == 0) {
+        handle_clear_mqtt_secret(request_id, command);
+    } else if (strcmp(command, "mqtt_publish_state") == 0) {
+        handle_mqtt_publish_state(request_id, command);
     } else if (strcmp(command, "get_ai_config") == 0) {
         handle_get_ai_config(request_id, command);
     } else if (strcmp(command, "get_ai_profiles") == 0) {
@@ -1605,6 +2785,12 @@ static void handle_line(const char *line)
         handle_set_asr_config(line, request_id, command);
     } else if (strcmp(command, "clear_asr_key") == 0) {
         handle_clear_asr_key(request_id, command);
+    } else if (strcmp(command, "get_tts_config") == 0) {
+        handle_get_tts_config(request_id, command);
+    } else if (strcmp(command, "set_tts_config") == 0) {
+        handle_set_tts_config(line, request_id, command);
+    } else if (strcmp(command, "clear_tts_key") == 0) {
+        handle_clear_tts_key(request_id, command);
     } else if (strcmp(command, "create_ai_profile") == 0) {
         handle_create_ai_profile(line, request_id, command);
     } else if (strcmp(command, "select_ai_profile") == 0) {
@@ -1615,18 +2801,56 @@ static void handle_line(const char *line)
         handle_test_ai_chat(line, request_id, command);
     } else if (strcmp(command, "ai_assistant_chat") == 0) {
         handle_ai_assistant_chat(line, request_id, command);
+    } else if (strcmp(command, "wake_start") == 0) {
+        handle_wake_start(request_id, command);
+    } else if (strcmp(command, "wake_stop") == 0) {
+        handle_wake_stop(request_id, command);
+    } else if (strcmp(command, "wake_status") == 0) {
+        handle_wake_status(request_id, command);
+    } else if (strcmp(command, "wake_reset_stats") == 0) {
+        handle_wake_reset_stats(request_id, command);
     } else if (strcmp(command, "mic_record_start") == 0) {
         handle_voice_chat_start(request_id, command);
     } else if (strcmp(command, "mic_record_status") == 0) {
         handle_voice_chat_status(request_id, command);
     } else if (strcmp(command, "mic_record_stop") == 0) {
         handle_mic_record_stop(request_id, command);
+    } else if (strcmp(command, "mic_record_wav") == 0) {
+        handle_mic_record_wav(request_id, command);
     } else if (strcmp(command, "voice_chat_start") == 0) {
         handle_voice_chat_start(request_id, command);
     } else if (strcmp(command, "voice_chat_stop") == 0) {
         handle_voice_chat_stop(request_id, command);
     } else if (strcmp(command, "voice_chat_status") == 0) {
         handle_voice_chat_status(request_id, command);
+    } else if (strcmp(command, "tts_play") == 0) {
+        handle_tts_play(line, request_id, command);
+    } else if (strcmp(command, "tts_status") == 0) {
+        handle_tts_status(request_id, command);
+    } else if (strcmp(command, "tts_stop") == 0) {
+        handle_tts_stop(request_id, command);
+    } else if (strcmp(command, "radar_test_start") == 0) {
+        handle_radar_test_start(request_id, command);
+    } else if (strcmp(command, "radar_test_status") == 0) {
+        handle_radar_test_status(request_id, command);
+    } else if (strcmp(command, "radar_test_stop") == 0) {
+        handle_radar_test_stop(request_id, command);
+    } else if (strcmp(command, "get_camera_status") == 0) {
+        handle_get_camera_status(request_id, command);
+    } else if (strcmp(command, "camera_probe") == 0) {
+        handle_camera_probe(request_id, command);
+    } else if (strcmp(command, "camera_capture") == 0) {
+        handle_camera_capture(request_id, command);
+    } else if (strcmp(command, "camera_jpeg_diag") == 0) {
+        handle_camera_jpeg_diag(request_id, command);
+    } else if (strcmp(command, "camera_rgb565_diag") == 0) {
+        handle_camera_rgb565_diag(request_id, command);
+    } else if (strcmp(command, "camera_analyze") == 0) {
+        handle_camera_analyze(request_id, command);
+    } else if (strcmp(command, "clear_camera_frame") == 0) {
+        handle_clear_camera_frame(request_id, command);
+    } else if (strcmp(command, "camera_reset") == 0) {
+        handle_camera_reset(request_id, command);
     } else if (strcmp(command, "get_ai_context_preview") == 0) {
         handle_get_ai_context_preview(line, request_id, command);
     } else if (strcmp(command, "test_ai_task") == 0) {
@@ -1643,6 +2867,8 @@ static void handle_line(const char *line)
         handle_clear_chat_history(request_id, command);
     } else if (strcmp(command, "get_pins") == 0) {
         handle_get_pins(request_id, command);
+    } else if (strcmp(command, "touch_i2c_diag") == 0) {
+        handle_touch_i2c_diag(request_id, command);
     } else if (strcmp(command, "get_sensors") == 0) {
         handle_get_sensors(request_id, command);
     } else if (strcmp(command, "get_diagnostics") == 0) {
@@ -1692,6 +2918,8 @@ static void usb_protocol_task(void *arg)
 
 esp_err_t fridge_usb_protocol_start(void)
 {
+    // 唤醒词事件通过同一条 USB JSON Lines 输出；这里只注册轻量回调，不在回调里触发 ASR/AI。
+    (void)fridge_wake_word_set_event_callback(emit_wake_detected_event, NULL);
     BaseType_t ok = xTaskCreate(usb_protocol_task, "usb_protocol", USB_PROTOCOL_TASK_STACK, NULL, 5, NULL);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

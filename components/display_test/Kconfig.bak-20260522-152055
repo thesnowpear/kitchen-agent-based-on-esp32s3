@@ -1,0 +1,19 @@
+menu "Fridge Spirit screen test"
+
+    config FRIDGE_SCREEN_TEST
+        bool "Enable standalone QSPI screen test"
+        default y
+        help
+            启用后主程序只运行 TS040HDS02CP-B1620A QSPI 屏幕点亮测试，
+            不启动 Wi-Fi 和 USB 业务流程，便于首次接线时降低电源峰值与干扰。
+
+    config FRIDGE_SCREEN_TEST_PCLK_HZ
+        int "QSPI screen test clock in Hz"
+        depends on FRIDGE_SCREEN_TEST
+        default 10000000
+        range 1000000 60000000
+        help
+            屏幕 QSPI 测试时钟。首次松散插线测试建议保持 10 MHz，
+            确认供电、排线和 WAIT# 稳定后再逐步提高。
+
+endmenu

@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>冰箱小精灵 UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="prototype">
+      <section class="device-shell" aria-label="冰箱小精灵 720 方屏 UI 原型">
+        <div class="screen" id="screen">
+          <section class="page standby-page is-active" data-page="standby">
+            <div class="standby-face">
+              <span class="standby-time">18:24</span>
+              <div class="mascot">
+                <span class="mascot-face">^_^</span>
+                <span class="mascot-blush"></span>
+              </div>
+              <h1>冰箱小精灵</h1>
+              <p id="standbyMood">今天也在认真保鲜</p>
+            </div>
+          </section>
+
+          <header class="app-status" id="statusBar" aria-label="小精灵状态栏" role="button" tabindex="0">
+            <div class="status-left">
+              <button class="status-back" id="statusBack" type="button" aria-label="小精灵">
+                <span class="fairy-status-icon"></span>
+              </button>
+              <strong>小精灵</strong>
+            </div>
+            <div class="status-right">
+              <span class="status-clock" id="statusClock">18:24</span>
+              <span id="networkState">Wi-Fi</span>
+              <span class="wifi-bars" aria-hidden="true"><i></i><i></i><i></i></span>
+              <span class="battery" aria-label="电量 86%"><i></i></span>
+              <span>86%</span>
+            </div>
+          </header>
+          <aside class="status-panel" id="statusPanel" aria-label="状态详情面板">
+            <div class="status-panel-head">
+              <strong>设备状态</strong>
+              <span>刚刚同步</span>
+            </div>
+            <div class="status-detail-grid">
+              <article class="wifi-status-card">
+                <span>Wi-Fi</span>
+                <strong id="wifiDetailText">Home_2.4G · -58 dBm</strong>
+                <button id="statusWifiOpen" type="button" data-page-target="wifi">选择网络</button>
+              </article>
+              <article><span>MQTT</span><strong>在线 · 12 ms</strong></article>
+              <article><span>电量</span><strong>86% · USB 供电</strong></article>
+              <article><span>传感器</span><strong>PIR / 光照 / IMU 正常</strong></article>
+              <article><span>本地识别</span><strong>库存 12 件 · 摄像头就绪</strong></article>
+            </div>
+          </aside>
+
+          <section class="page app-page" data-page="home">
+            <div class="home-head">
+              <div>
+                <p class="kicker">检测到有人靠近 · 已启动</p>
+                <h2>冰箱总览</h2>
+              </div>
+              <div class="home-actions">
+                <button class="pill-button" id="spaceEditToggle" type="button">编辑空间</button>
+                <button class="pill-button" data-page-target="door">临期 <span id="expiringCount">3</span></button>
+              </div>
+            </div>
+
+            <div class="fridge-map" aria-label="冰箱二维分区展示图">
+              <button class="zone zone-freezer" data-zone="freezer">
+                <span>上层冷冻</span>
+                <strong>4 件</strong>
+              </button>
+              <button class="zone zone-left" data-zone="left">
+                <span>左侧冷藏</span>
+                <strong>6 件</strong>
+              </button>
+              <button class="zone zone-right" data-zone="right">
+                <span>右侧冷藏</span>
+                <strong>5 件</strong>
+              </button>
+              <button class="zone zone-door" data-zone="door">
+                <span>门架</span>
+                <strong>3 件</strong>
+              </button>
+              <button class="zone zone-add" id="addFridgeZone" type="button">
+                <span>添加区域</span>
+                <strong>+</strong>
+              </button>
+            </div>
+
+            <div class="space-editor" id="spaceEditor" aria-label="冰箱空间编辑面板">
+              <label>
+                区域名称
+                <input id="spaceNameInput" value="自定义区" />
+              </label>
+              <label>
+                宽度
+                <input id="spaceWidthRange" type="range" min="1" max="3" value="1" />
+              </label>
+              <label>
+                高度
+                <input id="spaceHeightRange" type="range" min="1" max="3" value="1" />
+              </label>
+              <label class="space-note">
+                备注
+                <input id="spaceNoteInput" value="可放食材" />
+              </label>
+              <button class="space-delete" id="spaceDeleteButton" type="button">删除当前区域</button>
+            </div>
+
+          </section>
+
+          <section class="page app-page" data-page="zone">
+            <div class="zone-top">
+              <div>
+                <p class="kicker">九宫格位置管理</p>
+                <h2 id="zoneTitle">左侧冷藏</h2>
+              </div>
+            </div>
+
+            <div class="grid-board" id="gridBoard" aria-label="分区九宫格"></div>
+          </section>
+
+          <section class="page app-page" data-page="editFood">
+            <div class="zone-top">
+              <div>
+                <p class="kicker">食材信息编辑</p>
+                <h2>修改记录</h2>
+              </div>
+            </div>
+
+            <form class="food-form">
+              <label>
+                食材名称
+                <input id="foodNameInput" value="番茄" />
+              </label>
+              <label>
+                数量
+                <input id="foodAmountInput" value="2 个" />
+              </label>
+              <label>
+                到期时间
+                <input id="foodExpireInput" value="3 天后" />
+              </label>
+              <label>
+                位置
+                <div class="place-edit-row">
+                  <input id="foodPlaceInput" value="左侧冷藏 中 · 中" readonly />
+                  <button id="foodPlaceEditButton" type="button">位置编辑</button>
+                </div>
+              </label>
+              <label>
+                放入时间
+                <input id="foodStoredInput" value="2026-05-21 18:24" />
+              </label>
+              <label class="wide">
+                备注
+                <textarea id="foodNoteInput">做番茄炒蛋优先使用，外皮较软。</textarea>
+              </label>
+              <div class="voice-editor wide">
+                <div class="capture-input-options">
+                  <button type="button" class="voice-button" data-voice-target="note">
+                    <span class="voice-dot"></span>
+                    语音补充登记信息
+                  </button>
+                  <button type="button" class="manual-button" id="manualEditOpen">
+                    手动补充登记信息
+                  </button>
+                </div>
+                <output class="manual-preview" id="manualEditPreview">未输入补充信息</output>
+                <p id="voiceStatus">可说：“数量改成 3 个”“备注 今天先吃”。</p>
+              </div>
+              <button type="button" class="save-button" data-page-target="zone">保存修改</button>
+            </form>
+          </section>
+
+          <section class="page app-page" data-page="door">
+            <p class="kicker">门已打开 · 本地快路径提醒</p>
+            <h2>今天优先吃什么</h2>
+            <div class="food-list" id="expiringFoodList">
+              <article>
+                <div class="food-mark egg"></div>
+                <div>
+                  <strong>鸡蛋 · 3 个</strong>
+                  <span>左侧冷藏 A1 · 2 天后到期</span>
+                </div>
+                <button data-page-target="editFood" data-edit-zone="left" data-edit-slot="A1">编辑</button>
+              </article>
+              <article>
+                <div class="food-mark milk"></div>
+                <div>
+                  <strong>牛奶 · 1 盒</strong>
+                  <span>门架 C1 · 明天到期</span>
+                </div>
+                <button data-page-target="editFood" data-edit-zone="door" data-edit-slot="C1">编辑</button>
+              </article>
+              <article>
+                <div class="food-mark leaf"></div>
+                <div>
+                  <strong>菠菜 · 1 把</strong>
+                  <span>右侧冷藏 B1 · 适合煮汤</span>
+                </div>
+                <button data-page-target="editFood" data-edit-zone="right" data-edit-slot="B1">编辑</button>
+              </article>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="camera">
+            <div class="camera-viewfinder" id="cameraViewfinder">
+              <video id="cameraPreview" autoplay muted playsinline aria-label="摄像头实时画面"></video>
+              <div class="focus-frame"></div>
+              <button class="shutter-button" id="shutterButton" type="button" aria-label="拍摄食材"></button>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="cameraResult">
+            <p class="kicker">拍照登记 · 识别结果</p>
+            <h2>确认食材信息</h2>
+            <article class="camera-result" id="cameraResult" aria-live="polite">
+              <span>识别结果</span>
+              <strong id="cameraFoodName">尚未拍摄</strong>
+              <p id="cameraFoodMeta">拍摄后读取食材名称、数量和建议位置。</p>
+              <button class="camera-confirm-button" id="cameraConfirmButton" type="button" disabled>确认放入，继续拍摄</button>
+            </article>
+            <div class="voice-capture">
+              <div class="capture-input-options">
+                <button class="voice-button" data-voice-target="cameraNote">
+                  <span class="voice-dot"></span>
+                  语音补充登记信息
+                </button>
+                <button class="manual-button" id="manualCaptureOpen" type="button">
+                  手动补充登记信息
+                </button>
+              </div>
+              <output class="manual-preview" id="manualCapturePreview">未输入补充信息</output>
+              <span id="cameraVoiceStatus">可补充位置、数量、备注。</span>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="recipe">
+            <p class="kicker">厨房 AI 助手</p>
+            <h2>今晚一顿餐</h2>
+            <div class="meal-summary">
+              <span>3 道菜</span>
+              <span>约 35 分钟</span>
+              <span>消耗 6 项库存</span>
+            </div>
+            <div class="meal-list">
+              <article class="meal-card">
+                <div class="recipe-card">
+                  <div>
+                    <span class="recipe-time">主菜 · 18 分钟</span>
+                    <h3>番茄炒蛋</h3>
+                    <p>使用番茄、鸡蛋，顺手消耗临期库存。</p>
+                  </div>
+                  <figure class="dish-photo dish-tomato" aria-label="番茄炒蛋相关图片">
+                    <span class="plate"></span>
+                    <span class="tomato tomato-one"></span>
+                    <span class="tomato tomato-two"></span>
+                    <span class="egg egg-one"></span>
+                    <span class="egg egg-two"></span>
+                    <figcaption>主菜</figcaption>
+                  </figure>
+                </div>
+                <div class="recipe-details">
+                  <details>
+                    <summary>展开番茄炒蛋详情</summary>
+                    <p>鸡蛋 2 个打散，番茄 2 个切块。先滑炒鸡蛋盛出，再炒番茄出汁，倒回鸡蛋，少盐调味。消耗左侧冷藏 B2 番茄、A1 鸡蛋。</p>
+                  </details>
+                </div>
+              </article>
+
+              <article class="meal-card">
+                <div class="recipe-card">
+                  <div>
+                    <span class="recipe-time">汤品 · 12 分钟</span>
+                    <h3>菠菜鸡蛋汤</h3>
+                    <p>补充蔬菜和蛋白质，适合作为清淡汤品。</p>
+                  </div>
+                  <figure class="dish-photo dish-soup" aria-label="菠菜鸡蛋汤相关图片">
+                    <span class="bowl"></span>
+                    <span class="leaf leaf-one"></span>
+                    <span class="leaf leaf-two"></span>
+                    <span class="egg soup-egg"></span>
+                    <figcaption>汤品</figcaption>
+                  </figure>
+                </div>
+                <div class="recipe-details">
+                  <details>
+                    <summary>展开菠菜鸡蛋汤详情</summary>
+                    <p>水开后加入菠菜，淋入半个蛋液，少量盐调味即可。优先消耗右侧冷藏 B1 菠菜，可搭配番茄炒蛋作为一荤一素。</p>
+                  </details>
+                </div>
+              </article>
+
+              <article class="meal-card">
+                <div class="recipe-card">
+                  <div>
+                    <span class="recipe-time">配菜 · 5 分钟</span>
+                    <h3>黄瓜酸奶小碟</h3>
+                    <p>清爽解腻，顺手处理已开封酸奶。</p>
+                  </div>
+                  <figure class="dish-photo dish-cucumber" aria-label="黄瓜酸奶小碟相关图片">
+                    <span class="plate"></span>
+                    <span class="cucumber cucumber-one"></span>
+                    <span class="cucumber cucumber-two"></span>
+                    <span class="yogurt"></span>
+                    <figcaption>配菜</figcaption>
+                  </figure>
+                </div>
+                <div class="recipe-details">
+                  <details>
+                    <summary>展开黄瓜酸奶小碟详情</summary>
+                    <p>黄瓜切片，酸奶加少量黑胡椒或蜂蜜调味，作为冷盘。消耗左侧冷藏 B3 黄瓜、A2 酸奶，适合搭配热菜。</p>
+                  </details>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="shopping">
+            <p class="kicker">自动购物清单</p>
+            <h2>下次采购建议</h2>
+            <div class="shopping-list">
+              <label><input type="checkbox" /> 酸奶 2 杯 <span>低库存</span></label>
+              <label><input type="checkbox" /> 生菜 1 颗 <span>搭配菜单</span></label>
+              <label><input type="checkbox" /> 鸡胸肉 1 份 <span>常购补货</span></label>
+              <label><input type="checkbox" checked /> 牛奶 1 盒 <span>已加入</span></label>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="settings">
+            <p class="kicker">设备与画面设置</p>
+            <h2>小精灵偏好</h2>
+            <div class="settings-list">
+              <label class="brightness-setting">
+                <span>屏幕亮度</span>
+                <div class="brightness-control">
+                  <input id="brightnessRange" type="range" min="45" max="120" value="100" />
+                  <output id="brightnessValue">100%</output>
+                </div>
+              </label>
+              <label>
+                Wi-Fi 网络
+                <button class="settings-link-button" id="settingsWifiOpen" type="button" data-page-target="wifi">查看可用网络</button>
+              </label>
+              <button class="settings-action-button" type="button"><strong>设备运维</strong><span>OTA / 日志</span></button>
+              <label>
+                开门提醒
+                <input type="checkbox" checked />
+              </label>
+              <label>
+                语音唤醒
+                <input type="checkbox" checked />
+              </label>
+              <label>
+                临期提前提醒
+                <select>
+                  <option>提前 2 天</option>
+                  <option>提前 3 天</option>
+                  <option>提前 7 天</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="wifi">
+            <p class="kicker">设备网络</p>
+            <h2>选择 Wi-Fi</h2>
+            <div class="wifi-list" id="wifiList" aria-label="可用 Wi-Fi 列表"></div>
+          </section>
+
+          <section class="page app-page" data-page="more">
+            <p class="kicker">更多功能</p>
+            <h2>扩展厨房能力</h2>
+            <div class="more-grid">
+              <button data-page-target="recipe"><strong>AI 菜谱</strong><span>按库存生成</span></button>
+              <button><strong>营养助手</strong><span>热量与忌口</span></button>
+              <button><strong>定时器</strong><span>煮蛋 8 分钟</span></button>
+              <button><strong>烹饪问答</strong><span>厨房知识库</span></button>
+              <button><strong>家庭同步</strong><span>多人共享</span></button>
+            </div>
+          </section>
+
+          <section class="page app-page" data-page="offline">
+            <p class="kicker danger">Wi-Fi / MQTT 异常</p>
+            <h2>离线也能继续提醒</h2>
+            <div class="offline-stack">
+              <article><strong>本地库存</strong><span>已保存库存 12 件</span></article>
+              <article><strong>相机识别</strong><span>摄像头可离线读取食材</span></article>
+              <article><strong>重连状态</strong><span>每 10 秒尝试恢复</span></article>
+            </div>
+          </section>
+
+          <nav class="dock" aria-label="屏幕功能栏">
+            <button data-page-target="home" title="首页"><span class="icon home"></span><small>首页</small></button>
+            <button data-page-target="recipe" title="AI 助手"><span class="icon spark"></span><small>AI</small></button>
+            <button class="camera-main" data-page-target="camera" title="拍照登记"><span class="icon camera"></span><small>登记</small></button>
+            <button data-page-target="settings" title="设置"><span class="icon gear"></span><small>设置</small></button>
+            <button data-page-target="more" title="更多"><span class="icon more"></span><small>更多</small></button>
+          </nav>
+
+          <aside class="capture-keyboard" id="captureKeyboard" aria-label="26 键手动输入键盘">
+            <div class="capture-keyboard-head">
+              <strong id="manualKeyboardTitle">手动补充</strong>
+              <span id="keyboardModeLabel">中文拼音</span>
+              <button id="manualCaptureClose" type="button">收起</button>
+            </div>
+            <div class="manual-input-line" id="manualInputLine">请输入位置、数量或备注</div>
+            <div class="capture-keyboard-keys" id="captureKeyboardKeys"></div>
+          </aside>
+
+          <aside class="wifi-modal" id="wifiModal" aria-label="Wi-Fi 密码输入弹窗" aria-hidden="true">
+            <div class="wifi-dialog" role="dialog" aria-modal="true" aria-labelledby="wifiDialogTitle">
+              <div class="wifi-dialog-head">
+                <div>
+                  <span>加入网络</span>
+                  <strong id="wifiDialogTitle">Home_2.4G</strong>
+                </div>
+                <button id="wifiCancel" type="button">取消</button>
+              </div>
+              <label>
+                Wi-Fi 密码
+                <input id="wifiPasswordInput" type="password" placeholder="请输入网络密码" />
+              </label>
+              <p id="wifiDialogStatus">密码仅用于当前原型演示。</p>
+              <button id="wifiConnect" type="button">连接</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <aside class="controls" aria-label="原型控制面板">
+        <h2>演示控制</h2>
+        <button data-page-target="standby">待机状态</button>
+        <button data-page-target="home">检测靠近 / 启动首页</button>
+        <button data-zone="freezer">上层冷冻九宫格</button>
+        <button data-zone="left">左侧冷藏九宫格</button>
+        <button data-zone="door">门架九宫格</button>
+        <button data-page-target="camera">拍照登记</button>
+        <button data-page-target="settings">设置页面</button>
+        <button data-page-target="more">更多页面</button>
+        <button id="demoRun">运行 Demo 流程</button>
+      </aside>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

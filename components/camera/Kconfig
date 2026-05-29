@@ -1,0 +1,27 @@
+menu "Fridge Spirit Camera"
+
+    config FRIDGE_CAMERA_TEST
+        bool "Enable OV3660 camera-only test mode"
+        default n
+        help
+            Enable a camera-only bring-up firmware path. This mode starts NVS,
+            USB protocol, network/time, AI config and the OV3660 camera, while
+            skipping screen, touch, sensors and audio to avoid GPIO conflicts.
+
+    config FRIDGE_CAMERA_XCLK_HZ
+        int "OV3660 XCLK frequency"
+        default 10000000
+        range 5000000 20000000
+        help
+            Initial bring-up clock. Keep this low until wiring, power and PSRAM
+            stability are verified on the real module.
+
+    config FRIDGE_CAMERA_PREVIEW_MAX_BYTES
+        int "Maximum JPEG bytes returned as USB preview"
+        default 65536
+        range 8192 131072
+        help
+            If the captured JPEG exceeds this size, camera_capture returns an
+            error instead of pushing a very large JSON line over Web Serial.
+
+endmenu

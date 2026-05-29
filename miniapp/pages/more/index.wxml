@@ -1,0 +1,25 @@
+<!-- 更多页：2×2 大卡片，对齐 ui-reference 的 .more-grid -->
+<view class="page more-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">更多</view>
+      <view class="title">扩展功能</view>
+    </view>
+  </view>
+
+  <view class="more-grid">
+    <view
+      wx:for="{{entries}}"
+      wx:key="key"
+      class="more-card"
+      data-key="{{item.key}}"
+      bindtap="onTapEntry"
+      hover-class="more-card-hover"
+      hover-stay-time="80"
+    >
+      <view class="more-title">{{item.title}}</view>
+      <view class="more-hint">{{item.hint}}</view>
+      <view wx:if="{{item.badge}}" class="more-badge">{{item.badge}}</view>
+    </view>
+  </view>
+</view>

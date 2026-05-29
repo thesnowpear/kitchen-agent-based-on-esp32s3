@@ -1,0 +1,2 @@
+/* reminders 页样式全部走 app.wxss 通用原子 */
+.reminder-card { padding: var(--space-5) var(--space-6); }

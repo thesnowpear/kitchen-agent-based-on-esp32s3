@@ -1,0 +1,16 @@
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+pydantic>=2.10,<3.0
+pydantic-settings>=2.7,<3.0
+SQLAlchemy>=2.0,<3.0
+asyncpg>=0.30,<1.0
+httpx>=0.28,<1.0
+python-dotenv>=1.0,<2.0
+# 紧凑 HS256 JWT 签发/验签；本期仅用于开发期 token，不引入额外依赖。
+python-jose[cryptography]>=3.3,<4.0
+# multipart 上传：/inventory/scan 需要接受小程序拍照传来的图片文件。
+python-multipart>=0.0.9,<1.0
+# 图像压缩与格式归一化：上传前压到长边 ≤ 1024，避免视觉模型超时与流量浪费。
+pillow>=10.4,<12.0
+# 异步 MQTT 客户端：替换 mqtt_gateway.py 占位实现，与 EMQX 真实连接。
+gmqtt>=0.7,<1.0

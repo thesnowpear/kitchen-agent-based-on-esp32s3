@@ -43,7 +43,13 @@ export abstract class BaseTransport implements DeviceTransport {
   }
 
   protected emitMessage(message: DeviceMessage) {
-    this.messageHandlers.forEach((handler) => handler(message));
+    for (const handler of this.messageHandlers) {
+      try {
+        handler(message);
+      } catch (error) {
+        this.emitLog("warn", `消息处理器异常：${error instanceof Error ? error.message : String(error)}`, "transport");
+      }
+    }
     if (message.type === "event" && message.event === "log") {
       const payload = message.payload as DeviceEvent["payload"] & {
         level?: LogLevel;

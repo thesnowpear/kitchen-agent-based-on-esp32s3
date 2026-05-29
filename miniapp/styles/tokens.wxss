@@ -1,0 +1,86 @@
+/*
+ * miniapp 全局 design tokens —— 由 ui-reference/WLW/styles.css 提炼，
+ * 配合 frontend-design skill 的指导原则（避免 generic AI 风格 / 强主题色 / 中文优先字体）。
+ *
+ * 用法：所有页面 wxss 顶部 `@import "/styles/tokens.wxss";` 后用变量。
+ *
+ * 主题色板（"paper" 默认主题）：
+ * - 主背景采用米白 + 暖黄径向 + 米绿线性双层渐变，避免大面积纯色"医用白"；
+ * - 卡片底色 cream/paper-soft；
+ * - sage 系作主色（沉稳的草绿，对应"冰箱保鲜"语义）；
+ * - tomato（番茄红）= 临期/警示；yolk（蛋黄）= 强调点 / "AI 推荐"高亮；
+ * - mint（薄荷绿）= 冷藏区柔和底色。
+ *
+ * 信息层级：
+ * - text-ink   主文字色（接近黑）
+ * - text-muted 次文字色 / 标签
+ * - text-soft  时间戳 / 说明文字
+ *
+ * 圆角 / 阴影：
+ * - 卡片 24-32rpx；按钮 16rpx；徽标 999rpx 胶囊；
+ * - shadow-card 暖灰阴影模拟纸质感。
+ */
+
+page {
+  /* 颜色 */
+  --color-paper: #fffdf8;
+  --color-paper-soft: #fff5e5;
+  --color-cream: #fff5e5;
+  --color-mint: #dcefdc;
+  --color-sage: #5f8f72;
+  --color-sage-dark: #2f6047;
+  --color-sage-soft: rgba(95, 143, 114, 0.12);
+  --color-tomato: #d95745;
+  --color-tomato-soft: #ffe5df;
+  --color-yolk: #f6bf4f;
+  --color-yolk-soft: #fff1d0;
+  --color-ink: #24342d;
+  --color-text-muted: #758078;
+  --color-text-soft: #9aa6a0;
+  --color-line: rgba(47, 96, 71, 0.18);
+  --color-line-strong: rgba(47, 96, 71, 0.32);
+
+  /* zone 配色：与 ui-reference 的四区一致 */
+  --zone-freezer: #c8e0ee;   /* 冷冻：偏冷蓝 */
+  --zone-freezer-ink: #2c5f7d;
+  --zone-left: #dcefdc;       /* 左冷藏：薄荷 */
+  --zone-left-ink: #2f6047;
+  --zone-right: #ffe5d6;      /* 右冷藏：暖橙 */
+  --zone-right-ink: #b16438;
+  --zone-door: #f5e1c4;       /* 门架：奶咖 */
+  --zone-door-ink: #886233;
+
+  /* 圆角 */
+  --radius-xs: 8rpx;
+  --radius-sm: 16rpx;
+  --radius-md: 24rpx;
+  --radius-lg: 32rpx;
+  --radius-pill: 999rpx;
+
+  /* 间距 */
+  --space-2: 8rpx;
+  --space-3: 12rpx;
+  --space-4: 16rpx;
+  --space-5: 20rpx;
+  --space-6: 24rpx;
+  --space-8: 32rpx;
+  --space-10: 40rpx;
+  --space-12: 48rpx;
+
+  /* 字号 */
+  --text-xs: 22rpx;
+  --text-sm: 26rpx;
+  --text-base: 28rpx;
+  --text-md: 32rpx;
+  --text-lg: 38rpx;
+  --text-xl: 48rpx;
+  --text-2xl: 60rpx;
+
+  /* 阴影：暖灰，模拟纸面 */
+  --shadow-card: 0 12rpx 36rpx rgba(74, 86, 66, 0.12);
+  --shadow-lift: 0 18rpx 56rpx rgba(74, 86, 66, 0.18);
+
+  /* 字体栈：中文优先，避免 frontend-design skill 警告的 generic "Inter/Roboto" */
+  --font-stack: "PingFang SC", "Microsoft YaHei", "Noto Sans SC",
+    system-ui, -apple-system, "Segoe UI", sans-serif;
+}

@@ -1,0 +1,110 @@
+/* ai-chat 页：聊天气泡 + 底部 composer。
+ * composer 固定在自定义 dock 上方，避免与底部导航重叠。 */
+
+.chat-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-bottom: 430rpx;
+  box-sizing: border-box;
+}
+
+.chat-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) 0 var(--space-5);
+}
+
+.msg-row {
+  display: flex;
+  margin-bottom: var(--space-3);
+}
+.msg-row.me { justify-content: flex-end; }
+.msg-row.ai { justify-content: flex-start; }
+
+.msg-bubble {
+  max-width: 78%;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 253, 248, 0.92);
+  border: 1rpx solid var(--color-line);
+  color: var(--color-ink);
+  box-shadow: var(--shadow-card);
+}
+
+/* 设备本地 AI：薄荷渐变 + sage 描边，象征"在冰箱贴里跑" */
+.msg-bubble.device {
+  background: linear-gradient(180deg, var(--color-mint), var(--color-paper-soft));
+  border-color: rgba(95, 143, 114, 0.4);
+}
+/* 云端降级：暖黄渐变 + yolk 描边，象征"通过云端" */
+.msg-bubble.cloud {
+  background: linear-gradient(180deg, var(--color-yolk-soft), var(--color-paper-soft));
+  border-color: rgba(246, 191, 79, 0.5);
+}
+.msg-bubble.me {
+  background: var(--color-sage-dark);
+  color: var(--color-paper);
+  border-color: transparent;
+  box-shadow: 0 10rpx 22rpx rgba(47, 96, 71, 0.22);
+}
+
+.msg-content {
+  font-size: var(--text-base);
+  line-height: 1.55;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.msg-source {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+  border-top: 1rpx dashed var(--color-line);
+  padding-top: var(--space-2);
+}
+
+/* composer：白底 + 圆角描边胶囊；输入框去掉自身描边并用透明底，与外壳合一 */
+.composer {
+  position: fixed;
+  left: 38rpx;
+  right: 38rpx;
+  bottom: calc(162rpx + env(safe-area-inset-bottom));
+  z-index: 45;
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+  min-height: 96rpx;
+  padding: 10rpx 12rpx 10rpx 24rpx;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 253, 248, 0.96);
+  border: 1rpx solid var(--color-line);
+  box-shadow: var(--shadow-card);
+  box-sizing: border-box;
+}
+.composer .input {
+  flex: 1;
+  min-width: 0;
+  height: 72rpx;
+  line-height: 72rpx;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--color-ink);
+  font-size: var(--text-sm);
+  box-sizing: border-box;
+}
+.composer .btn {
+  flex: 0 0 176rpx;
+  width: 176rpx;
+  height: 72rpx;
+  line-height: 72rpx;
+  margin: 0;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  box-sizing: border-box;
+}

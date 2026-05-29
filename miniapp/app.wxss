@@ -1,0 +1,257 @@
+/*
+ * 全局 wxss：先 import design tokens（变量都暴露在 page 选择器上，子页面继承），
+ * 再定义跨页通用的"骨架"、"卡片"、"胶囊按钮"、"空态"、"标签"等基础原子。
+ *
+ * 设计原则（来自 frontend-design skill 内化）：
+ * - 不用纯白底，统一走米黄径向渐变 + 米绿线性渐变，避免"AI 医用白"；
+ * - 中文优先字体，行高 1.5，便于扫读；
+ * - 按钮主色用 sage（沉稳深绿）而非默认的祖母绿/科技蓝；
+ * - 警示色用 tomato（番茄红），强调色用 yolk（蛋黄黄），与"冰箱/食物"语义贴合。
+ */
+
+@import "/styles/tokens.wxss";
+
+page {
+  min-height: 100%;
+  background-color: var(--color-paper);
+  background-image:
+    radial-gradient(circle at 14% 14%, rgba(246, 191, 79, 0.18), transparent 26%),
+    linear-gradient(135deg, #f7eadc 0%, #dcebdc 100%);
+  color: var(--color-ink);
+  font-family: var(--font-stack);
+  font-size: var(--text-base);
+  line-height: 1.55;
+}
+
+/* 通用页面包裹：每页最外层 <view class="page"> */
+.page {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: var(--space-8) var(--space-6) var(--space-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+/* 入场轻动效：translateY(10rpx) → 0 / 180ms ease，沿用 ui-reference 的"rise" */
+.page > .rise,
+.rise {
+  animation: rise 180ms ease both;
+}
+@keyframes rise {
+  from { transform: translateY(10rpx); opacity: 0.0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* 标题层级 */
+.kicker {
+  margin: 0;
+  color: var(--color-sage-dark);
+  font-size: var(--text-xs);
+  letter-spacing: 2rpx;
+  text-transform: uppercase;
+}
+
+.title {
+  margin: 0 0 var(--space-3);
+  color: var(--color-ink);
+  font-size: var(--text-lg);
+  font-weight: 700;
+  letter-spacing: 0.5rpx;
+}
+
+.subtitle {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.soft {
+  color: var(--color-text-soft);
+}
+
+/* 卡片：米色纸感 + 1rpx sage 描边 + 暖灰阴影 */
+.panel {
+  position: relative;
+  padding: var(--space-6) var(--space-6);
+  background:
+    linear-gradient(180deg, rgba(255, 253, 248, 0.96), rgba(255, 245, 229, 0.94));
+  border: 1rpx solid var(--color-line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+.panel + .panel {
+  margin-top: var(--space-5);
+}
+
+/* 行排版 */
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+/* 顶部"标题 + 操作"行：所有非首页页面统一用 .hello-bar
+ * 与 ui-reference 的 .home-head / .zone-top 同构：flex, align-start, gap, 左侧 col(kicker+title) 右侧动作。 */
+.hello-bar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-2);
+}
+.hello-bar .col {
+  gap: var(--space-2);
+  flex: 1;
+}
+.hello-bar .title {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 800;
+  letter-spacing: -0.5rpx;
+}
+
+/* 标签 / 徽标：胶囊 */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 6rpx 18rpx;
+  border-radius: var(--radius-pill);
+  background: var(--color-sage-soft);
+  color: var(--color-sage-dark);
+  font-size: var(--text-xs);
+  letter-spacing: 0.5rpx;
+}
+.tag.warn { background: var(--color-yolk-soft); color: #946100; }
+.tag.danger { background: var(--color-tomato-soft); color: var(--color-tomato); }
+.tag.mint { background: var(--color-mint); color: var(--color-sage-dark); }
+
+/* 按钮：默认 sage 主色，secondary / ghost 配套 */
+.btn {
+  margin: 0;
+  padding: 0 var(--space-8);
+  height: 84rpx;
+  line-height: 84rpx;
+  border-radius: var(--radius-md);
+  background: var(--color-sage-dark);
+  color: #ffffff;
+  font-size: var(--text-base);
+  letter-spacing: 1rpx;
+  border: none;
+}
+.btn::after { border: none; }
+.btn.secondary {
+  background: var(--color-sage-soft);
+  color: var(--color-sage-dark);
+}
+.btn.ghost {
+  background: transparent;
+  color: var(--color-sage-dark);
+  border: 2rpx solid var(--color-line-strong);
+}
+.btn.danger {
+  background: var(--color-tomato);
+  color: #ffffff;
+}
+.btn[disabled] {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+/* 胶囊小按钮（首页 zone 卡片上方常用） */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 8rpx 22rpx;
+  height: 56rpx;
+  border-radius: var(--radius-pill);
+  background: var(--color-paper-soft);
+  color: var(--color-sage-dark);
+  font-size: var(--text-xs);
+  border: 1rpx solid var(--color-line);
+}
+.pill::after { border: none; }
+
+/* 输入框 */
+.input {
+  box-sizing: border-box;
+  width: 100%;
+  height: 88rpx;
+  padding: 0 var(--space-6);
+  border: 1rpx solid var(--color-line);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.7);
+  font-size: var(--text-base);
+}
+
+/* 列表容器 */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* 空态 */
+.empty {
+  padding: var(--space-12) var(--space-6);
+  color: var(--color-text-muted);
+  text-align: center;
+  font-size: var(--text-sm);
+}
+
+/* 骨架占位 */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--color-sage-soft);
+  border-radius: var(--radius-sm);
+  min-height: 64rpx;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.5) 50%,
+    transparent 100%);
+  animation: shimmer 1400ms ease-in-out infinite;
+}
+@keyframes shimmer {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
+/* AI 悬浮按钮：home 页右下角进入 ai-chat */
+.ai-fab {
+  position: fixed;
+  right: var(--space-6);
+  bottom: 160rpx;
+  width: 112rpx;
+  height: 112rpx;
+  border-radius: var(--radius-pill);
+  background: var(--color-sage-dark);
+  color: var(--color-paper);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 1rpx;
+  box-shadow: var(--shadow-lift);
+  z-index: 10;
+}
+.ai-fab::after { border: none; }

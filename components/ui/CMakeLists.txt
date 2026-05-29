@@ -1,0 +1,27 @@
+idf_component_register(
+    SRCS
+        "fridge_ui_task.c"
+        "fridge_ui_model.c"
+        "fridge_ui_theme.c"
+        "fonts/fridge_font_cn_16.c"
+        "fonts/fridge_font_cn_24.c"
+        "fonts/fridge_font_cn_32.c"
+        "pages/page_standby.c"
+        "pages/page_home.c"
+        "pages/page_zone.c"
+        "pages/page_edit_food.c"
+        "pages/page_door.c"
+        "pages/page_camera.c"
+        "pages/page_camera_result.c"
+        "pages/page_recipe.c"
+        "pages/page_shopping.c"
+        "pages/page_settings.c"
+        "pages/page_wifi.c"
+        "pages/page_more.c"
+        "pages/page_offline.c"
+        "widgets/status_bar.c"
+        "widgets/dock.c"
+        "widgets/keyboard.c"
+    INCLUDE_DIRS "include"
+    REQUIRES display touch sensors radar network storage audio asr freertos heap log nvs_flash cjson lvgl
+)

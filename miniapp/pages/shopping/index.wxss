@@ -1,0 +1,175 @@
+/* 购物清单：左 checkbox + 主体 + 数量；已勾选行整体褪色 + 划线 */
+
+.shopping-page {
+  padding-bottom: 220rpx;  /* 给自定义 tabBar 让位：dock 144 + margin 16 + 抬起 56 */
+}
+
+.toolbar {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.toolbar .btn {
+  height: 72rpx;
+  line-height: 72rpx;
+  padding: 0;
+  font-size: var(--text-sm);
+}
+
+.danger-text {
+  color: var(--color-tomato) !important;
+}
+
+.filter-tabs {
+  white-space: nowrap;
+  margin-top: var(--space-1);
+}
+
+.filter-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 56rpx;
+  padding: 0 24rpx;
+  margin-right: var(--space-3);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.62);
+  border: 1rpx solid var(--color-line);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+}
+
+.filter-tab.active {
+  background: var(--color-sage-dark);
+  color: #fff;
+  border-color: transparent;
+}
+
+.shop-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.shop-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6);
+  border-radius: var(--radius-lg);
+  background: rgba(255, 253, 248, 0.92);
+  border: 1rpx solid var(--color-line);
+  box-shadow: var(--shadow-card);
+}
+
+.shop-row.done {
+  opacity: 0.55;
+  background: rgba(234, 245, 223, 0.6);
+}
+
+.shop-row.ai { border-left: 6rpx solid var(--color-yolk); }
+.shop-row.expire { border-left: 6rpx solid var(--color-tomato); }
+.shop-row.manual { border-left: 6rpx solid var(--color-sage-dark); }
+.shop-row.recipe { border-left: 6rpx solid #8e72d8; }
+
+.shop-check {
+  width: 40rpx;
+  height: 40rpx;
+  border-radius: 50%;
+  border: 3rpx solid var(--color-line-strong);
+  flex-shrink: 0;
+  position: relative;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.shop-check.on {
+  background: var(--color-sage-dark);
+  border-color: var(--color-sage-dark);
+}
+
+.shop-check.on::after {
+  content: "";
+  position: absolute;
+  left: 11rpx;
+  top: 5rpx;
+  width: 12rpx;
+  height: 20rpx;
+  border-right: 4rpx solid #fff;
+  border-bottom: 4rpx solid #fff;
+  transform: rotate(45deg);
+}
+
+.shop-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+  min-width: 0;
+}
+
+.shop-name {
+  font-size: var(--text-md);
+  font-weight: 800;
+  color: var(--color-ink);
+  letter-spacing: -0.2rpx;
+}
+
+.shop-row.done .shop-name {
+  text-decoration: line-through;
+  color: var(--color-text-soft);
+}
+
+.shop-sub {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.shop-qty {
+  font-size: var(--text-sm);
+  color: var(--color-sage-dark);
+  font-weight: 800;
+  letter-spacing: 0.5rpx;
+}
+
+.sheet-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(36, 52, 45, 0.38);
+}
+
+.edit-sheet {
+  box-sizing: border-box;
+  width: 100%;
+  padding: var(--space-5) var(--space-6) calc(var(--space-8) + env(safe-area-inset-bottom));
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-lg);
+  background: var(--color-paper);
+  box-shadow: 0 -16rpx 42rpx rgba(74, 86, 66, 0.2);
+}
+
+.sheet-handle {
+  width: 96rpx;
+  height: 8rpx;
+  margin: 0 auto var(--space-5);
+  border-radius: var(--radius-pill);
+  background: var(--color-line);
+}
+
+.field-block {
+  margin-top: var(--space-4);
+}
+
+.field-label {
+  margin-bottom: var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+}
+
+.sheet-actions {
+  gap: var(--space-3);
+  margin-top: var(--space-6);
+}

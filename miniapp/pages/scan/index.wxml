@@ -1,0 +1,55 @@
+<view class="page scan-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">{{hintZone ? '区域：' + hintZone : '拍照入库'}}</view>
+      <view class="title">食材识别</view>
+    </view>
+  </view>
+
+  <view class="panel">
+    <view class="kicker">第一步</view>
+    <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">选一张食材图</view>
+    <view class="subtitle">拍冰箱内景或单个食材均可，模型会识别名称、数量并推荐位置。上传后图片仅用于识别，不会留存原图。</view>
+    <button class="btn" style="margin-top: var(--space-5);" loading="{{uploading}}" bindtap="onChooseImage">{{uploading ? '识别中…' : '拍照或选图'}}</button>
+    <button class="btn ghost" style="margin-top: var(--space-3);" bindtap="onManualCreate">手动登记</button>
+    <view wx:if="{{progressText}}" class="soft" style="margin-top: var(--space-3); text-align: center;">{{progressText}}</view>
+    <view wx:if="{{errorText}}" class="subtitle" style="color: var(--color-tomato); margin-top: var(--space-3);">{{errorText}}</view>
+  </view>
+
+  <view wx:if="{{candidates.length > 0}}" class="kicker" style="margin-top: var(--space-3);">识别候选 · 模型：{{modelUsed}}</view>
+
+  <view wx:if="{{candidates.length > 0}}" class="list">
+    <view wx:for="{{candidates}}" wx:key="viewId" wx:for-index="idx" class="panel candidate-card">
+      <view class="row">
+        <view class="col">
+          <view class="title" style="font-size: var(--text-md); margin: 0;">{{item.name}}</view>
+          <view class="subtitle">{{item.category || '未分类'}} · {{item.quantity}}{{item.unit}}</view>
+        </view>
+        <view class="tag {{item.confidenceClass}}">置信 {{item.confidence}}%</view>
+      </view>
+      <view class="subtitle" style="margin-top: var(--space-3);">
+        建议位置：
+        <text wx:if="{{item.suggestedZone}}">{{item.suggestedZone}}{{item.suggestedSlot ? ' · ' + item.suggestedSlot : ''}}</text>
+        <text wx:else style="color: var(--color-tomato);">无可用位置</text>
+      </view>
+      <view wx:if="{{item.suggestedReason}}" class="soft" style="margin-top: var(--space-2);">{{item.suggestedReason}}</view>
+      <view wx:if="{{item.note}}" class="soft" style="margin-top: var(--space-2);">{{item.note}}</view>
+      <view class="row" style="margin-top: var(--space-4); gap: var(--space-3);">
+        <button class="btn ghost" style="flex: 1;" data-index="{{idx}}" loading="{{item.busy}}" bindtap="onEditCandidate">先编辑再入库</button>
+        <button class="btn secondary" wx:if="{{!item.saved}}" style="flex: 1;" data-index="{{idx}}" loading="{{item.busy}}" bindtap="onConfirmCandidate">直接入库</button>
+        <button class="btn" wx:else disabled style="flex: 1;">已入库</button>
+      </view>
+    </view>
+  </view>
+
+  <view wx:if="{{candidates.length > 0}}" class="row" style="margin-top: var(--space-6);">
+    <button class="btn ghost" style="flex: 1;" bindtap="onChooseImage">继续拍一张</button>
+    <button class="btn secondary" style="flex: 1;" loading="{{confirmingAll}}" bindtap="onConfirmAll">全部入库</button>
+    <button class="btn" style="flex: 1;" bindtap="onTapDone">完成</button>
+  </view>
+
+  <view wx:if="{{rawText}}" class="panel" style="margin-top: var(--space-6);">
+    <view class="kicker">调试：模型原始输出（前 200 字）</view>
+    <view class="soft" style="margin-top: var(--space-2); word-break: break-all;">{{rawText}}</view>
+  </view>
+</view>

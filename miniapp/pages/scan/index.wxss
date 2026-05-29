@@ -1,0 +1,6 @@
+/* scan 是 tabBar 页，需要给 fixed dock 和中间抬起按钮留足滚动安全区。 */
+.scan-page {
+  padding-bottom: 310rpx;
+}
+
+.candidate-card { padding: var(--space-5) var(--space-6); }

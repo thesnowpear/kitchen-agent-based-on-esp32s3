@@ -1,0 +1,54 @@
+<view class="page inventory-page rise">
+  <view class="hello-bar">
+    <view class="col">
+      <view class="kicker">分区库存</view>
+      <view class="title">食材清单</view>
+    </view>
+    <view class="row" style="gap: var(--space-3);">
+      <view class="pill" bindtap="onTapRefreshDevice">↻ 刷新冰箱</view>
+      <view class="pill" bindtap="onTapScan">+ 拍照入库</view>
+    </view>
+  </view>
+
+  <scroll-view class="zone-tabs" scroll-x="true" enhanced="true" show-scrollbar="false">
+    <view wx:for="{{zones}}" wx:key="key" class="tab {{activeZone === item.key ? 'active' : ''}}" data-zone="{{item.key}}" bindtap="onTapTab">
+      {{item.label}}
+    </view>
+  </scroll-view>
+
+  <view wx:if="{{errorText}}" class="panel" style="border-color: var(--color-tomato-soft);">
+    <view class="kicker" style="color: var(--color-tomato);">加载失败</view>
+    <view class="subtitle">{{errorText}}</view>
+    <button class="btn ghost" style="margin-top: var(--space-3);" bindtap="load">重试</button>
+  </view>
+
+  <view wx:if="{{showAsGrid && !errorText}}" class="grid-board">
+    <view wx:for="{{cells}}" wx:key="slot" class="cell {{item.occupied ? 'occupied' : 'empty'}} {{item.level || ''}}" data-slot="{{item.slot}}" bindtap="onTapCell">
+      <view class="cell-slot">{{item.slot}}</view>
+      <block wx:if="{{item.occupied}}">
+        <view class="cell-name">{{item.item.name}}</view>
+        <view class="cell-meta">{{item.item.quantity}}{{item.item.unit}}</view>
+        <view wx:if="{{item.expireText}}" class="cell-expire">{{item.expireText}}</view>
+      </block>
+      <block wx:else>
+        <view class="cell-plus">+</view>
+      </block>
+    </view>
+  </view>
+
+  <view wx:if="{{showAsGrid && listView.length > 0}}" class="kicker" style="margin-top: var(--space-3);">待归位</view>
+  <view wx:if="{{!showAsGrid || listView.length > 0}}" class="list">
+    <view wx:for="{{listView}}" wx:key="id" class="panel item-card" data-id="{{item.id}}" bindtap="onTapItem">
+      <view class="row">
+        <view class="col">
+          <view class="title" style="font-size: var(--text-md); margin: 0;">{{item.name}}</view>
+          <view class="subtitle">{{item.category || '未分类'}} · {{item.quantity}}{{item.unit}}</view>
+        </view>
+        <view wx:if="{{item.expireDate}}" class="tag warn">{{item.expireDate}}</view>
+      </view>
+      <view class="soft" style="margin-top: var(--space-2);">{{item.locationText}}</view>
+    </view>
+  </view>
+
+  <view wx:if="{{!loading && !errorText && items.length === 0}}" class="empty">还没有库存数据，去 +拍照入库 添加一条吧</view>
+</view>
