@@ -187,6 +187,31 @@ export interface AiChatResponseData {
   fallbackReason?: string;
   modelUsed?: string;
   deviceSn?: string;
+  sessionId?: string;
+}
+
+/** /ai/history 响应里的单条历史消息。 */
+export interface AiChatHistoryMessage {
+  id: string;
+  role: "user" | "assistant" | string;
+  content: string;
+  source?: "device" | "cloud_fallback" | "miniapp" | string;
+  fallbackReason?: string;
+  modelUsed?: string;
+  deviceSn?: string;
+  sentAt: string;
+}
+
+/** /ai/history 响应。 */
+export interface AiChatHistoryData {
+  sessionId: string;
+  messages: AiChatHistoryMessage[];
+}
+
+/** DELETE /ai/history 响应。 */
+export interface AiChatHistoryClearData {
+  sessionId: string;
+  deletedCount: number;
 }
 
 /** /ai/config GET 响应（backend `AiConfigData`，不含明文 apiKey）。 */
@@ -349,6 +374,114 @@ export interface FridgeZoneConfig {
   width?: number;
   /** 首页编辑态使用：自定义空间在下方网格中占几行。 */
   height?: number;
+}
+
+/** /fridge/zones 响应。 */
+export interface FridgeZoneListData {
+  zones: FridgeZoneConfig[];
+  configUpdatedAt?: string;
+  source: string;
+}
+
+/** PUT /fridge/zones 请求。 */
+export interface FridgeZoneUpdateRequest {
+  zones: FridgeZoneConfig[];
+}
+
+/** 同步事件域。 */
+export type SyncDomain =
+  | "inventory"
+  | "fridge_zones"
+  | "ai_config"
+  | "settings"
+  | "reminder"
+  | "shopping_list"
+  | "recipe_cache"
+  | "ai_history"
+  | string;
+
+/** 本地或服务端同步事件。 */
+export interface SyncEvent {
+  id?: string;
+  clientEventId: string;
+  domain: SyncDomain;
+  op: string;
+  source: "miniapp" | "device" | "server" | string;
+  serverRevision?: number;
+  clientRevision?: number;
+  deviceSn?: string;
+  payload: Record<string, unknown>;
+  createdAt?: string;
+}
+
+/** POST /sync/push 请求。 */
+export interface SyncPushRequest {
+  events: SyncEvent[];
+}
+
+/** POST /sync/push 响应。 */
+export interface SyncPushData {
+  serverRevision: number;
+  accepted: number;
+  duplicates: number;
+  events: SyncEvent[];
+}
+
+/** POST /sync/device-push 请求。 */
+export interface SyncDevicePushRequest {
+  domains?: string[];
+  requestDeviceInventory?: boolean;
+  acceptCleanDeviceSnapshot?: boolean;
+  pushCloudSnapshot?: boolean;
+}
+
+/** POST /sync/device-push 响应。 */
+export interface SyncDevicePushData {
+  deviceCount: number;
+  commandCount: number;
+  queuedCount: number;
+  domains: string[];
+  errors: string[];
+}
+
+/** GET /sync/status 响应。 */
+export interface SyncStatusData {
+  serverRevision: number;
+  lastSyncedAt?: string;
+  deviceRevision?: number;
+  pendingEvents: number;
+  domains: Record<string, number>;
+}
+
+/** 云端完整备份快照。 */
+export interface SyncSnapshotData {
+  serverRevision: number;
+  generatedAt: string;
+  inventory: InventoryItem[];
+  fridgeZones: FridgeZoneConfig[];
+  aiConfig?: AiConfigData;
+  reminders: ReminderItem[];
+  shoppingList: { items: Record<string, unknown>[]; updatedAt?: string };
+  recipeCache: { items: Record<string, unknown>[]; updatedAt?: string };
+  settings?: Record<string, unknown>;
+  aiHistory?: { sessionId: string; messages: Record<string, unknown>[] };
+}
+
+/** GET /sync/pull 响应。 */
+export interface SyncPullData {
+  serverRevision: number;
+  events: SyncEvent[];
+  snapshot?: SyncSnapshotData;
+}
+
+/** 小程序本地同步状态。 */
+export interface LocalSyncState {
+  serverRevision: number;
+  lastPulledAt?: number;
+  lastPushedAt?: number;
+  initialDevicePulledAt?: number;
+  lastSyncError?: string;
+  dirtyDomains: SyncDomain[];
 }
 
 /** 微信订阅/通知登记请求。 */

@@ -27,6 +27,8 @@ Component({
   data: {
     /** 当前选中索引；外部通过 setData 同步 */
     selected: 0,
+    /** 页面级抽屉打开时隐藏 dock，避免微信自定义 tabBar 压住页面弹层。 */
+    hidden: false,
     /** 5 个 tab 按钮的元数据；顺序 = 索引 */
     buttons: [
       { pagePath: "/pages/home/index",     text: "首页",   iconClass: "icon-home" },

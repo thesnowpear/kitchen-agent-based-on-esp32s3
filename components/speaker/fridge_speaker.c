@@ -4,9 +4,12 @@
 #include "fridge_speaker.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "cJSON.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
@@ -33,6 +36,9 @@
 #define TTS_NVS_KEY_VOICE "voice"
 #define TTS_NVS_KEY_API_KEY "api_key"
 #define TTS_NVS_KEY_TIMEOUT "timeout_ms"
+#define TTS_NVS_KEY_UPDATED_MS "updated_ms"
+#define TTS_NVS_KEY_VOLUME "volume"
+#define TTS_NVS_KEY_ENABLED "enabled"
 
 static const char *TAG = "fridge_speaker";
 
@@ -56,6 +62,10 @@ static fridge_speaker_state_t s_state = FRIDGE_SPEAKER_STATE_IDLE;
 static char s_model[FRIDGE_TTS_MAX_MODEL_LEN + 1];
 static char s_voice[FRIDGE_TTS_MAX_VOICE_LEN + 1];
 static char s_error[FRIDGE_TTS_MAX_ERROR_LEN + 1];
+static uint8_t s_volume = FRIDGE_SPEAKER_DEFAULT_VOLUME;
+static bool s_volume_loaded;
+static bool s_tts_enabled = true;
+static bool s_tts_enabled_loaded;
 static bool s_initialized;
 static bool s_i2s_enabled;
 static volatile bool s_stop_requested;
@@ -95,6 +105,33 @@ static uint32_t clamp_timeout_ms(uint32_t timeout_ms)
         return 90000;
     }
     return timeout_ms;
+}
+
+static int64_t tts_config_now_ms(void)
+{
+    time_t now = time(NULL);
+    if (now >= 1735689600LL) {
+        return (int64_t)now * 1000;
+    }
+    return esp_timer_get_time() / 1000;
+}
+
+static int64_t load_tts_updated_ms(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(TTS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return 0;
+    }
+    int64_t updated_ms = 0;
+    (void)nvs_get_i64(handle, TTS_NVS_KEY_UPDATED_MS, &updated_ms);
+    nvs_close(handle);
+    return updated_ms > 0 ? updated_ms : 0;
+}
+
+static uint8_t clamp_volume(uint8_t percent)
+{
+    return percent > 100 ? 100 : percent;
 }
 
 static void set_state(fridge_speaker_state_t state, const char *error)
@@ -141,8 +178,76 @@ static esp_err_t load_tts_config(fridge_tts_config_update_t *config)
     if (nvs_get_u32(handle, TTS_NVS_KEY_TIMEOUT, &timeout_ms) == ESP_OK) {
         config->timeout_ms = clamp_timeout_ms(timeout_ms);
     }
+    int64_t updated_ms = 0;
+    if (nvs_get_i64(handle, TTS_NVS_KEY_UPDATED_MS, &updated_ms) == ESP_OK && updated_ms > 0) {
+        config->config_updated_at_ms = updated_ms;
+    }
     nvs_close(handle);
     return ESP_OK;
+}
+
+static uint8_t load_saved_volume(void)
+{
+    uint8_t volume = FRIDGE_SPEAKER_DEFAULT_VOLUME;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(TTS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        (void)nvs_get_u8(handle, TTS_NVS_KEY_VOLUME, &volume);
+        nvs_close(handle);
+    }
+    return clamp_volume(volume);
+}
+
+static esp_err_t save_volume(uint8_t volume)
+{
+    nvs_handle_t handle;
+    ESP_RETURN_ON_ERROR(nvs_open(TTS_NVS_NAMESPACE, NVS_READWRITE, &handle), TAG, "open TTS volume NVS failed");
+    esp_err_t err = nvs_set_u8(handle, TTS_NVS_KEY_VOLUME, clamp_volume(volume));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static bool load_saved_tts_enabled(void)
+{
+    uint8_t enabled = 1;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(TTS_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        (void)nvs_get_u8(handle, TTS_NVS_KEY_ENABLED, &enabled);
+        nvs_close(handle);
+    }
+    return enabled != 0;
+}
+
+static esp_err_t save_tts_enabled(bool enabled)
+{
+    nvs_handle_t handle;
+    ESP_RETURN_ON_ERROR(nvs_open(TTS_NVS_NAMESPACE, NVS_READWRITE, &handle), TAG, "open TTS enable NVS failed");
+    esp_err_t err = nvs_set_u8(handle, TTS_NVS_KEY_ENABLED, enabled ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static void scale_pcm16(uint8_t *data, size_t len, uint8_t volume)
+{
+    // MAX98357 没有数字音量寄存器，这里在 I2S 写入前按百分比缩放 16-bit PCM。
+    int16_t *samples = (int16_t *)data;
+    size_t count = len / sizeof(int16_t);
+    for (size_t i = 0; i < count; i++) {
+        int32_t scaled = ((int32_t)samples[i] * (int32_t)volume) / 100;
+        if (scaled > INT16_MAX) {
+            scaled = INT16_MAX;
+        } else if (scaled < INT16_MIN) {
+            scaled = INT16_MIN;
+        }
+        samples[i] = (int16_t)scaled;
+    }
 }
 
 static esp_err_t speaker_http_event_handler(esp_http_client_event_t *event)
@@ -258,11 +363,13 @@ static void play_task(void *arg)
 {
     (void)arg;
     size_t offset = 0;
+    uint8_t chunk_buf[2048];
     while (true) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         bool stop = s_stop_requested;
         uint8_t *audio = s_audio;
         size_t total = s_audio_bytes;
+        uint8_t volume = s_volume;
         xSemaphoreGive(s_lock);
         if (stop || offset >= total || !audio) {
             break;
@@ -271,8 +378,10 @@ static void play_task(void *arg)
         if (chunk > 2048) {
             chunk = 2048;
         }
+        memcpy(chunk_buf, audio + offset, chunk);
+        scale_pcm16(chunk_buf, chunk, volume);
         size_t written = 0;
-        esp_err_t err = i2s_channel_write(s_tx_chan, audio + offset, chunk, &written, pdMS_TO_TICKS(500));
+        esp_err_t err = i2s_channel_write(s_tx_chan, chunk_buf, chunk, &written, pdMS_TO_TICKS(500));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "i2s speaker write failed: %s", esp_err_to_name(err));
             set_state(FRIDGE_SPEAKER_STATE_ERROR, "i2s speaker write failed");
@@ -338,9 +447,18 @@ esp_err_t fridge_speaker_init(void)
     std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     err = i2s_channel_init_std_mode(s_tx_chan, &std_cfg);
     ESP_RETURN_ON_ERROR(err, TAG, "speaker i2s std init failed");
+    s_volume = load_saved_volume();
+    s_volume_loaded = true;
+    s_tts_enabled = load_saved_tts_enabled();
+    s_tts_enabled_loaded = true;
     s_initialized = true;
-    ESP_LOGI(TAG, "MAX98357 test output ready: BCLK=GPIO%d LRC=GPIO%d DIN=GPIO%d sample_rate=%d; BCLK/WS share the INMP441 clock wiring",
-             SPEAKER_BCLK_GPIO, SPEAKER_WS_GPIO, SPEAKER_DOUT_GPIO, FRIDGE_TTS_SAMPLE_RATE);
+    ESP_LOGI(TAG, "MAX98357 test output ready: BCLK=GPIO%d LRC=GPIO%d DIN=GPIO%d sample_rate=%d volume=%u%% tts=%s; BCLK/WS share the INMP441 clock wiring",
+             SPEAKER_BCLK_GPIO,
+             SPEAKER_WS_GPIO,
+             SPEAKER_DOUT_GPIO,
+             FRIDGE_TTS_SAMPLE_RATE,
+             (unsigned)s_volume,
+             s_tts_enabled ? "on" : "off");
     return ESP_OK;
 }
 
@@ -386,6 +504,14 @@ esp_err_t fridge_tts_set_config(const fridge_tts_config_update_t *config)
         err = nvs_set_str(handle, TTS_NVS_KEY_API_KEY, config->api_key);
     }
     if (err == ESP_OK) {
+        int64_t previous_ms = load_tts_updated_ms();
+        int64_t updated_ms = config->config_updated_at_ms > 0 ? config->config_updated_at_ms : tts_config_now_ms();
+        if (config->config_updated_at_ms <= 0 && updated_ms <= previous_ms) {
+            updated_ms = previous_ms + 1;
+        }
+        err = nvs_set_i64(handle, TTS_NVS_KEY_UPDATED_MS, updated_ms);
+    }
+    if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
@@ -409,6 +535,107 @@ esp_err_t fridge_tts_clear_key(void)
     }
     nvs_close(handle);
     return err;
+}
+
+esp_err_t fridge_tts_get_sync_payload(char *out, size_t out_size)
+{
+    ESP_RETURN_ON_FALSE(out && out_size > 0, ESP_ERR_INVALID_ARG, TAG, "invalid TTS sync payload buffer");
+    out[0] = '\0';
+
+    fridge_tts_config_update_t config = {0};
+    ESP_RETURN_ON_ERROR(load_tts_config(&config), TAG, "load TTS sync config failed");
+    char normalized_voice[FRIDGE_TTS_MAX_VOICE_LEN + 1] = {0};
+    normalize_voice_for_model(&config, normalized_voice, sizeof(normalized_voice));
+
+    cJSON *root = cJSON_CreateObject();
+    ESP_RETURN_ON_FALSE(root, ESP_ERR_NO_MEM, TAG, "create TTS sync payload failed");
+    cJSON_AddNumberToObject(root, "configUpdatedAt", (double)config.config_updated_at_ms);
+    cJSON_AddStringToObject(root, "ttsApiBaseUrl", config.api_base_url);
+    cJSON_AddStringToObject(root, "ttsModel", config.model);
+    cJSON_AddStringToObject(root, "ttsVoice", normalized_voice);
+    cJSON_AddStringToObject(root, "ttsApiKey", config.api_key);
+    cJSON_AddNumberToObject(root, "ttsTimeoutMs", config.timeout_ms);
+
+    char *printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    ESP_RETURN_ON_FALSE(printed, ESP_ERR_NO_MEM, TAG, "print TTS sync payload failed");
+    size_t len = strlen(printed);
+    if (len >= out_size) {
+        cJSON_free(printed);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out, printed, len + 1);
+    cJSON_free(printed);
+    return ESP_OK;
+}
+
+esp_err_t fridge_speaker_preview_volume(uint8_t percent)
+{
+    ESP_RETURN_ON_ERROR(fridge_speaker_init(), TAG, "speaker init failed");
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_volume = clamp_volume(percent);
+    s_volume_loaded = true;
+    xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+esp_err_t fridge_speaker_set_volume(uint8_t percent)
+{
+    ESP_RETURN_ON_ERROR(fridge_speaker_preview_volume(percent), TAG, "speaker volume preview failed");
+    uint8_t volume = clamp_volume(percent);
+    esp_err_t err = save_volume(volume);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save speaker volume failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+uint8_t fridge_speaker_get_volume(void)
+{
+    if (!s_initialized || !s_lock) {
+        if (!s_volume_loaded) {
+            s_volume = load_saved_volume();
+            s_volume_loaded = true;
+        }
+        return s_volume;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint8_t volume = s_volume;
+    xSemaphoreGive(s_lock);
+    return volume;
+}
+
+esp_err_t fridge_speaker_set_tts_enabled(bool enabled)
+{
+    if (s_lock) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_tts_enabled = enabled;
+        s_tts_enabled_loaded = true;
+        xSemaphoreGive(s_lock);
+    } else {
+        s_tts_enabled = enabled;
+        s_tts_enabled_loaded = true;
+    }
+    esp_err_t err = save_tts_enabled(enabled);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS enabled failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+bool fridge_speaker_get_tts_enabled(void)
+{
+    if (!s_initialized || !s_lock) {
+        if (!s_tts_enabled_loaded) {
+            s_tts_enabled = load_saved_tts_enabled();
+            s_tts_enabled_loaded = true;
+        }
+        return s_tts_enabled;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool enabled = s_tts_enabled;
+    xSemaphoreGive(s_lock);
+    return enabled;
 }
 
 esp_err_t fridge_speaker_synthesize_and_play(const char *text, fridge_speaker_status_t *out)

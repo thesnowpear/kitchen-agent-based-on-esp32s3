@@ -203,7 +203,7 @@ esp_err_t fridge_wake_word_init(void)
         }
     }
 
-    // ESP-SR 模型由固定 label 为 model 的分区加载，烧录前必须确认 partitions.csv 中存在该分区。
+    // ESP-SR 模型由固定 label 为 model 的分区加载，烧录前必须确认当前自定义分区表中存在该分区。
     s_models = esp_srmodel_init("model");
     if (!s_models) {
         set_state(FRIDGE_WAKE_WORD_STATE_ERROR, "load ESP-SR models failed");

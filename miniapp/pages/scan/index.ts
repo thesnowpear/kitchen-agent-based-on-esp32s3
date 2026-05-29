@@ -11,6 +11,7 @@
  */
 
 import { createInventoryItem, scanFoodImage } from "../../services/api";
+import { enqueueSyncOp, syncNow } from "../../services/sync";
 import type { MiniAppInstance } from "../../app";
 import type {
   InventoryWritePayload,
@@ -142,12 +143,24 @@ Page({
       confidence: target.confidence,
     };
     try {
-      await createInventoryItem(payload);
+      const created = await createInventoryItem(payload);
+      enqueueSyncOp("inventory", "scan_create", {
+        item: created,
+        payload,
+        candidate: target,
+      });
+      void syncNow().catch(() => {
+        // 入库已成功；同步失败时队列保留，离线页可重试。
+      });
       this.patchCandidate(idx, { busy: false, saved: true });
       wx.showToast({ title: "已入库", icon: "success" });
     } catch (err) {
+      enqueueSyncOp("inventory", "scan_create_pending", {
+        payload,
+        candidate: target,
+      });
       this.patchCandidate(idx, { busy: false });
-      wx.showToast({ title: "入库失败", icon: "none" });
+      wx.showToast({ title: "入库失败，已加入待同步", icon: "none" });
     }
   },
 
@@ -175,14 +188,28 @@ Page({
         confidence: candidate.confidence,
       };
       try {
-        await createInventoryItem(payload);
+        const created = await createInventoryItem(payload);
+        enqueueSyncOp("inventory", "scan_create", {
+          item: created,
+          payload,
+          candidate,
+        });
         okCount += 1;
         this.patchCandidate(index, { busy: false, saved: true });
       } catch {
+        enqueueSyncOp("inventory", "scan_create_pending", {
+          payload,
+          candidate,
+        });
         this.patchCandidate(index, { busy: false });
       }
     }
     this.setData({ confirmingAll: false });
+    if (okCount > 0) {
+      void syncNow().catch(() => {
+        // 批量入库后的同步失败会保留队列。
+      });
+    }
     wx.showToast({ title: `已入库 ${okCount} 项`, icon: okCount > 0 ? "success" : "none" });
   },
 

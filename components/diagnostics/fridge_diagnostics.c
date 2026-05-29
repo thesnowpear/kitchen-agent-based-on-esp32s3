@@ -9,6 +9,7 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
 #include "esp_timer.h"
 #include "fridge_network.h"
 
@@ -94,9 +95,14 @@ esp_err_t fridge_diagnostics_get_snapshot(fridge_diagnostic_snapshot_t *snapshot
     fridge_network_get_status(&net);
 
     snprintf(snapshot->psram, sizeof(snapshot->psram), "%lu KB free", (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-    strlcpy(snapshot->flash_partition, "8MB + OTA + LittleFS 由 sdkconfig.defaults/partitions.csv 定义", sizeof(snapshot->flash_partition));
+    strlcpy(snapshot->flash_partition, "8MB: ota_0 大主固件 + ota_1 小 recovery + assets/cache/model", sizeof(snapshot->flash_partition));
     strlcpy(snapshot->littlefs, "planned: assets + cache", sizeof(snapshot->littlefs));
-    strlcpy(snapshot->ota_slot, "OTA 分区已预留，升级逻辑待接入", sizeof(snapshot->ota_slot));
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running) {
+        snprintf(snapshot->ota_slot, sizeof(snapshot->ota_slot), "%s active; ota_1 recovery", running->label);
+    } else {
+        strlcpy(snapshot->ota_slot, "ota_0 main; ota_1 recovery", sizeof(snapshot->ota_slot));
+    }
     snapshot->brownout_count = 0;
     snapshot->watchdog_count = 0;
     strlcpy(snapshot->last_error, net.last_error[0] ? net.last_error : "无网络错误", sizeof(snapshot->last_error));

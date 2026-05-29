@@ -1,0 +1,14 @@
+# Recovery build profile.
+# Usage:
+#   idf.py -B build_recovery -DFRIDGE_RECOVERY_BUILD=ON -DSDKCONFIG="sdkconfig.recovery" -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.recovery.defaults" reconfigure build
+# Flash note:
+#   recovery 镜像属于 ota_1；不要直接对 recovery build 目录执行默认 idf.py flash，
+#   否则 ESP-IDF 会按普通 app 流程把镜像写到 ota_0。
+#
+# 该配置只用于生成 ota_1 小型本地恢复固件；默认 sdkconfig.defaults 仍构建 ota_0 主固件。
+CONFIG_FRIDGE_RECOVERY_APP=y
+CONFIG_FRIDGE_UI_ENABLE=n
+CONFIG_FRIDGE_SCREEN_TEST=n
+CONFIG_FRIDGE_CAMERA_TEST=n
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_MN_EN_NONE=y

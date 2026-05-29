@@ -5,6 +5,7 @@
  */
 
 import { getHomeOverview, getInventory, getReminders } from "../../services/api";
+import { getLocalSyncState, getSyncQueue, syncNow } from "../../services/sync";
 import type { InventoryItem, OfflineSnapshot, ReminderItem } from "../../types/models";
 import { displayPlace } from "../../utils/fridgeZones";
 import { getOfflineSnapshot, updateOfflineSnapshot } from "../../utils/localFeatures";
@@ -21,12 +22,18 @@ Page({
     expiringCount: 0,
     reminderCount: 0,
     deviceText: "未知",
+    syncRevision: 0,
+    syncQueueCount: 0,
+    syncDirtyText: "无",
+    syncLastText: "尚未同步",
+    syncErrorText: "",
     inventory: [] as OfflineInventoryView[],
     reminders: [] as OfflineReminderView[],
   },
 
   onShow() {
     this.applySnapshot(getOfflineSnapshot());
+    this.applySyncState();
   },
 
   onPullDownRefresh() {
@@ -36,6 +43,7 @@ Page({
   applySnapshot(snapshot: OfflineSnapshot | null) {
     if (!snapshot) {
       this.setData({ hasSnapshot: false });
+      this.applySyncState();
       return;
     }
     const overview = snapshot.overview || null;
@@ -63,12 +71,14 @@ Page({
       inventory,
       reminders,
     });
+    this.applySyncState();
   },
 
   async onTapRetry(): Promise<void> {
     if (this.data.refreshing) return;
     this.setData({ refreshing: true });
     try {
+      await syncNow();
       const [overview, inventory, reminders] = await Promise.all([
         getHomeOverview(),
         getInventory(),
@@ -80,8 +90,12 @@ Page({
         reminderItems: reminders.items || [],
       });
       this.applySnapshot(snapshot);
+      this.applySyncState();
       wx.showToast({ title: "已刷新缓存", icon: "success" });
-    } catch {
+    } catch (err) {
+      this.applySyncState();
+      const message = err instanceof Error ? err.message : "暂时无法联网";
+      this.setData({ syncErrorText: message });
       wx.showToast({ title: "暂时无法联网", icon: "none" });
     } finally {
       this.setData({ refreshing: false });
@@ -116,5 +130,23 @@ Page({
       const diff = Math.round((target.getTime() - today.getTime()) / 86400000);
       return diff <= 3;
     }).length;
+  },
+
+  applySyncState() {
+    const state = getLocalSyncState();
+    const queue = getSyncQueue();
+    const last = Math.max(state.lastPushedAt || 0, state.lastPulledAt || 0);
+    this.setData({
+      syncRevision: state.serverRevision || 0,
+      syncQueueCount: queue.length,
+      syncDirtyText: state.dirtyDomains?.length ? state.dirtyDomains.join(" / ") : "无",
+      syncLastText: last ? this.humanizeSyncTime(last) : "尚未同步",
+      syncErrorText: state.lastSyncError || "",
+    });
+  },
+
+  humanizeSyncTime(ts: number): string {
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   },
 });

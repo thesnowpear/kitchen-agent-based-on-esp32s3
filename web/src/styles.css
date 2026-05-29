@@ -1637,6 +1637,20 @@ label {
   font-size: 13px;
 }
 
+.checkbox-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0;
+  color: var(--ink);
+}
+
+.checkbox-line input {
+  width: 18px;
+  min-height: 18px;
+  accent-color: var(--accent);
+}
+
 .form-hint {
   color: var(--muted);
   font-size: 12px;

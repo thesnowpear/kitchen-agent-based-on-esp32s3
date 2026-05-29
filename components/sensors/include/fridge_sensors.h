@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
-#include "driver/i2c_types.h"
+#include "driver/i2c.h"
 #include "fridge_radar.h"
 
 #ifdef __cplusplus

@@ -31,10 +31,28 @@ static lv_obj_t *s_name_value;
 static lv_obj_t *s_note_value;
 static lv_obj_t *s_width_value;
 static lv_obj_t *s_height_value;
+static lv_obj_t *s_width_dec_btn;
+static lv_obj_t *s_width_inc_btn;
+static lv_obj_t *s_height_dec_btn;
+static lv_obj_t *s_height_inc_btn;
 static lv_obj_t *s_delete_btn;
 static lv_obj_t *s_scroll_hint;
 static bool s_space_editing;
 static uint8_t s_selected_zone = UINT8_MAX;
+
+typedef struct {
+    uint8_t col;
+    uint8_t row;
+    uint8_t max_width;
+    uint8_t max_height;
+} standard_zone_slot_t;
+
+static const standard_zone_slot_t STANDARD_ZONE_SLOTS[4] = {
+    {.col = 0, .row = 0, .max_width = 2, .max_height = 1},
+    {.col = 0, .row = 1, .max_width = 1, .max_height = 2},
+    {.col = 1, .row = 1, .max_width = 1, .max_height = 2},
+    {.col = 2, .row = 0, .max_width = 1, .max_height = 3},
+};
 
 static uint8_t clamp_span(uint8_t value)
 {
@@ -71,9 +89,30 @@ static bool is_custom_zone_visible(const fridge_ui_model_t *model, uint8_t zone)
     return model->zones[zone].custom && (model->zones[zone].count > 0 || (name[0] != '\0' && !placeholder));
 }
 
-static bool has_free_custom_slot(const bool custom_visible[2])
+static bool is_custom_zone_occupied(const fridge_ui_model_t *model, uint8_t zone)
 {
-    return !custom_visible[0] || !custom_visible[1];
+    if (!model || zone >= FRIDGE_UI_ZONE_COUNT || !model->zones[zone].custom) {
+        return false;
+    }
+    const char *name = model->zones[zone].name;
+    const bool placeholder = strcmp(name, "自定义区") == 0 || strcmp(name, "备用区") == 0;
+    return model->zones[zone].count > 0 || (name[0] != '\0' && !placeholder);
+}
+
+static bool has_free_custom_slot(const fridge_ui_model_t *model)
+{
+    return !is_custom_zone_occupied(model, 4) || !is_custom_zone_occupied(model, 5);
+}
+
+static const char *zone_note_or_count(const fridge_ui_model_t *model, uint8_t zone)
+{
+    if (!model || zone >= FRIDGE_UI_ZONE_COUNT) {
+        return "可放食材";
+    }
+    if (s_space_editing && model->zones[zone].note[0]) {
+        return model->zones[zone].note;
+    }
+    return NULL;
 }
 
 static void select_zone_for_edit(uint8_t zone)
@@ -188,7 +227,11 @@ static void width_cb(lv_event_t *event)
         return;
     }
     int width_next = (int)model.zones[s_selected_zone].width + (int)delta;
+    uint8_t max_width = s_selected_zone < 4 ? STANDARD_ZONE_SLOTS[s_selected_zone].max_width : 3;
     uint8_t width = clamp_span((uint8_t)(width_next < 1 ? 1 : width_next));
+    if (width > max_width) {
+        width = max_width;
+    }
     update_zone_from_editor(NULL, NULL, width, 0);
 }
 
@@ -201,7 +244,11 @@ static void height_cb(lv_event_t *event)
         return;
     }
     int height_next = (int)model.zones[s_selected_zone].height + (int)delta;
+    uint8_t max_height = s_selected_zone < 4 ? STANDARD_ZONE_SLOTS[s_selected_zone].max_height : 3;
     uint8_t height = clamp_span((uint8_t)(height_next < 1 ? 1 : height_next));
+    if (height > max_height) {
+        height = max_height;
+    }
     update_zone_from_editor(NULL, NULL, 0, height);
 }
 
@@ -266,6 +313,49 @@ static void set_edit_target_style(home_zone_view_t *view, bool selected)
     }
     lv_obj_set_style_border_width(view->button, selected ? 4 : 1, 0);
     lv_obj_set_style_border_color(view->button, selected ? theme->accent_2 : theme->line, 0);
+}
+
+static void apply_standard_zone_layout(const fridge_ui_model_t *model)
+{
+    if (!model) {
+        return;
+    }
+    const int16_t col_x[3] = {18, 250, 484};
+    const int16_t row_y[3] = {18, 128, 229};
+    const int16_t col_w[3] = {218, 220, 124};
+    const int16_t row_h[3] = {96, 87, 87};
+    const int16_t gap = 14;
+
+    for (size_t i = 0; i < 4; i++) {
+        home_zone_view_t *view = &s_zone_views[i];
+        const standard_zone_slot_t *slot = &STANDARD_ZONE_SLOTS[i];
+        uint8_t width = clamp_span(model->zones[view->zone].width);
+        uint8_t height = clamp_span(model->zones[view->zone].height);
+        if (width > slot->max_width) {
+            width = slot->max_width;
+        }
+        if (height > slot->max_height) {
+            height = slot->max_height;
+        }
+
+        int16_t x = col_x[slot->col];
+        int16_t y = row_y[slot->row];
+        int16_t w = 0;
+        int16_t h = 0;
+        for (uint8_t col = 0; col < width && slot->col + col < 3; col++) {
+            w += col_w[slot->col + col];
+        }
+        for (uint8_t row = 0; row < height && slot->row + row < 3; row++) {
+            h += row_h[slot->row + row];
+        }
+        if (width > 1) {
+            w += (int16_t)((width - 1) * gap);
+        }
+        if (height > 1) {
+            h += (int16_t)((height - 1) * gap);
+        }
+        apply_zone_layout(view, x, y, w, h);
+    }
 }
 
 static void create_zone_button(home_zone_view_t *view, lv_obj_t *map)
@@ -386,24 +476,24 @@ static void create_editor_panel(lv_obj_t *parent)
     lv_obj_set_pos(width_title, 24, 106);
     lv_obj_set_style_text_color(width_title, theme->muted, 0);
     lv_obj_set_style_text_font(width_title, fridge_ui_font_small(), 0);
-    create_step_button(s_editor_panel, 96, 102, "-", width_cb, -1);
+    s_width_dec_btn = create_step_button(s_editor_panel, 96, 102, "-", width_cb, -1);
     s_width_value = lv_label_create(s_editor_panel);
     lv_obj_set_pos(s_width_value, 142, 108);
     lv_obj_set_style_text_color(s_width_value, theme->text, 0);
     lv_obj_set_style_text_font(s_width_value, fridge_ui_font_body(), 0);
-    create_step_button(s_editor_panel, 188, 102, "+", width_cb, 1);
+    s_width_inc_btn = create_step_button(s_editor_panel, 188, 102, "+", width_cb, 1);
 
     lv_obj_t *height_title = lv_label_create(s_editor_panel);
     lv_label_set_text(height_title, "高度");
     lv_obj_set_pos(height_title, 260, 106);
     lv_obj_set_style_text_color(height_title, theme->muted, 0);
     lv_obj_set_style_text_font(height_title, fridge_ui_font_small(), 0);
-    create_step_button(s_editor_panel, 332, 102, "-", height_cb, -1);
+    s_height_dec_btn = create_step_button(s_editor_panel, 332, 102, "-", height_cb, -1);
     s_height_value = lv_label_create(s_editor_panel);
     lv_obj_set_pos(s_height_value, 378, 108);
     lv_obj_set_style_text_color(s_height_value, theme->text, 0);
     lv_obj_set_style_text_font(s_height_value, fridge_ui_font_body(), 0);
-    create_step_button(s_editor_panel, 424, 102, "+", height_cb, 1);
+    s_height_inc_btn = create_step_button(s_editor_panel, 424, 102, "+", height_cb, 1);
 
     s_delete_btn = lv_button_create(s_editor_panel);
     lv_obj_set_pos(s_delete_btn, 516, 104);
@@ -504,8 +594,25 @@ static void update_editor_panel(const fridge_ui_model_t *model)
     fridge_ui_label_set_text_fmt_if_changed(s_editor_title, "编辑：%s", zone->name);
     fridge_ui_label_set_text_fmt_if_changed(s_name_value, "名称 %s", zone->name);
     fridge_ui_label_set_text_fmt_if_changed(s_note_value, "备注 %s", zone->note[0] ? zone->note : "可放食材");
-    fridge_ui_label_set_text_fmt_if_changed(s_width_value, "%u", clamp_span(zone->width));
-    fridge_ui_label_set_text_fmt_if_changed(s_height_value, "%u", clamp_span(zone->height));
+    bool standard_zone = s_selected_zone < 4;
+    uint8_t width = clamp_span(zone->width);
+    uint8_t height = clamp_span(zone->height);
+    uint8_t max_width = standard_zone ? STANDARD_ZONE_SLOTS[s_selected_zone].max_width : 3;
+    uint8_t max_height = standard_zone ? STANDARD_ZONE_SLOTS[s_selected_zone].max_height : 3;
+    if (width > max_width) {
+        width = max_width;
+    }
+    if (height > max_height) {
+        height = max_height;
+    }
+    fridge_ui_label_set_text_fmt_if_changed(s_width_value, "%u/%u", width, max_width);
+    fridge_ui_label_set_text_fmt_if_changed(s_height_value, "%u/%u", height, max_height);
+    lv_obj_t *span_buttons[] = {s_width_dec_btn, s_width_inc_btn, s_height_dec_btn, s_height_inc_btn};
+    for (size_t i = 0; i < sizeof(span_buttons) / sizeof(span_buttons[0]); i++) {
+        if (span_buttons[i]) {
+            lv_obj_clear_state(span_buttons[i], LV_STATE_DISABLED);
+        }
+    }
     if (s_delete_btn) {
         if (s_selected_zone >= 4) {
             lv_obj_clear_state(s_delete_btn, LV_STATE_DISABLED);
@@ -533,27 +640,35 @@ void fridge_ui_page_home_update(void)
         is_custom_zone_visible(&model, 5),
     };
     bool edit_or_custom = s_space_editing || picking || custom_visible[0] || custom_visible[1];
-    bool free_custom_slot = has_free_custom_slot(custom_visible);
-
-    apply_zone_layout(&s_zone_views[0], 18, 18, 452, 96);
-    apply_zone_layout(&s_zone_views[1], 18, 128, 218, 188);
-    apply_zone_layout(&s_zone_views[2], 250, 128, 220, 188);
-    apply_zone_layout(&s_zone_views[3], 484, 18, 124, 298);
-
-    for (size_t i = 0; i < 4; i++) {
-        home_zone_view_t *view = &s_zone_views[i];
-        fridge_ui_label_set_text_if_changed(view->name, model.zones[view->zone].name);
-        fridge_ui_label_set_text_fmt_if_changed(view->count, "%u 件", model.zones[view->zone].count);
-        set_edit_target_style(view, (s_space_editing && s_selected_zone == view->zone) || (picking && model.active_zone == view->zone));
-    }
+    bool free_custom_slot = has_free_custom_slot(&model);
 
     int16_t next_x = 18;
     int16_t next_y = 334;
     int16_t row_h = 0;
     int16_t content_bottom = 316;
     const int16_t grid_gap = 12;
-    const int16_t cell_w = 194;
+    const int16_t cell_w = 188;
     const int16_t cell_h = 96;
+    const int16_t custom_start_x = 18;
+    const uint8_t custom_grid_cols = 3;
+    uint8_t row_used_cols = 0;
+
+    apply_standard_zone_layout(&model);
+
+    for (size_t i = 0; i < 4; i++) {
+        home_zone_view_t *view = &s_zone_views[i];
+        fridge_ui_label_set_text_if_changed(view->name, model.zones[view->zone].name);
+        const char *note = zone_note_or_count(&model, view->zone);
+        if (note) {
+            fridge_ui_label_set_text_if_changed(view->count, note);
+            lv_obj_set_style_text_font(view->count, fridge_ui_font_body(), 0);
+        } else {
+            fridge_ui_label_set_text_fmt_if_changed(view->count, "%u 件", model.zones[view->zone].count);
+            lv_obj_set_style_text_font(view->count, fridge_ui_font_large(), 0);
+        }
+        set_edit_target_style(view, (s_space_editing && s_selected_zone == view->zone) || (picking && model.active_zone == view->zone));
+    }
+
     for (size_t i = 0; i < 2; i++) {
         home_zone_view_t *view = &s_custom_views[i];
         bool visible = custom_visible[i];
@@ -564,25 +679,25 @@ void fridge_ui_page_home_update(void)
         lv_obj_remove_flag(view->button, LV_OBJ_FLAG_HIDDEN);
         uint8_t width = clamp_span(model.zones[view->zone].width);
         uint8_t height = clamp_span(model.zones[view->zone].height);
+        if (width > custom_grid_cols) {
+            width = custom_grid_cols;
+        }
         int16_t w = (int16_t)(width * cell_w + (width - 1) * grid_gap);
         int16_t h = (int16_t)(height * cell_h + (height - 1) * grid_gap);
-        if (next_x > 18 && next_x + w > 608) {
-            next_x = 18;
+        // 自定义区按 3 列 span 装箱：1 格 + 2 格应能同排，避免像素边界误判换行。
+        if (row_used_cols > 0 && row_used_cols + width > custom_grid_cols) {
+            next_x = custom_start_x;
             next_y += row_h + grid_gap;
             row_h = 0;
+            row_used_cols = 0;
         }
         apply_zone_layout(view, next_x, next_y, w, h);
         fridge_ui_label_set_text_if_changed(view->name, model.zones[view->zone].name);
-        const char *note = model.zones[view->zone].note[0] ? model.zones[view->zone].note : "可放食材";
-        if (model.zones[view->zone].count > 0 && !s_space_editing) {
-            fridge_ui_label_set_text_fmt_if_changed(view->count, "%u 件", model.zones[view->zone].count);
-            lv_obj_set_style_text_font(view->count, fridge_ui_font_large(), 0);
-        } else {
-            fridge_ui_label_set_text_if_changed(view->count, note);
-            lv_obj_set_style_text_font(view->count, fridge_ui_font_body(), 0);
-        }
+        fridge_ui_label_set_text_fmt_if_changed(view->count, "%u 件", model.zones[view->zone].count);
+        lv_obj_set_style_text_font(view->count, fridge_ui_font_large(), 0);
         set_edit_target_style(view, (s_space_editing && s_selected_zone == view->zone) || (picking && model.active_zone == view->zone));
-        next_x += w + grid_gap;
+        row_used_cols += width;
+        next_x = (int16_t)(custom_start_x + row_used_cols * (cell_w + grid_gap));
         if (h > row_h) {
             row_h = h;
         }
@@ -596,10 +711,11 @@ void fridge_ui_page_home_update(void)
             lv_obj_remove_flag(s_add_zone_btn, LV_OBJ_FLAG_HIDDEN);
             int16_t add_w = cell_w;
             int16_t add_h = cell_h;
-            if (next_x > 18 && next_x + add_w > 608) {
-                next_x = 18;
+            if (row_used_cols > 0 && row_used_cols + 1 > custom_grid_cols) {
+                next_x = custom_start_x;
                 next_y += row_h + grid_gap;
                 row_h = 0;
+                row_used_cols = 0;
             }
             lv_obj_set_pos(s_add_zone_btn, next_x, next_y);
             lv_obj_set_size(s_add_zone_btn, add_w, add_h);

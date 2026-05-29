@@ -5,6 +5,7 @@
  */
 
 import { getInventory } from "../../services/api";
+import { enqueueSyncOp, syncNow } from "../../services/sync";
 import type { InventoryItem, ShoppingItem } from "../../types/models";
 import { addShoppingItems, getShoppingItems, saveShoppingItems } from "../../utils/localFeatures";
 
@@ -141,6 +142,7 @@ Page({
       ]);
       this.setData({ items });
       this.applyFilter(items, this.data.filter);
+      this.queueShoppingSync("add", items);
     }
     this.closeAdd();
   },
@@ -194,6 +196,7 @@ Page({
       );
       this.setData({ items, filter: "all" });
       this.applyFilter(items, "all");
+      this.queueShoppingSync("seed_expiring", items);
       wx.showToast({ title: `已加入 ${expiring.length} 项`, icon: "success" });
     } catch {
       wx.showToast({ title: "读取库存失败", icon: "none" });
@@ -221,6 +224,17 @@ Page({
     saveShoppingItems(items);
     this.setData({ items });
     this.applyFilter(items, this.data.filter);
+    this.queueShoppingSync("replace", items);
+  },
+
+  queueShoppingSync(op: string, items: ShoppingItem[]) {
+    enqueueSyncOp("shopping_list", op, {
+      items,
+      updatedAt: new Date().toISOString(),
+    });
+    void syncNow().catch(() => {
+      // 购物清单是本地优先能力；同步失败保留队列。
+    });
   },
 
   noop() {

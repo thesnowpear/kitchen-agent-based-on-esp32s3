@@ -8,7 +8,8 @@
 
 static lv_obj_t *s_time;
 static lv_obj_t *s_wifi;
-static lv_obj_t *s_battery;
+static lv_obj_t *s_wifi_bars[3];
+static lv_obj_t *s_wifi_cross;
 static lv_obj_t *s_back;
 static lv_obj_t *s_back_label;
 static lv_obj_t *s_panel;
@@ -37,7 +38,7 @@ static void panel_cb(lv_event_t *event)
 
 static void back_cb(lv_event_t *event)
 {
-    (void)event;
+    lv_event_stop_bubbling(event);
     fridge_ui_go_back();
 }
 
@@ -59,15 +60,15 @@ lv_obj_t *fridge_ui_status_bar_create(lv_obj_t *parent)
 
     // 顶栏左侧兼做参考原型的“小精灵 / 返回”按钮，便于位置编辑等流程快速回退。
     s_back = lv_button_create(bar);
-    lv_obj_set_size(s_back, 130, 42);
-    lv_obj_align(s_back, LV_ALIGN_LEFT_MID, -8, 0);
+    lv_obj_set_size(s_back, 188, 54);
+    lv_obj_align(s_back, LV_ALIGN_LEFT_MID, -18, 0);
     lv_obj_set_style_bg_opa(s_back, LV_OPA_TRANSP, 0);
     lv_obj_set_style_shadow_width(s_back, 0, 0);
     lv_obj_add_event_cb(s_back, back_cb, LV_EVENT_CLICKED, NULL);
     s_back_label = lv_label_create(s_back);
     lv_obj_set_style_text_color(s_back_label, theme->accent, 0);
     lv_obj_set_style_text_font(s_back_label, fridge_ui_font_body(), 0);
-    lv_obj_center(s_back_label);
+    lv_obj_align(s_back_label, LV_ALIGN_LEFT_MID, 18, 0);
 
     s_time = lv_label_create(bar);
     lv_obj_set_style_text_color(s_time, theme->text, 0);
@@ -76,18 +77,39 @@ lv_obj_t *fridge_ui_status_bar_create(lv_obj_t *parent)
     lv_obj_add_flag(s_time, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_time, panel_cb, LV_EVENT_CLICKED, NULL);
 
-    s_battery = lv_label_create(bar);
-    lv_label_set_text(s_battery, "86%");
-    lv_obj_set_style_text_color(s_battery, theme->accent, 0);
-    lv_obj_align(s_battery, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_add_flag(s_battery, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_battery, panel_cb, LV_EVENT_CLICKED, NULL);
-
+    // 右侧仅保留 Wi-Fi 状态和信号图标，不再显示电量占位，避免顶栏数字挤压。
     s_wifi = lv_label_create(bar);
-    lv_obj_align_to(s_wifi, s_battery, LV_ALIGN_OUT_LEFT_MID, -20, 0);
+    lv_label_set_text(s_wifi, "Wi-Fi");
+    lv_obj_set_width(s_wifi, 72);
+    lv_label_set_long_mode(s_wifi, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_align(s_wifi, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_align(s_wifi, LV_ALIGN_RIGHT_MID, -68, 1);
     lv_obj_set_style_text_color(s_wifi, theme->accent, 0);
+    lv_obj_set_style_text_font(s_wifi, fridge_ui_font_body(), 0);
     lv_obj_add_flag(s_wifi, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_wifi, panel_cb, LV_EVENT_CLICKED, NULL);
+
+    for (uint8_t i = 0; i < 3; i++) {
+        s_wifi_bars[i] = lv_obj_create(bar);
+        lv_obj_remove_style_all(s_wifi_bars[i]);
+        lv_obj_set_size(s_wifi_bars[i], 8, 8 + i * 7);
+        lv_obj_set_style_bg_color(s_wifi_bars[i], theme->line, 0);
+        lv_obj_set_style_bg_opa(s_wifi_bars[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_wifi_bars[i], 4, 0);
+        lv_obj_align(s_wifi_bars[i], LV_ALIGN_RIGHT_MID, -42 + i * 13, 7 - i * 3);
+        lv_obj_add_flag(s_wifi_bars[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_wifi_bars[i], panel_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    // 未连接时显示一个明确的叉号；连接成功后再切回三格信号条。
+    s_wifi_cross = lv_label_create(bar);
+    lv_label_set_text(s_wifi_cross, "x");
+    lv_obj_set_style_text_color(s_wifi_cross, theme->danger, 0);
+    lv_obj_set_style_text_font(s_wifi_cross, fridge_ui_font_body(), 0);
+    lv_obj_align(s_wifi_cross, LV_ALIGN_RIGHT_MID, -16, 0);
+    lv_obj_add_flag(s_wifi_cross, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_wifi_cross, panel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_wifi_cross, LV_OBJ_FLAG_HIDDEN);
 
     s_panel = lv_obj_create(parent);
     lv_obj_set_pos(s_panel, 48, 78);
@@ -137,13 +159,31 @@ void fridge_ui_status_bar_update(void)
 
     fridge_ui_model_t model = {0};
     fridge_ui_model_get(&model);
-    const char *wifi_text = "Wi-Fi --";
+    bool wifi_connected = model.network.connected;
+    uint8_t wifi_level = 0;
     if (model.network.connected) {
-        wifi_text = model.network.rssi >= -60 ? "Wi-Fi 3" : (model.network.rssi >= -75 ? "Wi-Fi 2" : "Wi-Fi 1");
-    } else if (model.network.connecting) {
-        wifi_text = "Wi-Fi ...";
+        wifi_level = model.network.rssi >= -60 ? 3 : (model.network.rssi >= -75 ? 2 : 1);
     }
-    fridge_ui_label_set_text_if_changed(s_wifi, wifi_text);
+    fridge_ui_label_set_text_if_changed(s_wifi, "Wi-Fi");
+    const fridge_ui_theme_t *theme = fridge_ui_theme_get();
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!s_wifi_bars[i]) {
+            continue;
+        }
+        if (wifi_connected) {
+            lv_obj_clear_flag(s_wifi_bars[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_wifi_bars[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_set_style_bg_color(s_wifi_bars[i], i < wifi_level ? theme->accent : theme->line, 0);
+    }
+    if (s_wifi_cross) {
+        if (wifi_connected) {
+            lv_obj_add_flag(s_wifi_cross, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(s_wifi_cross, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 
     bool can_back = fridge_ui_model_is_place_picking() ||
                     (g_ui_page != FRIDGE_UI_PAGE_HOME && g_ui_page != FRIDGE_UI_PAGE_STANDBY);

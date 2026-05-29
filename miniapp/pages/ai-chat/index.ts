@@ -2,16 +2,18 @@
  * AI 对话页：与冰箱小精灵聊天。
  *
  * 数据流：
- *   1) 加载时不主动调 backend，避免无意义 token 消耗；
+ *   1) 加载时读取云端历史；没有历史时显示本地欢迎语；
  *   2) 用户输入 → push 自己的 message → POST /ai/chat → push AI 回复（带 source 徽标）；
  *   3) source=device 时背景偏 mint，source=cloud_fallback 时偏 yolk + 显示 fallbackReason。
  *
- * 历史保存：仅放内存，离开页面后清空（避免持久化 PII）。
+ * 历史保存：后端按 sessionId 持久化；设备端短期历史后续通过 MQTT TODO 合并。
  */
 
-import { sendAiChat } from "../../services/api";
+import { clearAiChatHistory, getAiChatHistory, sendAiChat } from "../../services/api";
 import type { AiChatMessage } from "../../types/models";
 import { RequestError } from "../../utils/request";
+
+const DEFAULT_SESSION_ID = "miniapp-default";
 
 function uuid(): string {
   return "msg_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -25,14 +27,19 @@ Page({
   data: {
     input: "",
     sending: false,
+    loadingHistory: false,
+    sessionId: DEFAULT_SESSION_ID,
     messages: [] as AiChatMessage[],
     scrollIntoView: "" as string,
     placeholder: "今晚做什么菜？哪些临期？",
   },
 
-  onLoad() {
-    // 入场时塞一条欢迎语，由前端构造，不消耗 token。
-    const intro: AiChatMessage = {
+  async onLoad() {
+    await this.loadHistory();
+  },
+
+  makeIntro(): AiChatMessage {
+    return {
       id: uuid(),
       role: "assistant",
       // 注意：欢迎语包含中文引号短语（"今天吃什么" 等），故外层必须用反引号或 ASCII 双引号 + 转义；
@@ -41,7 +48,40 @@ Page({
       source: "device",
       sentAt: nowIso(),
     };
-    this.setData({ messages: [intro], scrollIntoView: intro.id });
+  },
+
+  async loadHistory() {
+    if (this.data.loadingHistory) return;
+    this.setData({ loadingHistory: true });
+    try {
+      const history = await getAiChatHistory(this.data.sessionId);
+      const messages = (history.messages || [])
+        .filter((message) => message.role === "user" || message.role === "assistant")
+        .map((message) => ({
+          id: `hist_${message.id.replace(/[^A-Za-z0-9_-]/g, "_")}`,
+          role: message.role as "user" | "assistant",
+          content: message.content,
+          source:
+            message.source === "device" || message.source === "cloud_fallback"
+              ? message.source
+              : undefined,
+          fallbackReason: message.fallbackReason,
+          modelUsed: message.modelUsed,
+          deviceSn: message.deviceSn,
+          sentAt: message.sentAt,
+        }));
+      const next = messages.length ? messages : [this.makeIntro()];
+      this.setData({
+        sessionId: history.sessionId || this.data.sessionId,
+        messages: next,
+        scrollIntoView: next[next.length - 1]?.id || "",
+      });
+    } catch {
+      const intro = this.makeIntro();
+      this.setData({ messages: [intro], scrollIntoView: intro.id });
+    } finally {
+      this.setData({ loadingHistory: false });
+    }
   },
 
   onShow() {
@@ -79,7 +119,7 @@ Page({
     });
 
     try {
-      const res = await sendAiChat(text);
+      const res = await sendAiChat(text, this.data.sessionId);
       this.replaceMessage(placeholderId, {
         ...aiPlaceholder,
         content: res.reply || "（无回复）",
@@ -88,6 +128,9 @@ Page({
         modelUsed: res.modelUsed,
         deviceSn: res.deviceSn,
       });
+      if (res.sessionId && res.sessionId !== this.data.sessionId) {
+        this.setData({ sessionId: res.sessionId });
+      }
     } catch (err) {
       const message =
         err instanceof RequestError
@@ -112,8 +155,23 @@ Page({
     });
   },
 
-  onClear() {
-    this.setData({ messages: [], scrollIntoView: "" });
-    this.onLoad();
+  async onClear() {
+    wx.showModal({
+      title: "清空对话",
+      content: "会清空云端保存的当前会话历史，设备端本地短期历史暂不受影响。",
+      confirmText: "清空",
+      confirmColor: "#d95745",
+      success: async (res) => {
+        if (!res.confirm) return;
+        try {
+          await clearAiChatHistory(this.data.sessionId);
+          const intro = this.makeIntro();
+          this.setData({ messages: [intro], scrollIntoView: intro.id });
+          wx.showToast({ title: "已清空", icon: "success" });
+        } catch {
+          wx.showToast({ title: "清空失败", icon: "none" });
+        }
+      },
+    });
   },
 });

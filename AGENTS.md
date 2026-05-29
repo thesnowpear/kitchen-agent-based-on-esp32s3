@@ -35,8 +35,8 @@
 - 当前源码已经不再是空白工程：`main/main.c` 已有主控启动编排，`components/` 下已有 `diagnostics`、`network`、`usb_protocol`、`display_test` 等组件。
 - 已有说明书和硬件资料在 `doc/` 目录。
 - 已新增架构文档：`doc/项目架构与工作流设计.md`。
-- 已新增 `partitions.csv` 与 `sdkconfig.defaults`，目标配置已按 `ESP32-S3-DevKitC-1 N8R8` 规划为 `8MB Flash + 8MB PSRAM + 双 OTA + 本地数据分区`。
-- 当前 `sdkconfig` 里仍保留一些需要继续核对和收敛的生成配置；后续实现固件时要继续以 N8R8 实板约束为准，不能回退到 2MB 单 app 思路。
+- 已新增 `partitions_recovery.csv` 与 `sdkconfig.defaults`，目标配置已按 `ESP32-S3-DevKitC-1 N8R8` 规划为 `8MB Flash + 8MB PSRAM + 大主固件 ota_0 + 小 recovery ota_1 + 本地数据分区`。
+- 当前 `sdkconfig` 里仍保留一些需要继续核对和收敛的生成配置；后续实现固件时要继续以 N8R8 实板约束为准，不能回退到 2MB 单 app 或无本地 recovery 的纯云端恢复思路。
 
 ## 工程技术栈与编程约定
 
@@ -222,7 +222,7 @@ static void fridge_state_update(const sensor_event_t *event)
 
 ## 实现顺序建议
 
-1. 修正目标硬件配置：8 MB Flash、PSRAM、自定义分区表、OTA、LittleFS。
+1. 修正目标硬件配置：8 MB Flash、PSRAM、自定义分区表、大主固件 + 小 recovery、LittleFS。
 2. 建立组件化目录结构，保留 `main.c` 作为启动编排入口。
 3. 先做硬件安全验证：电源、电压、GPIO、共地、I2C 上拉、屏幕复位和背光。
 4. 点亮屏幕和触摸，使用低时钟起步，再逐步提升。

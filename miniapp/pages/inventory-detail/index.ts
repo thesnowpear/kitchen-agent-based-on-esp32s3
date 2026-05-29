@@ -13,6 +13,7 @@ import {
   getInventory,
   updateInventoryItem,
 } from "../../services/api";
+import { enqueueSyncOp, syncNow } from "../../services/sync";
 import type {
   FridgeZoneConfig,
   InventoryItem,
@@ -351,21 +352,31 @@ Page({
     try {
       const payload = this.buildPayload();
       if (this.data.mode === "create") {
-        await createInventoryItem(payload);
+        const created = await createInventoryItem(payload);
+        enqueueSyncOp("inventory", "upsert", { item: created, payload });
         wx.showToast({ title: "已入库", icon: "success" });
       } else {
-        await updateInventoryItem(this.data.itemId, payload);
+        const updated = await updateInventoryItem(this.data.itemId, payload);
+        enqueueSyncOp("inventory", "upsert", { item: updated, itemId: this.data.itemId, payload });
         wx.showToast({ title: "已保存", icon: "success" });
       }
+      void syncNow().catch(() => {
+        // 页面写入已经完成；同步失败时保留队列，离线页可继续重试。
+      });
       setTimeout(() => wx.navigateBack(), 400);
     } catch (err) {
+      const payload = this.buildPayload();
+      enqueueSyncOp("inventory", this.data.mode === "create" ? "create_pending" : "update_pending", {
+        itemId: this.data.itemId || undefined,
+        payload,
+      });
       const message =
         err instanceof RequestError
           ? err.message
           : err instanceof Error
             ? err.message
             : "保存失败";
-      wx.showToast({ title: message, icon: "none" });
+      wx.showToast({ title: `${message}，已加入待同步`, icon: "none" });
     } finally {
       this.setData({ saving: false });
     }
@@ -382,10 +393,21 @@ Page({
         if (!res.confirm) return;
         try {
           await deleteInventoryItem(this.data.itemId);
+          enqueueSyncOp("inventory", "delete", {
+            itemId: this.data.itemId,
+            name: this.data.name,
+          });
+          void syncNow().catch(() => {
+            // 删除后的同步失败会保留在队列里，离线页可继续重试。
+          });
           wx.showToast({ title: "已删除", icon: "success" });
           setTimeout(() => wx.navigateBack(), 400);
         } catch (err) {
-          wx.showToast({ title: "删除失败", icon: "none" });
+          enqueueSyncOp("inventory", "delete_pending", {
+            itemId: this.data.itemId,
+            name: this.data.name,
+          });
+          wx.showToast({ title: "删除失败，已加入待同步", icon: "none" });
         }
       },
     });

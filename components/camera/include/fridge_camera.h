@@ -38,6 +38,17 @@ typedef struct {
     uint32_t frame_id;
 } fridge_camera_frame_view_t;
 
+// UI 实时预览帧：RGB565 数据由调用者持有，使用后必须调用 fridge_camera_free_preview_frame() 释放。
+// 注意：该帧只服务屏幕取景，不用于 AI 识别；AI 识别仍使用更清晰的 JPEG 抓拍路径。
+typedef struct {
+    uint8_t *rgb565;
+    size_t len;
+    int width;
+    int height;
+    uint32_t capture_ms;
+    uint32_t frame_id;
+} fridge_camera_preview_frame_t;
+
 // RGB565 诊断结果：只用于判断 DVP 同步和并口采样是否能形成完整帧，不返回大图。
 typedef struct {
     bool ok;
@@ -73,6 +84,12 @@ esp_err_t fridge_camera_probe(fridge_camera_probe_result_t *out);
 
 // 抓拍一张 QVGA YUV422，并软件压缩为 JPEG 后保存到 PSRAM/RAM 中作为最近帧。
 esp_err_t fridge_camera_capture(void);
+
+// 抓取一张低分辨率 RGB565 预览帧，用于 LVGL 登记页实时取景。
+esp_err_t fridge_camera_capture_preview_rgb565(fridge_camera_preview_frame_t *out);
+
+// 释放 UI 预览帧数据。
+void fridge_camera_free_preview_frame(fridge_camera_preview_frame_t *frame);
 
 // 抓拍当前实测稳定的 OV3660 XGA 图片并软件压缩为 JPEG，供 AI 图片识别使用。
 // 注意：该路径比串口预览清晰，但不会硬闯当前不稳定的 QXGA/UXGA/SXGA 档位。

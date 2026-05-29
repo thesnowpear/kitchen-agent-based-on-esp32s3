@@ -5,7 +5,8 @@
  */
 
 import { getInventory, sendAiChat } from "../../services/api";
-import type { InventoryItem, RecipeRecommendation } from "../../types/models";
+import { enqueueSyncOp, syncNow } from "../../services/sync";
+import type { InventoryItem, RecipeRecommendation, ShoppingItem } from "../../types/models";
 import { addShoppingItems, getRecipeRecommendations, saveRecipeRecommendations, makeLocalId } from "../../utils/localFeatures";
 
 type RecipeView = RecipeRecommendation & {
@@ -42,6 +43,7 @@ Page({
       const reply = await sendAiChat(prompt, "miniapp-recipe");
       const cards = parseRecipeReply(reply.reply);
       saveRecipeRecommendations(cards);
+      this.queueRecipeSync(cards);
       this.applyCards(cards);
       this.setData({ rawReply: reply.reply });
       wx.showToast({ title: "已生成菜谱", icon: "success" });
@@ -93,7 +95,7 @@ Page({
       wx.showToast({ title: "没有缺少食材", icon: "none" });
       return;
     }
-    addShoppingItems(
+    const shoppingItems = addShoppingItems(
       missing.map((it) => ({
         name: it.name,
         quantityText: it.quantityText || "1 份",
@@ -101,7 +103,28 @@ Page({
         sourceText: `菜谱缺料 · ${card.title}`,
       })),
     );
+    this.queueShoppingSync(shoppingItems);
     wx.showToast({ title: `已加入 ${missing.length} 项`, icon: "success" });
+  },
+
+  queueRecipeSync(cards: RecipeRecommendation[]) {
+    enqueueSyncOp("recipe_cache", "replace", {
+      items: cards,
+      updatedAt: new Date().toISOString(),
+    });
+    void syncNow().catch(() => {
+      // 菜谱缓存保留本地可用，同步失败时队列继续等待。
+    });
+  },
+
+  queueShoppingSync(items: ShoppingItem[]) {
+    enqueueSyncOp("shopping_list", "recipe_add", {
+      items,
+      updatedAt: new Date().toISOString(),
+    });
+    void syncNow().catch(() => {
+      // 缺料清单已经写入本地，同步失败不阻塞用户。
+    });
   },
 
   noop() {

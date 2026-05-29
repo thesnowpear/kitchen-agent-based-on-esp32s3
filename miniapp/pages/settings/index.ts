@@ -16,6 +16,13 @@ import {
   updateAiConfig,
   updateSettings,
 } from "../../services/api";
+import {
+  enqueueSyncOp,
+  getLocalSyncState,
+  getSyncQueue,
+  refreshSyncStatus,
+  syncNow,
+} from "../../services/sync";
 import type {
   AiConfigData,
   AiConfigUpdateRequest,
@@ -25,7 +32,13 @@ import type {
 } from "../../types/models";
 import { RequestError } from "../../utils/request";
 import { getStorage, setStorage } from "../../utils/storage";
-import { addCustomFridgeZone, deleteCustomFridgeZone, getFridgeZones } from "../../utils/fridgeZones";
+import {
+  addCustomFridgeZone,
+  deleteCustomFridgeZone,
+  getFridgeZones,
+  saveFridgeZonesToCloud,
+  syncFridgeZonesFromCloud,
+} from "../../utils/fridgeZones";
 
 const DEFAULT_PRIVACY: PrivacySettings = {
   allowCloudSync: true,
@@ -122,8 +135,17 @@ Page({
 
     /** 设备操作区 */
     refreshing: false,
+    zoneSyncing: false,
     zones: [] as FridgeZoneConfig[],
     newZoneName: "",
+
+    /** 三端同步区 */
+    syncBusy: false,
+    syncRevision: 0,
+    syncQueueCount: 0,
+    syncDirtyText: "无",
+    syncLastText: "尚未同步",
+    syncErrorText: "",
   },
 
   async onShow() {
@@ -136,8 +158,10 @@ Page({
       baseUrl: config.baseUrl,
       mockEnabled: config.mockEnabled,
     });
-    await Promise.all([this.loadPrivacy(), this.loadAiConfig()]);
     this.setData({ zones: getFridgeZones() });
+    this.refreshLocalSyncView();
+    await Promise.all([this.loadPrivacy(), this.loadAiConfig(), this.loadZones()]);
+    await this.refreshRemoteSyncView();
   },
 
   // ---------- API 地址 ----------
@@ -162,6 +186,12 @@ Page({
     };
     const app = getApp<MiniAppInstance["globalData"]>() as unknown as MiniAppInstance;
     app.setApiConfig(config);
+    enqueueSyncOp("settings", "api_config_update", {
+      baseUrl: config.baseUrl,
+      timeoutMs: config.timeoutMs,
+      mockEnabled: config.mockEnabled,
+    });
+    this.refreshLocalSyncView();
     wx.showToast({ title: "API 已更新", icon: "success" });
   },
 
@@ -202,8 +232,13 @@ Page({
     setStorage("privacySettings", this.data.privacy);
     try {
       await updateSettings({ privacy: this.data.privacy });
+      enqueueSyncOp("settings", "privacy_update", { privacy: this.data.privacy });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "隐私已同步", icon: "success" });
     } catch {
+      enqueueSyncOp("settings", "privacy_update_pending", { privacy: this.data.privacy });
+      this.refreshLocalSyncView();
       wx.showToast({ title: "已保存到本地", icon: "none" });
     } finally {
       this.setData({ savingPrivacy: false });
@@ -221,14 +256,23 @@ Page({
     if (this.data.savingPreferences) return;
     this.setData({ savingPreferences: true });
     try {
-      await updateSettings({
+      const preferences = {
+        reminderLeadDays: parseInt(this.data.reminderLeadDays, 10) || 3,
+        lowStockThreshold: parseInt(this.data.lowStockThreshold, 10) || 1,
+      };
+      await updateSettings({ preferences });
+      enqueueSyncOp("settings", "preferences_update", { preferences });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
+      wx.showToast({ title: "提醒偏好已保存", icon: "success" });
+    } catch {
+      enqueueSyncOp("settings", "preferences_update_pending", {
         preferences: {
           reminderLeadDays: parseInt(this.data.reminderLeadDays, 10) || 3,
           lowStockThreshold: parseInt(this.data.lowStockThreshold, 10) || 1,
         },
       });
-      wx.showToast({ title: "提醒偏好已保存", icon: "success" });
-    } catch {
+      this.refreshLocalSyncView();
       wx.showToast({ title: "保存失败", icon: "none" });
     } finally {
       this.setData({ savingPreferences: false });
@@ -255,6 +299,13 @@ Page({
           source: "miniapp-settings",
         },
       });
+      enqueueSyncOp("settings", "notification_subscribe", {
+        channel: "wechat",
+        target,
+        allowReminderPush: this.data.privacy.allowReminderPush,
+      });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "订阅登记已保存", icon: "success" });
     } catch {
       wx.showToast({ title: "订阅登记失败", icon: "none" });
@@ -361,6 +412,7 @@ Page({
     if (this.data.ttsNewKey) payload.ttsApiKey = this.data.ttsNewKey;
     try {
       const cfg = await updateAiConfig(payload);
+      enqueueSyncOp("ai_config", "update", this.maskAiSyncPayload(payload));
       const model = cfg.model || cfg.chatModel || this.data.aiModel || DEFAULT_AI_MODEL;
       const nextSystemPrompt = cfg.systemPrompt ?? systemPrompt;
       const ready = cfg.ready ?? Boolean(cfg.apiBaseUrl && model && cfg.hasApiKey);
@@ -392,8 +444,12 @@ Page({
         ttsHasKey: cfg.ttsHasApiKey ?? this.data.ttsHasKey,
         ttsNewKey: "",
       });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "AI 配置已同步", icon: "success" });
     } catch (err) {
+      enqueueSyncOp("ai_config", "update_pending", this.maskAiSyncPayload(payload));
+      this.refreshLocalSyncView();
       const message =
         err instanceof RequestError ? err.message : "保存失败";
       wx.showToast({ title: message, icon: "none" });
@@ -408,6 +464,7 @@ Page({
     try {
       // backend 约定：apiKey="" 表示清空。
       const cfg = await updateAiConfig({ apiKey: "" });
+      enqueueSyncOp("ai_config", "clear_api_key", { keyCleared: true });
       const model = cfg.model || cfg.chatModel || this.data.aiModel || DEFAULT_AI_MODEL;
       this.setData({
         aiKeyPreview: cfg.apiKeyPreview || "",
@@ -416,6 +473,8 @@ Page({
         aiLastError: cfg.lastError || "",
         aiNewKey: "",
       });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "已清除 Key", icon: "success" });
     } catch {
       wx.showToast({ title: "清除失败", icon: "none" });
@@ -429,11 +488,14 @@ Page({
     this.setData({ aiSaving: true });
     try {
       const cfg = await updateAiConfig({ asrApiKey: "" });
+      enqueueSyncOp("ai_config", "clear_asr_key", { asrKeyCleared: true });
       this.setData({
         asrKeyPreview: cfg.asrApiKeyPreview || "",
         asrHasKey: cfg.asrHasApiKey ?? false,
         asrNewKey: "",
       });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "已清除 ASR Key", icon: "success" });
     } catch {
       wx.showToast({ title: "清除失败", icon: "none" });
@@ -447,11 +509,14 @@ Page({
     this.setData({ aiSaving: true });
     try {
       const cfg = await updateAiConfig({ ttsApiKey: "" });
+      enqueueSyncOp("ai_config", "clear_tts_key", { ttsKeyCleared: true });
       this.setData({
         ttsKeyPreview: cfg.ttsApiKeyPreview || "",
         ttsHasKey: cfg.ttsHasApiKey ?? false,
         ttsNewKey: "",
       });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
       wx.showToast({ title: "已清除 TTS Key", icon: "success" });
     } catch {
       wx.showToast({ title: "清除失败", icon: "none" });
@@ -461,6 +526,37 @@ Page({
   },
 
   // ---------- 设备操作 ----------
+
+  async loadZones() {
+    if (this.data.zoneSyncing) return;
+    this.setData({ zoneSyncing: true });
+    try {
+      const zones = await syncFridgeZonesFromCloud();
+      this.setData({ zones });
+    } catch {
+      this.setData({ zones: getFridgeZones() });
+    } finally {
+      this.setData({ zoneSyncing: false });
+    }
+  },
+
+  async persistZones(zones: FridgeZoneConfig[], successTitle: string) {
+    this.setData({ zones, zoneSyncing: true });
+    try {
+      const synced = await saveFridgeZonesToCloud(zones);
+      enqueueSyncOp("fridge_zones", "replace", { zones: synced });
+      this.setData({ zones: synced });
+      this.refreshLocalSyncView();
+      void this.trySyncQuietly();
+      wx.showToast({ title: successTitle, icon: "success" });
+    } catch {
+      enqueueSyncOp("fridge_zones", "replace_pending", { zones });
+      this.refreshLocalSyncView();
+      wx.showToast({ title: "已保存本地，云端待同步", icon: "none" });
+    } finally {
+      this.setData({ zoneSyncing: false });
+    }
+  },
 
   async onTapRefreshDevice() {
     if (this.data.refreshing) return;
@@ -482,10 +578,74 @@ Page({
     this.setData({ newZoneName: String(event.detail.value || "") });
   },
 
-  onAddZone() {
+  async onTapSyncNow() {
+    if (this.data.syncBusy) return;
+    this.setData({ syncBusy: true, syncErrorText: "" });
+    try {
+      await syncNow({ forceDeviceRefresh: true });
+      this.refreshLocalSyncView();
+      wx.showToast({ title: "同步完成", icon: "success" });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "同步失败";
+      this.refreshLocalSyncView();
+      this.setData({ syncErrorText: message });
+      wx.showToast({ title: message, icon: "none" });
+    } finally {
+      this.setData({ syncBusy: false });
+    }
+  },
+
+  async refreshRemoteSyncView() {
+    const state = await refreshSyncStatus();
+    this.applySyncState(state);
+  },
+
+  refreshLocalSyncView() {
+    this.applySyncState(getLocalSyncState());
+  },
+
+  applySyncState(state: ReturnType<typeof getLocalSyncState>) {
+    const queue = getSyncQueue();
+    const last = Math.max(state.lastPushedAt || 0, state.lastPulledAt || 0);
+    this.setData({
+      syncRevision: state.serverRevision || 0,
+      syncQueueCount: queue.length,
+      syncDirtyText: state.dirtyDomains?.length ? state.dirtyDomains.join(" / ") : "无",
+      syncLastText: last ? this.formatSyncTime(last) : "尚未同步",
+      syncErrorText: state.lastSyncError || "",
+    });
+  },
+
+  formatSyncTime(ts: number): string {
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  },
+
+  async trySyncQuietly() {
+    try {
+      await syncNow();
+    } catch {
+      // 页面保存成功即可；同步错误会显示在同步状态卡片。
+    } finally {
+      this.refreshLocalSyncView();
+    }
+  },
+
+  maskAiSyncPayload(payload: AiConfigUpdateRequest): Record<string, unknown> {
+    const masked: Record<string, unknown> = { ...payload };
+    if (payload.apiKey !== undefined) masked.apiKeyChanged = true;
+    if (payload.asrApiKey !== undefined) masked.asrApiKeyChanged = true;
+    if (payload.ttsApiKey !== undefined) masked.ttsApiKeyChanged = true;
+    delete masked.apiKey;
+    delete masked.asrApiKey;
+    delete masked.ttsApiKey;
+    return masked;
+  },
+
+  async onAddZone() {
     const zones = addCustomFridgeZone(this.data.newZoneName || "");
     this.setData({ zones, newZoneName: "" });
-    wx.showToast({ title: "已添加分区", icon: "success" });
+    await this.persistZones(zones, "分区已同步");
   },
 
   onDeleteZone(event: WechatMiniprogram.BaseEvent) {
@@ -499,7 +659,8 @@ Page({
       confirmColor: "#d95745",
       success: (res) => {
         if (!res.confirm) return;
-        this.setData({ zones: deleteCustomFridgeZone(key) });
+        const zones = deleteCustomFridgeZone(key);
+        void this.persistZones(zones, "分区已删除");
       },
     });
   },

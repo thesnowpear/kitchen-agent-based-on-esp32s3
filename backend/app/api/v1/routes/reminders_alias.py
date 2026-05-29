@@ -24,6 +24,8 @@ from app.schemas.reminder import (
     ReminderListData,
     ReminderSchema,
 )
+from app.services.sync_device_bridge import push_cloud_snapshot_to_devices
+from app.services.sync_service import get_status, record_server_event
 
 router = APIRouter()
 
@@ -72,6 +74,21 @@ async def reminders_confirm(
         raise HTTPException(status_code=404, detail="reminder not found")
     reminder.status = payload.status
     reminder.acked_at = datetime.now(timezone.utc)
+    await record_server_event(
+        db,
+        home_id=home.id,
+        user_id=_user.id,
+        domain="reminder",
+        op="confirm",
+        payload={"id": str(reminder.id), "status": reminder.status},
+    )
     await db.commit()
     await db.refresh(reminder)
+    await push_cloud_snapshot_to_devices(
+        db,
+        home_id=home.id,
+        server_revision=(await get_status(db, home.id)).server_revision,
+        domains={"reminder"},
+        request_device_inventory=False,
+    )
     return ApiResponse[ReminderSchema](data=_reminder_to_schema(reminder))

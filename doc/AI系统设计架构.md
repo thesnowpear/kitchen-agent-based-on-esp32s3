@@ -48,6 +48,8 @@ OpenAI-compatible API
 | `shopping_list_generate` | 生成购物清单 | 建议购买、可选补充、依据 |
 | `reminder_explain` | 解释临期/过期提醒 | 食材、剩余天数、位置、保守处理建议 |
 | `voice_intent_parse` | 语音意图解析 | 意图、槽位、需要确认的信息 |
+| `kitchen_tool_control` | 厨房计时工具控制 | 白名单 JSON，支持定时器、秒表、闹钟 |
+| `ui_control` | 屏幕页面切换 | 白名单 JSON，只允许低风险页面切换 |
 
 ## 4. 上下文注入策略
 
@@ -90,6 +92,13 @@ OpenAI-compatible API
 
 `test_ai_chat` 仍作为隐藏/次要的基础连通性探针保留；`AI 助手` 页面同时提供 AI 设置、任务模式、上下文预览、真实对话和硬件测试记忆维护。
 
+AI 助手回复会经过 `ai_actions` 白名单动作层。当前允许自动执行：
+
+- `ui.switch_page`：切换到 `home`、`standby`、`zone`、`door`、`recipe`、`nutrition`、`shopping`、`settings`、`wifi`、`more`、`offline`、`ai`、`timer`、`stopwatch`、`alarm`。
+- `timer`、`stopwatch`、`alarm`：沿用厨房工具组件的定时器、秒表和闹钟控制。
+
+当前禁止 AI 自动执行拍照页、亮度、音量、Wi-Fi 连接、库存写入、OTA 和 GPIO 控制。页面切换通过 `fridge_ui_set_page_async()` 投递给 LVGL UI 线程，后台 AI/USB/语音任务不得直接操作 LVGL 对象。
+
 ## 7. 设备直连 AI API
 
 设备端直接调用 OpenAI-compatible 接口。首版最小接口：
@@ -112,6 +121,8 @@ OpenAI-compatible API
 
 - AI 识别结果低置信度、图片模糊、遮挡或包装文字不清时必须要求用户确认或重新拍照。
 - 不得自动删除、消耗、移动或修改库存。
+- 不得自动进入拍照页或触发摄像头采集；OV3660 预览/抓拍必须由用户显式操作。
+- 不得自动修改亮度、音量、Wi-Fi 连接、OTA、GPIO 或其他硬件配置。
 - 临期和过期食品建议必须保守；异味、霉变、胀包、冷链异常时提醒谨慎食用或丢弃。
 - 不声称能看到实时画面、传感器或真实库存，除非系统输入明确提供。
 - 对儿童饮食、疾病饮食和过敏问题保持谨慎，必要时建议咨询专业人士。

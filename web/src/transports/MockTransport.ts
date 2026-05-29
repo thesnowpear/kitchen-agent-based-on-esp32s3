@@ -30,12 +30,15 @@ import type {
   DeviceChatHistory,
   DeviceCommand,
   DeviceResponse,
+  KitchenToolsStatus,
   MemorySummary,
   MQTTConfig,
   NetworkConfig,
   ProjectAITaskRequest,
   ProjectAITaskResponse,
   RadarSnapshot,
+  StateMachineConfig,
+  StateMachineStatus,
   TTSConfig,
   TTSStatus,
   WakeStatus,
@@ -103,6 +106,16 @@ export class MockTransport extends BaseTransport {
   private aiProfiles: AIConfig[] = [this.aiConfig];
   private asrConfig: ASRConfig = createMockASRConfig();
   private ttsConfig: TTSConfig = createMockTTSConfig();
+  private stateMachineConfig: StateMachineConfig = {
+    nightLightThreshold: 250,
+    dayLightThreshold: 450,
+    radarTwoMeterRaw: 200,
+    radarTwoMeterGate: 8,
+    sleepEnabled: false,
+    autoVoiceAfterClose: true,
+    autoVoiceRecordSeconds: 6,
+    closeStableMs: 2500,
+  };
   private ttsStatus: TTSStatus = {
     state: "idle",
     sampleRate: 24000,
@@ -115,6 +128,26 @@ export class MockTransport extends BaseTransport {
     voice: "",
     error: "",
   };
+  private kitchenTools: KitchenToolsStatus = {
+    timeReady: true,
+    timer: {
+      state: "idle",
+      durationSeconds: 0,
+      remainingSeconds: 0,
+      label: "",
+    },
+    stopwatch: {
+      state: "idle",
+      elapsedSeconds: 0,
+    },
+    alarms: [],
+    lastAlert: "",
+    lastError: "",
+  };
+  private kitchenTimerStartedAt = 0;
+  private kitchenTimerEndsAt = 0;
+  private stopwatchStartedAt = 0;
+  private nextAlarmId = 1;
   private wakeStatus: WakeStatus = createMockWakeStatus();
   private cameraStatus: CameraStatus = createMockCameraStatus(false);
   private cameraPreviewDataUrl: string | null = null;
@@ -145,6 +178,31 @@ export class MockTransport extends BaseTransport {
     prunedCount: 0,
     messages: [],
   };
+
+  private createStateMachineStatus(): StateMachineStatus {
+    const sensors = createMockSensors();
+    return {
+      state: sensors.stateMachine?.state ?? "SLEEP",
+      doorState: sensors.stateMachine?.doorState ?? "CLOSED",
+      offline: false,
+      isNight: (sensors.lightValue10bit ?? sensors.lux) < this.stateMachineConfig.nightLightThreshold,
+      radarSoftwarePaused: (sensors.lightValue10bit ?? sensors.lux) < this.stateMachineConfig.nightLightThreshold,
+      radarPresenceReliable: Boolean(sensors.radar?.stablePresence),
+      radarWithin2m: false,
+      radarWithin1m: false,
+      radarApproaching: Boolean(sensors.radar?.approaching),
+      imuMotionStrength: 0.08,
+      lightValue10bit: sensors.lightValue10bit ?? sensors.lux,
+      lightDelta: sensors.lightDelta,
+      radarDistanceRaw: sensors.radar?.smoothedDistanceRaw ?? 0,
+      radarGate: sensors.radar?.stableGate ?? 0,
+      lastReason: "Mock 状态机：亮度与雷达阈值模拟",
+      autoVoiceState: "IDLE",
+      autoVoiceError: "",
+      updatedAtMs: Date.now(),
+      stateSinceMs: Date.now() - 5000,
+    };
+  }
 
   private withVoiceDiagnostics(status: VoiceChatStatus): VoiceChatStatus {
     const sampleCount = Math.floor(status.pcmBytes / 2);
@@ -370,6 +428,20 @@ export class MockTransport extends BaseTransport {
         };
         responsePayload = this.ttsConfig;
         break;
+      case "get_state_machine_config":
+        responsePayload = this.stateMachineConfig;
+        break;
+      case "set_state_machine_config":
+        this.stateMachineConfig = {
+          ...this.stateMachineConfig,
+          ...(payload as Partial<StateMachineConfig>),
+        };
+        this.emitLog("info", "Mock 状态机配置已保存。", "state");
+        responsePayload = this.stateMachineConfig;
+        break;
+      case "get_state_machine_status":
+        responsePayload = this.createStateMachineStatus();
+        break;
       case "create_ai_profile": {
         const nextId = Math.max(...this.aiProfiles.map((item) => item.profileId ?? 0)) + 1;
         this.aiConfig = {
@@ -424,7 +496,8 @@ export class MockTransport extends BaseTransport {
         if (!this.aiConfig.hasApiKey) {
           throw new Error("Mock AI 缺少 API Key，请先保存一个测试 Key。");
         }
-        const reply = this.createAssistantReply(request);
+        const tool = this.tryExecuteKitchenToolFromText(request.message);
+        const reply = tool?.message ?? this.createAssistantReply(request);
         const historyCount = this.chatHistory.messages.length;
         const historyPrunedCount = this.appendMockChatHistory(request, reply);
         responsePayload = {
@@ -441,8 +514,79 @@ export class MockTransport extends BaseTransport {
           historyCount: Math.min(historyCount, this.chatHistory.maxMessages),
           historyPersisted: true,
           historyPrunedCount,
+          toolExecuted: Boolean(tool),
+          toolMessage: tool?.message ?? "",
         } satisfies AIAssistantChatResponse;
         this.emitLog("info", `Mock AI 助手已注入上下文并完成：${request.taskType}`, "ai");
+        break;
+      }
+      case "get_kitchen_tools":
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "timer_start": {
+        const request = payload as { durationSeconds?: number; duration_seconds?: number; label?: string } | undefined;
+        const seconds = Math.max(1, request?.durationSeconds ?? request?.duration_seconds ?? 480);
+        this.startKitchenTimer(seconds, request?.label || "厨房");
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      }
+      case "timer_pause":
+        this.pauseKitchenTimer();
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "timer_resume":
+        this.resumeKitchenTimer();
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "timer_cancel":
+        this.kitchenTools.timer = { state: "idle", durationSeconds: 0, remainingSeconds: 0, label: "" };
+        this.kitchenTimerStartedAt = 0;
+        this.kitchenTimerEndsAt = 0;
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "stopwatch_start":
+        this.startStopwatch();
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "stopwatch_pause":
+        this.pauseStopwatch();
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "stopwatch_reset":
+        this.kitchenTools.stopwatch = { state: "idle", elapsedSeconds: 0 };
+        this.stopwatchStartedAt = 0;
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      case "alarm_set": {
+        const request = payload as { hour?: number; minute?: number; label?: string } | undefined;
+        const hour = request?.hour ?? 7;
+        const minute = request?.minute ?? 0;
+        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+          throw new Error("闹钟时间无效");
+        }
+        if (this.kitchenTools.alarms.length >= 5) {
+          throw new Error("最多只能设置 5 个闹钟");
+        }
+        this.kitchenTools.alarms = [
+          ...this.kitchenTools.alarms,
+          { id: this.nextAlarmId++, enabled: true, ringing: false, hour, minute, label: request?.label || "厨房提醒" },
+        ];
+        responsePayload = this.getKitchenToolsSnapshot();
+        break;
+      }
+      case "alarm_cancel":
+      case "alarm_dismiss": {
+        const request = payload as { id?: number } | undefined;
+        const id = request?.id ?? this.kitchenTools.alarms[0]?.id;
+        if (!id) {
+          throw new Error("没有可操作的闹钟");
+        }
+        if (command === "alarm_cancel") {
+          this.kitchenTools.alarms = this.kitchenTools.alarms.filter((alarm) => alarm.id !== id);
+        } else {
+          this.kitchenTools.alarms = this.kitchenTools.alarms.map((alarm) => (alarm.id === id ? { ...alarm, ringing: false } : alarm));
+        }
+        responsePayload = this.getKitchenToolsSnapshot();
         break;
       }
       case "wake_start":
@@ -815,7 +959,10 @@ export class MockTransport extends BaseTransport {
         responsePayload = createMockPins();
         break;
       case "get_sensors":
-        responsePayload = createMockSensors();
+        responsePayload = {
+          ...createMockSensors(),
+          stateMachine: this.createStateMachineStatus(),
+        };
         break;
       case "get_diagnostics":
         responsePayload = createMockDiagnostics();
@@ -877,6 +1024,103 @@ export class MockTransport extends BaseTransport {
       window.clearInterval(this.wakeTimer);
       this.wakeTimer = undefined;
     }
+  }
+
+  private getKitchenToolsSnapshot(): KitchenToolsStatus {
+    const now = Date.now();
+    const timer = { ...this.kitchenTools.timer };
+    if (timer.state === "running") {
+      timer.remainingSeconds = Math.max(0, Math.ceil((this.kitchenTimerEndsAt - now) / 1000));
+      if (timer.remainingSeconds <= 0) {
+        timer.state = "ringing";
+        this.kitchenTools.lastAlert = `${timer.label || "厨房"}定时器到了`;
+        this.kitchenTools.timer = timer;
+      }
+    }
+    const stopwatch = { ...this.kitchenTools.stopwatch };
+    if (stopwatch.state === "running") {
+      stopwatch.elapsedSeconds = Math.max(0, Math.floor((now - this.stopwatchStartedAt) / 1000) + this.kitchenTools.stopwatch.elapsedSeconds);
+    }
+    return {
+      ...this.kitchenTools,
+      timer,
+      stopwatch,
+      alarms: this.kitchenTools.alarms.map((alarm) => ({ ...alarm })),
+    };
+  }
+
+  private startKitchenTimer(seconds: number, label: string) {
+    const now = Date.now();
+    this.kitchenTimerStartedAt = now;
+    this.kitchenTimerEndsAt = now + seconds * 1000;
+    this.kitchenTools.timer = {
+      state: "running",
+      durationSeconds: seconds,
+      remainingSeconds: seconds,
+      label,
+    };
+    this.kitchenTools.lastError = "";
+    this.emitLog("info", `Mock 定时器已启动：${label} ${seconds}s`, "kitchen_tools");
+  }
+
+  private pauseKitchenTimer() {
+    const snap = this.getKitchenToolsSnapshot();
+    if (snap.timer.state !== "running") {
+      throw new Error("定时器未在运行");
+    }
+    this.kitchenTools.timer = { ...snap.timer, state: "paused" };
+  }
+
+  private resumeKitchenTimer() {
+    if (this.kitchenTools.timer.state !== "paused" || this.kitchenTools.timer.remainingSeconds <= 0) {
+      throw new Error("定时器不能继续");
+    }
+    const now = Date.now();
+    this.kitchenTimerStartedAt = now;
+    this.kitchenTimerEndsAt = now + this.kitchenTools.timer.remainingSeconds * 1000;
+    this.kitchenTools.timer = { ...this.kitchenTools.timer, state: "running" };
+  }
+
+  private startStopwatch() {
+    if (this.kitchenTools.stopwatch.state !== "running") {
+      this.stopwatchStartedAt = Date.now();
+      this.kitchenTools.stopwatch = { ...this.kitchenTools.stopwatch, state: "running" };
+    }
+  }
+
+  private pauseStopwatch() {
+    const snap = this.getKitchenToolsSnapshot();
+    if (snap.stopwatch.state !== "running") {
+      throw new Error("秒表未在运行");
+    }
+    this.kitchenTools.stopwatch = { ...snap.stopwatch, state: "paused" };
+  }
+
+  private tryExecuteKitchenToolFromText(text: string) {
+    if (/定时器|分钟|秒钟/.test(text)) {
+      const minuteMatch = text.match(/(\d+)\s*分钟/);
+      const secondMatch = text.match(/(\d+)\s*秒/);
+      const seconds = (minuteMatch ? Number(minuteMatch[1]) * 60 : 0) + (secondMatch ? Number(secondMatch[1]) : 0);
+      if (seconds > 0) {
+        const label = text.includes("煮蛋") ? "煮蛋" : "厨房";
+        this.startKitchenTimer(seconds, label);
+        return { message: `已启动${label}定时器，${Math.floor(seconds / 60)}分钟${String(seconds % 60).padStart(2, "0")}秒` };
+      }
+    }
+    if (/开始秒表/.test(text)) {
+      this.startStopwatch();
+      return { message: "秒表已开始" };
+    }
+    if (/暂停秒表/.test(text)) {
+      this.pauseStopwatch();
+      return { message: "秒表已暂停" };
+    }
+    if (/重置秒表|清零秒表/.test(text)) {
+      this.kitchenTools.stopwatch = { state: "idle", elapsedSeconds: 0 };
+      this.stopwatchStartedAt = 0;
+      return { message: "秒表已重置" };
+    }
+    return null;
   }
 
   private createMockCameraPreview() {

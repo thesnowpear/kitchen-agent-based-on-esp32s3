@@ -13,7 +13,19 @@
     <button class="btn" style="margin-top: var(--space-5);" loading="{{refreshing}}" bindtap="onTapRetry">现在尝试同步</button>
   </view>
 
-  <block wx:else>
+  <view class="panel offline-summary">
+    <view class="row">
+      <view>
+        <view class="kicker">同步队列</view>
+        <view class="subtitle">服务端版本 {{syncRevision}} · 待上传 {{syncQueueCount}} 条</view>
+      </view>
+      <view class="tag {{syncQueueCount > 0 ? 'warn' : 'mint'}}">{{syncQueueCount > 0 ? '待同步' : '已就绪'}}</view>
+    </view>
+    <view class="soft field-hint">变更域：{{syncDirtyText}} · 最近同步：{{syncLastText}}</view>
+    <view wx:if="{{syncErrorText}}" class="subtitle">最近错误：{{syncErrorText}}</view>
+  </view>
+
+  <block wx:if="{{hasSnapshot}}">
     <view class="panel offline-summary">
       <view class="kicker">缓存时间</view>
       <view class="offline-time">{{savedText}}</view>

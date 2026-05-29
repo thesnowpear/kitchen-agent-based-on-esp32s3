@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "cJSON.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -24,6 +26,7 @@
 #define AI_NVS_KEY_SYSTEM "system"
 #define AI_NVS_KEY_TIMEOUT "timeout_ms"
 #define AI_NVS_KEY_ACTIVE_PROFILE "active"
+#define AI_NVS_KEY_UPDATED_MS "updated_ms"
 #define AI_HTTP_RESPONSE_CAP 8192
 #define AI_TEST_MAX_TOKENS 128
 #define AI_ASSISTANT_MAX_TOKENS 512
@@ -65,6 +68,15 @@ static uint32_t clamp_timeout_ms(uint32_t timeout_ms)
         return 60000;
     }
     return timeout_ms;
+}
+
+static int64_t ai_config_now_ms(void)
+{
+    time_t now = time(NULL);
+    if (now >= 1735689600LL) {
+        return (int64_t)now * 1000;
+    }
+    return esp_timer_get_time() / 1000;
 }
 
 static bool starts_with(const char *text, const char *prefix)
@@ -417,6 +429,8 @@ static void make_profile_key(uint8_t profile_id, const char *field, char *out, s
             strlcpy(out, AI_NVS_KEY_SYSTEM, out_size);
         } else if (strcmp(field, "timeout") == 0) {
             strlcpy(out, AI_NVS_KEY_TIMEOUT, out_size);
+        } else if (strcmp(field, "updated") == 0) {
+            strlcpy(out, AI_NVS_KEY_UPDATED_MS, out_size);
         } else {
             strlcpy(out, "name0", out_size);
         }
@@ -434,8 +448,24 @@ static void make_profile_key(uint8_t profile_id, const char *field, char *out, s
         prefix = 's';
     } else if (strcmp(field, "timeout") == 0) {
         prefix = 't';
+    } else if (strcmp(field, "updated") == 0) {
+        prefix = 'u';
     }
     snprintf(out, out_size, "%c%u", prefix, (unsigned)profile_id);
+}
+
+static int64_t load_profile_updated_ms(uint8_t profile_id)
+{
+    nvs_handle_t handle;
+    if (open_ai_nvs(NVS_READONLY, &handle) != ESP_OK) {
+        return 0;
+    }
+    char key[16];
+    int64_t updated_ms = 0;
+    make_profile_key(profile_id, "updated", key, sizeof(key));
+    (void)nvs_get_i64(handle, key, &updated_ms);
+    nvs_close(handle);
+    return updated_ms > 0 ? updated_ms : 0;
 }
 
 static uint8_t get_active_profile_id(void)
@@ -546,6 +576,11 @@ static esp_err_t load_profile_config(uint8_t profile_id, fridge_ai_config_update
         timeout_ms = FRIDGE_AI_DEFAULT_TIMEOUT_MS;
     }
     config->timeout_ms = clamp_timeout_ms(timeout_ms);
+    int64_t updated_ms = 0;
+    make_profile_key(profile_id, "updated", key, sizeof(key));
+    if (nvs_get_i64(handle, key, &updated_ms) == ESP_OK && updated_ms > 0) {
+        config->config_updated_at_ms = updated_ms;
+    }
     nvs_close(handle);
     return ESP_OK;
 }
@@ -679,7 +714,13 @@ static char *build_assistant_request(const fridge_ai_config_update_t *config, co
 
     const char *assistant_policy =
         "你现在运行在冰箱小精灵硬件测试模式。必须优先依据下方项目上下文回答；"
-        "不要编造库存、日期、数量、识别结果或传感器状态；涉及库存变更、识别候选、过敏、过期和霉变时要保守，并提醒用户确认。";
+        "不要编造库存、日期、数量、识别结果或传感器状态；涉及库存变更、识别候选、过敏、过期和霉变时要保守，并提醒用户确认。"
+        "如果用户明确要求定时器、秒表或闹钟，请优先输出一段可执行紧凑 JSON，例如 {\"tool\":\"timer\",\"action\":\"start\",\"duration_seconds\":480,\"label\":\"煮蛋\"}、{\"tool\":\"stopwatch\",\"action\":\"start\"} 或 {\"tool\":\"alarm\",\"action\":\"set\",\"hour\":7,\"minute\":0,\"label\":\"拿牛奶\"}；不要把缺失的时间或时长编出来。"
+        "如果用户明确要求切换屏幕页面，只能输出白名单 UI JSON：{\"tool\":\"ui\",\"action\":\"switch_page\",\"page\":\"home|standby|zone|door|recipe|nutrition|shopping|settings|wifi|more|offline|ai|timer|stopwatch|alarm\"}。"
+        "不要输出 camera 或 camera_result 页面指令，因为拍照页会启动摄像头预览，必须由用户手动确认进入；不要尝试控制亮度、音量、Wi-Fi 连接、拍照、库存写入、OTA 或 GPIO。"
+        "你可以自主决定是否更新长期结构化记忆，但只能在用户明确表达稳定偏好、家庭人数、忌口、过敏、常用工具、长期习惯，或用户明确要求记住/忘记时使用；闲聊、单次菜谱、传感器状态、临时库存、未确认识别结果不要写入长期记忆。"
+        "需要写记忆时，在回复最后另起一行输出给固件的隐藏指令：MEMORY_OP:{\"action\":\"append|replace|clear\",\"key\":\"taste|avoid|allergies|family_size|kitchen_tools|recent_summary\",\"value\":\"不超过80字的中文摘要\",\"reason\":\"简短原因\"}。"
+        "如果不需要写记忆，不要输出 MEMORY_OP。用户可见回答不要解释这条隐藏指令。";
     char *policy = json_escape_alloc(assistant_policy);
     if (!policy) {
         for (size_t i = 0; i < history_count; i++) {
@@ -996,6 +1037,16 @@ esp_err_t fridge_ai_client_set_config(const fridge_ai_config_update_t *config)
         err = nvs_set_str(handle, key, config->api_key);
     }
     if (err == ESP_OK) {
+        make_profile_key(profile_id, "updated", key, sizeof(key));
+        int64_t previous_ms = load_profile_updated_ms(profile_id);
+        int64_t now_ms = ai_config_now_ms();
+        int64_t updated_ms = config->config_updated_at_ms > 0 ? config->config_updated_at_ms : now_ms;
+        if (config->config_updated_at_ms <= 0 && updated_ms <= previous_ms) {
+            updated_ms = previous_ms + 1;
+        }
+        err = nvs_set_i64(handle, key, updated_ms);
+    }
+    if (err == ESP_OK) {
         err = nvs_set_u8(handle, AI_NVS_KEY_ACTIVE_PROFILE, profile_id);
     }
     if (err == ESP_OK) {
@@ -1010,6 +1061,47 @@ esp_err_t fridge_ai_client_set_config(const fridge_ai_config_update_t *config)
         set_last_error("AI 配置保存失败");
     }
     return err;
+}
+
+esp_err_t fridge_ai_client_get_sync_payload(char *out, size_t out_size)
+{
+    ESP_RETURN_ON_FALSE(out && out_size > 0, ESP_ERR_INVALID_ARG, TAG, "invalid sync payload buffer");
+    out[0] = '\0';
+
+    fridge_ai_config_update_t *config = calloc(1, sizeof(*config));
+    ESP_RETURN_ON_FALSE(config, ESP_ERR_NO_MEM, TAG, "AI sync config allocation failed");
+    esp_err_t err = load_full_config(config);
+    if (err != ESP_OK) {
+        free(config);
+        return err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        free(config);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddNumberToObject(root, "schema_version", 1);
+    cJSON_AddNumberToObject(root, "configUpdatedAt", (double)config->config_updated_at_ms);
+    cJSON_AddStringToObject(root, "apiBaseUrl", config->api_base_url);
+    cJSON_AddStringToObject(root, "apiKey", config->api_key);
+    cJSON_AddStringToObject(root, "chatModel", config->model);
+    cJSON_AddStringToObject(root, "systemPrompt", config->system_prompt);
+    cJSON_AddNumberToObject(root, "timeoutMs", config->timeout_ms);
+    cJSON_AddStringToObject(root, "profileName", config->profile_name);
+
+    char *printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    free(config);
+    ESP_RETURN_ON_FALSE(printed, ESP_ERR_NO_MEM, TAG, "print AI sync payload failed");
+    size_t len = strlen(printed);
+    if (len >= out_size) {
+        cJSON_free(printed);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out, printed, len + 1);
+    cJSON_free(printed);
+    return ESP_OK;
 }
 
 esp_err_t fridge_ai_client_clear_key(void)

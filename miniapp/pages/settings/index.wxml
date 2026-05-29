@@ -6,6 +6,21 @@
     </view>
   </view>
 
+  <!-- 0. 三端同步状态 -->
+  <view class="panel">
+    <view class="row">
+      <view>
+        <view class="kicker">三端同步</view>
+        <view class="title" style="font-size: var(--text-md); margin: var(--space-2) 0;">备份与双向同步</view>
+      </view>
+      <view class="tag {{syncQueueCount > 0 ? 'warn' : 'mint'}}">{{syncQueueCount > 0 ? '待同步' : '已就绪'}}</view>
+    </view>
+    <view class="subtitle">服务端版本：{{syncRevision}} · 待上传：{{syncQueueCount}} · 变更域：{{syncDirtyText}}</view>
+    <view class="soft field-hint">最近同步：{{syncLastText}}</view>
+    <view wx:if="{{syncErrorText}}" class="ai-alert">同步错误：{{syncErrorText}}</view>
+    <button class="btn secondary" style="margin-top: var(--space-5);" loading="{{syncBusy}}" bindtap="onTapSyncNow">立即同步</button>
+  </view>
+
   <!-- 1. 后端 API -->
   <view class="panel">
     <view class="kicker">后端 API</view>
@@ -59,7 +74,7 @@
   <!-- 2.6 空间分区 -->
   <view class="panel">
     <view class="kicker">空间分区</view>
-    <view class="subtitle">标准分区固定保留；自定义分区存在本地，库存字段可使用 custom_*。</view>
+    <view class="subtitle">标准分区固定保留；自定义分区会同步到云端，本地保留离线缓存。</view>
     <view class="zone-list">
       <view wx:for="{{zones}}" wx:key="key" class="zone-row">
         <view>

@@ -20,6 +20,7 @@ extern "C" {
 #define FRIDGE_TTS_DEFAULT_VOICE "fnlp/MOSS-TTSD-v0.5:alex"
 #define FRIDGE_TTS_DEFAULT_TIMEOUT_MS 45000
 #define FRIDGE_TTS_SAMPLE_RATE 24000
+#define FRIDGE_SPEAKER_DEFAULT_VOLUME 70
 
 typedef enum {
     FRIDGE_SPEAKER_STATE_IDLE = 0,
@@ -46,6 +47,7 @@ typedef struct {
     char voice[FRIDGE_TTS_MAX_VOICE_LEN + 1];
     char api_key[FRIDGE_TTS_MAX_API_KEY_LEN + 1];
     uint32_t timeout_ms;
+    int64_t config_updated_at_ms;
     bool update_api_key;
 } fridge_tts_config_update_t;
 
@@ -66,6 +68,13 @@ esp_err_t fridge_speaker_init(void);
 esp_err_t fridge_tts_get_config(fridge_tts_config_view_t *out);
 esp_err_t fridge_tts_set_config(const fridge_tts_config_update_t *config);
 esp_err_t fridge_tts_clear_key(void);
+// 生成设备本地 TTS 同步文档；比赛演示版会包含明文 API Key，只能走受控同步通道。
+esp_err_t fridge_tts_get_sync_payload(char *out, size_t out_size);
+esp_err_t fridge_speaker_preview_volume(uint8_t percent);
+esp_err_t fridge_speaker_set_volume(uint8_t percent);
+uint8_t fridge_speaker_get_volume(void);
+esp_err_t fridge_speaker_set_tts_enabled(bool enabled);
+bool fridge_speaker_get_tts_enabled(void);
 esp_err_t fridge_speaker_synthesize_and_play(const char *text, fridge_speaker_status_t *out);
 esp_err_t fridge_speaker_get_status(fridge_speaker_status_t *out);
 esp_err_t fridge_speaker_stop(void);

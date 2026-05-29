@@ -3,12 +3,13 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 
-# 使用自定义 8MB 分区表：双 OTA、LittleFS、本地 coredump。
+# 使用自定义 8MB 分区表：大主固件 + 小 recovery、本地资源分区和 coredump。
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_recovery.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_recovery.csv"
 
-# OTA 回滚：升级失败可回退，适合后续远程运维。
+# OTA 启动状态：主固件运行在 ota_0，小型 recovery 运行在 ota_1。
+# 注意：一大一小后不能再把云端恢复当唯一兜底；recovery 必须保留本地串口/联网恢复入口。
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_ROLLBACK_ENABLE=y
 
@@ -38,12 +39,18 @@ CONFIG_FRIDGE_CAMERA_TEST=n
 CONFIG_FRIDGE_CAMERA_XCLK_HZ=10000000
 CONFIG_FRIDGE_CAMERA_PREVIEW_MAX_BYTES=65536
 
+# 当前传感器、触摸和 USB I2C 调试路径仍使用 ESP-IDF legacy I2C。
+# esp32-camera 的 SCCB 也必须走 legacy 驱动，避免 IDF6 启动期检测到新旧 I2C 混用后 abort。
+CONFIG_SCCB_HARDWARE_I2C_DRIVER_LEGACY=y
+# CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW is not set
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
+
 # AI API 测试使用 HTTPS 与系统证书包，不额外在固件中硬编码服务商证书。
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
 # ESP-SR WakeNet：第一版只加载官方“小滨小滨/小冰小冰”唤醒词模型。
-# 模型烧录到 partitions.csv 中固定 label=model 的分区，保留双 OTA，不启用 MultiNet 命令词。
+# 模型烧录到 partitions_recovery.csv 中固定 label=model 的分区，不启用 MultiNet 命令词。
 CONFIG_MODEL_IN_FLASH=y
 CONFIG_AFE_INTERFACE_V1=y
 CONFIG_SR_NSN_WEBRTC=y
@@ -74,3 +81,6 @@ CONFIG_LV_USE_DEMO_MUSIC=n
 CONFIG_LV_USE_DEMO_FLEX_LAYOUT=n
 CONFIG_LV_USE_DEMO_MULTILANG=n
 CONFIG_LV_USE_DEMO_VECTOR_GRAPHIC=n
+
+# 默认构建完整主固件。需要生成 ota_1 小型兜底固件时，临时打开该项并执行 reconfigure build。
+CONFIG_FRIDGE_RECOVERY_APP=n

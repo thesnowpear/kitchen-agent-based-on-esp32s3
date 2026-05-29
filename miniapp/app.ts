@@ -27,6 +27,7 @@ import type {
 } from "./types/models";
 import { getStorage, setStorage } from "./utils/storage";
 import { updateOfflineSnapshot } from "./utils/localFeatures";
+import { syncNow } from "./services/sync";
 
 /** 全局状态。所有 setX 方法都会同步写 storage（缓存 key 与 storage 函数对齐）。 */
 export interface MiniAppGlobalData {
@@ -106,6 +107,14 @@ App<MiniAppGlobalData>({
       });
   },
 
+  onShow() {
+    if (this.globalData.session?.token) {
+      void syncNow().catch((err) => {
+        console.warn("foreground sync failed", err);
+      });
+    }
+  },
+
   /** 静默微信登录：仅 wx.login 拿 code，不调 wx.getUserProfile（避免任何二次确认弹窗）。
    *  失败时把错误塞到 lastLoginError，让 home 页给出"重试"按钮。 */
   async ensureSession(force = false): Promise<AuthSession | null> {
@@ -171,6 +180,9 @@ App<MiniAppGlobalData>({
     try {
       const overview = await getHomeOverview();
       this.setOverview(overview);
+      void syncNow().catch((err) => {
+        console.warn("bootstrap sync failed", err);
+      });
       if (overview.device) {
         this.setActiveDevice(overview.device);
       }

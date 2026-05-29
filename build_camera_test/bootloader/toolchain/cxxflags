@@ -1,6 +1,0 @@
-"-specs=D:/esp-IDF/Project/fridge_spirit/build_camera_test/bootloader/specs/picolibc.specs"
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero
--fno-rtti

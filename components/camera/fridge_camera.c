@@ -15,6 +15,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_psram.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/portmacro.h"
 #include "img_converters.h"
 
 #ifndef CONFIG_FRIDGE_CAMERA_XCLK_HZ
@@ -30,6 +33,7 @@
 #define CAM_LOW_LIGHT_MAX_GAIN_X100 240
 #define CAM_LOW_LIGHT_CHROMA_X100 78
 #define CAM_AI_FULLRES_JPEG_QUALITY 82
+#define CAM_LOCK_TIMEOUT_MS 15000
 
 typedef struct {
     framesize_t frame_size;
@@ -40,8 +44,10 @@ typedef struct {
 
 static const cam_ai_capture_option_t CAM_AI_CAPTURE_OPTIONS[] = {
     // 成品路径使用当前实测最高稳定档 XGA。QXGA 会 SCCB 寄存器写失败，UXGA/SXGA 首帧超时，
-    // 不应让用户每次 AI 识别都等待失败重试；更高分辨率后续作为专项诊断链路继续攻关。
+    // 如果完整 UI 场景下 XGA 临时失败，继续降级到 VGA/QVGA，优先保证“能拍照上传给 AI”。
     {FRAMESIZE_XGA, "XGA", "ai xga software jpeg", 3U * 1024U * 1024U},
+    {FRAMESIZE_VGA, "VGA", "ai vga software jpeg", 2U * 1024U * 1024U},
+    {FRAMESIZE_QVGA, "QVGA", "ai qvga software jpeg", 1U * 1024U * 1024U},
 };
 
 static const char *TAG = "fridge_camera";
@@ -70,7 +76,13 @@ enum {
     CAM_PIN_D7 = 18,  // pin_d7 <- OV3660 D9
 };
 
+#if CONFIG_FRIDGE_CAMERA_TEST
 #define CAM_PROBE_I2C_PORT I2C_NUM_1
+#define CAM_PROBE_OWNS_I2C 1
+#else
+#define CAM_PROBE_I2C_PORT I2C_NUM_0
+#define CAM_PROBE_OWNS_I2C 0
+#endif
 #define CAM_PROBE_I2C_HZ 100000
 #define CAM_PROBE_TIMEOUT_MS 80
 #define CAM_PROBE_SCCB_ADDR 0x3C
@@ -90,6 +102,49 @@ static int s_height;
 static uint32_t s_capture_ms;
 static uint32_t s_frame_id;
 static char s_last_error[FRIDGE_CAMERA_MAX_ERROR_LEN + 1];
+static SemaphoreHandle_t s_camera_mutex;
+static portMUX_TYPE s_camera_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static esp_err_t camera_lock(TickType_t timeout_ticks)
+{
+    // esp32-camera 是全局驱动，UI 预览、AI 抓拍和 USB 诊断必须串行访问。
+    // 使用递归互斥是为了允许公开 API 内部复用 reset/init 这类同组件函数。
+    if (!s_camera_mutex) {
+        SemaphoreHandle_t new_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!new_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+        taskENTER_CRITICAL(&s_camera_mutex_init_lock);
+        if (!s_camera_mutex) {
+            s_camera_mutex = new_mutex;
+            new_mutex = NULL;
+        }
+        taskEXIT_CRITICAL(&s_camera_mutex_init_lock);
+        if (new_mutex) {
+            vSemaphoreDelete(new_mutex);
+        }
+    }
+    return xSemaphoreTakeRecursive(s_camera_mutex, timeout_ticks) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static void camera_unlock(void)
+{
+    if (s_camera_mutex) {
+        xSemaphoreGiveRecursive(s_camera_mutex);
+    }
+}
+
+static void reset_camera_state_after_init_failure(void)
+{
+    // 初始化或预热失败后不能保留 s_initialized=true 的半初始化状态；
+    // 否则下一次 UI 预览可能跳过 init，直接在异常驱动状态下 fb_get。
+    (void)esp_camera_deinit();
+    s_initialized = false;
+    s_rgb565_diag_mode = false;
+    s_software_jpeg_mode = false;
+    s_hardware_jpeg_diag_mode = false;
+    s_preview_source_format = 0;
+}
 
 static void set_last_error(const char *message)
 {
@@ -143,6 +198,11 @@ static void probe_xclk_stop(void)
 
 static esp_err_t probe_i2c_start(void)
 {
+#if !CAM_PROBE_OWNS_I2C
+    // 正常 UI 固件里 GPIO4/5 已经由传感器组件安装为 I2C0。
+    // 安全探测只复用现有总线，禁止再安装 I2C1 到同一组物理线。
+    return ESP_OK;
+#else
     // SCCB 兼容 I2C 读写。这里单独使用 I2C1，探测完成立即卸载，避免与完整 esp32-camera 初始化状态混在一起。
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -158,11 +218,14 @@ static esp_err_t probe_i2c_start(void)
         return err;
     }
     return i2c_driver_install(CAM_PROBE_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+#endif
 }
 
 static void probe_i2c_stop(void)
 {
+#if CAM_PROBE_OWNS_I2C
     i2c_driver_delete(CAM_PROBE_I2C_PORT);
+#endif
 }
 
 static esp_err_t probe_read_reg16(uint8_t addr, uint16_t reg, uint8_t *value)
@@ -227,6 +290,77 @@ static uint32_t calc_yuv422_luma_avg(const uint8_t *data, size_t len)
         y_samples += 2;
     }
     return y_samples ? (uint32_t)(y_sum / y_samples) : 0;
+}
+
+static uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+    return (uint16_t)((((uint16_t)r & 0xF8) << 8) |
+                      (((uint16_t)g & 0xFC) << 3) |
+                      ((uint16_t)b >> 3));
+}
+
+static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    int c = (int)y - 16;
+    int d = (int)u - 128;
+    int e = (int)v - 128;
+    if (c < 0) {
+        c = 0;
+    }
+    // UI 取景只做轻量整数换算，避免在预览任务里引入浮点和额外大缓存。
+    *r = clamp_u8_int((298 * c + 409 * e + 128) >> 8);
+    *g = clamp_u8_int((298 * c - 100 * d - 208 * e + 128) >> 8);
+    *b = clamp_u8_int((298 * c + 516 * d + 128) >> 8);
+}
+
+static esp_err_t convert_yuv422_frame_to_rgb565_preview(const camera_fb_t *fb, fridge_camera_preview_frame_t *out)
+{
+    if (!fb || !out || fb->format != PIXFORMAT_YUV422 || !fb->buf || fb->len < 4 || fb->width <= 0 || fb->height <= 0) {
+        set_last_error("ui preview frame is not YUV422");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        return ESP_FAIL;
+    }
+
+    size_t pixel_count = (size_t)fb->width * (size_t)fb->height;
+    size_t out_len = pixel_count * sizeof(uint16_t);
+    if (fb->len < out_len) {
+        set_last_error("ui preview YUV422 frame length is too short");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        return ESP_FAIL;
+    }
+
+    uint8_t *copy = heap_caps_malloc(out_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) {
+        copy = heap_caps_malloc(out_len, MALLOC_CAP_8BIT);
+    }
+    if (!copy) {
+        set_last_error("ui preview rgb565 allocation failed");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        return ESP_ERR_NO_MEM;
+    }
+
+    uint16_t *dst = (uint16_t *)copy;
+    size_t dst_index = 0;
+    // OV3660 当前原始帧在实机上已验证为 YUYV：Y0 U Y1 V。
+    for (size_t i = 0; i + 3 < fb->len && dst_index + 1 < pixel_count; i += 4) {
+        uint8_t y0 = fb->buf[i + 0];
+        uint8_t u = fb->buf[i + 1];
+        uint8_t y1 = fb->buf[i + 2];
+        uint8_t v = fb->buf[i + 3];
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        yuv_to_rgb(y0, u, v, &r, &g, &b);
+        dst[dst_index++] = rgb888_to_rgb565(r, g, b);
+        yuv_to_rgb(y1, u, v, &r, &g, &b);
+        dst[dst_index++] = rgb888_to_rgb565(r, g, b);
+    }
+
+    out->rgb565 = copy;
+    out->len = out_len;
+    out->width = fb->width;
+    out->height = fb->height;
+    return ESP_OK;
 }
 
 static const char *frame_size_label_from_dimensions(int width, int height)
@@ -551,8 +685,19 @@ static void fill_camera_config(camera_config_t *config, pixformat_t pixel_format
     config->pin_pwdn = CAM_PIN_PWDN;
     config->pin_reset = CAM_PIN_RESET;
     config->pin_xclk = CAM_PIN_XCLK;
+#if CONFIG_FRIDGE_CAMERA_TEST
+    // 摄像头专用测试固件会跳过传感器和触摸，可让 esp32-camera 独占 I2C1 做 SCCB。
+    // 这样保留昨天已验证的单摄像头 bring-up 路径，便于继续排查 DVP/供电问题。
     config->pin_sccb_sda = CAM_PIN_SIOD;
     config->pin_sccb_scl = CAM_PIN_SIOC;
+#else
+    // 正常 UI 固件中 GPIO4/5 已由 MPU6050/FT6336U 初始化为 I2C0。
+    // 不能再让 esp32-camera 用 I2C1 驱动同一对物理线，否则安全探测短读可过，
+    // 但完整 OV3660 初始化的大量 SCCB 写寄存器会和 I2C0 采样任务互相干扰。
+    config->pin_sccb_sda = -1;
+    config->pin_sccb_scl = -1;
+    config->sccb_i2c_port = I2C_NUM_0;
+#endif
     config->pin_d7 = CAM_PIN_D7;
     config->pin_d6 = CAM_PIN_D6;
     config->pin_d5 = CAM_PIN_D5;
@@ -601,6 +746,7 @@ static esp_err_t init_raw_camera(pixformat_t pixel_format, framesize_t frame_siz
     apply_auto_image_controls(mode_name);
     err = warmup_frames(mode_name, CAM_RAW_WARMUP_FRAME_COUNT);
     if (err != ESP_OK) {
+        reset_camera_state_after_init_failure();
         return err;
     }
     return ESP_OK;
@@ -638,6 +784,7 @@ static esp_err_t init_hardware_jpeg_camera(void)
     apply_auto_image_controls("hardware jpeg");
     err = warmup_frames("hardware jpeg", CAM_JPEG_WARMUP_FRAME_COUNT);
     if (err != ESP_OK) {
+        reset_camera_state_after_init_failure();
         return err;
     }
     return ESP_OK;
@@ -648,6 +795,11 @@ esp_err_t fridge_camera_probe(fridge_camera_probe_result_t *out)
     if (!out) {
         return ESP_ERR_INVALID_ARG;
     }
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+
     memset(out, 0, sizeof(*out));
     out->sccb_address = CAM_PROBE_SCCB_ADDR;
     out->expected_pid = CAM_PROBE_EXPECTED_PID;
@@ -657,6 +809,7 @@ esp_err_t fridge_camera_probe(fridge_camera_probe_result_t *out)
     if (err != ESP_OK) {
         snprintf(out->last_error, sizeof(out->last_error), "XCLK start failed: %s", esp_err_to_name(err));
         out->duration_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+        camera_unlock();
         return err;
     }
     out->xclk_enabled = true;
@@ -667,6 +820,7 @@ esp_err_t fridge_camera_probe(fridge_camera_probe_result_t *out)
         snprintf(out->last_error, sizeof(out->last_error), "SCCB/I2C start failed: %s", esp_err_to_name(err));
         probe_xclk_stop();
         out->duration_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+        camera_unlock();
         return err;
     }
     out->sccb_ready = true;
@@ -701,13 +855,19 @@ esp_err_t fridge_camera_probe(fridge_camera_probe_result_t *out)
     if (err != ESP_OK) {
         probe_set_error(out, out->last_error);
     }
+    camera_unlock();
     return err;
 }
 
 esp_err_t fridge_camera_init(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t ret = ESP_OK;
     if (s_initialized && s_software_jpeg_mode) {
-        return ESP_OK;
+        goto finish;
     }
     if (s_initialized) {
         // 普通预览和诊断都会切换 esp32-camera 像素格式；切换前必须释放 DMA/LEDC/SCCB 状态。
@@ -717,26 +877,34 @@ esp_err_t fridge_camera_init(void)
     if (!esp_psram_is_initialized()) {
         set_last_error("PSRAM 未初始化，不能安全启动 OV3660 RGB565 帧缓冲");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_ERR_INVALID_STATE;
+        ret = ESP_ERR_INVALID_STATE;
+        goto finish;
     }
 
     esp_err_t err = init_raw_camera(PIXFORMAT_YUV422, FRAMESIZE_QVGA, false, "yuv422 qvga software jpeg");
     if (err != ESP_OK) {
-        return err;
+        ret = err;
+        goto finish;
     }
 
     set_last_error("");
     ESP_LOGI(TAG,
              "OV3660 camera initialized: YUV422 QVGA xclk=%dHz, fb=PSRAM single frame, software JPEG preview",
              CONFIG_FRIDGE_CAMERA_XCLK_HZ);
-    return ESP_OK;
+finish:
+    camera_unlock();
+    return ret;
 }
 
 esp_err_t fridge_camera_capture(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
     esp_err_t err = fridge_camera_init();
     if (err != ESP_OK) {
-        return err;
+        goto finish;
     }
 
     int64_t start_us = esp_timer_get_time();
@@ -744,19 +912,21 @@ esp_err_t fridge_camera_capture(void)
     if (!fb) {
         set_last_error("esp_camera_fb_get returned NULL");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto finish;
     }
     if (fb->format != PIXFORMAT_YUV422 || fb->len == 0) {
         esp_camera_fb_return(fb);
         set_last_error("camera frame is not YUV422");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto finish;
     }
 
     err = convert_yuv_frame_to_jpeg(fb, 70, "qvga preview", false);
     if (err != ESP_OK) {
         esp_camera_fb_return(fb);
-        return err;
+        goto finish;
     }
     s_capture_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
     esp_camera_fb_return(fb);
@@ -770,11 +940,93 @@ esp_err_t fridge_camera_capture(void)
              (unsigned)s_jpeg_len,
              (unsigned long)s_capture_ms,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-    return ESP_OK;
+finish:
+    camera_unlock();
+    return err;
+}
+
+esp_err_t fridge_camera_capture_preview_rgb565(fridge_camera_preview_frame_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t err = ESP_OK;
+    memset(out, 0, sizeof(*out));
+
+    if (!esp_psram_is_initialized()) {
+        set_last_error("PSRAM 未初始化，不能安全启动 UI 预览帧缓冲");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        err = ESP_ERR_INVALID_STATE;
+        goto finish;
+    }
+
+    if (!s_initialized || !s_software_jpeg_mode || s_preview_source_format != PIXFORMAT_YUV422) {
+        // UI 实时取景复用已验证稳定的 YUV422/QVGA 初始化路径，再软件转成 LVGL RGB565。
+        // 避免在完整 UI 运行时反复切到 OV3660 RGB565 寄存器配置，降低 SCCB 和 DMA 初始化失败概率。
+        err = fridge_camera_init();
+        if (err != ESP_OK) {
+            goto finish;
+        }
+    }
+
+    int64_t start_us = esp_timer_get_time();
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        set_last_error("ui preview esp_camera_fb_get returned NULL");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        err = ESP_FAIL;
+        goto finish;
+    }
+    if (fb->format != PIXFORMAT_YUV422 || fb->len == 0) {
+        esp_camera_fb_return(fb);
+        set_last_error("ui preview frame is not YUV422");
+        ESP_LOGE(TAG, "%s", s_last_error);
+        err = ESP_FAIL;
+        goto finish;
+    }
+
+    err = convert_yuv422_frame_to_rgb565_preview(fb, out);
+    if (err != ESP_OK) {
+        esp_camera_fb_return(fb);
+        goto finish;
+    }
+    out->capture_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+    out->frame_id = ++s_frame_id;
+    esp_camera_fb_return(fb);
+
+    set_last_error("");
+    ESP_LOGD(TAG,
+             "UI preview frame ok: frame=%lu, %dx%d, yuv422->rgb565=%u bytes, %lu ms",
+             (unsigned long)out->frame_id,
+             out->width,
+             out->height,
+             (unsigned)out->len,
+             (unsigned long)out->capture_ms);
+finish:
+    camera_unlock();
+    return err;
+}
+
+void fridge_camera_free_preview_frame(fridge_camera_preview_frame_t *frame)
+{
+    if (!frame) {
+        return;
+    }
+    free(frame->rgb565);
+    memset(frame, 0, sizeof(*frame));
 }
 
 esp_err_t fridge_camera_capture_ai_fullres(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t ret = ESP_OK;
     // AI 识别使用实测稳定的高分辨率 XGA，串口预览仍保持 QVGA。
     // 这里抓到 JPEG 后立即反初始化 DMA/帧缓冲，给后续 base64 和 HTTPS 请求释放 PSRAM。
     // QXGA/UXGA/SXGA 当前在该排线和驱动组合下不稳定，不进入成品主路径，避免用户每次识别都等待失败重试。
@@ -786,7 +1038,8 @@ esp_err_t fridge_camera_capture_ai_fullres(void)
     if (!esp_psram_is_initialized()) {
         set_last_error("PSRAM 未初始化，不能安全启动 OV3660 XGA AI 抓拍");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_ERR_INVALID_STATE;
+        ret = ESP_ERR_INVALID_STATE;
+        goto finish;
     }
 
     int64_t start_us = esp_timer_get_time();
@@ -854,17 +1107,26 @@ esp_err_t fridge_camera_capture_ai_fullres(void)
                  (unsigned)s_jpeg_len,
                  (unsigned long)s_capture_ms,
                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-        return ESP_OK;
+        ret = ESP_OK;
+        goto finish;
     }
 
     strlcpy(s_last_error, "AI 高分辨率抓拍失败：", sizeof(s_last_error));
     strlcat(s_last_error, last_reason[0] ? last_reason : esp_err_to_name(last_err), sizeof(s_last_error));
     ESP_LOGE(TAG, "%s", s_last_error);
-    return last_err;
+    ret = last_err;
+finish:
+    camera_unlock();
+    return ret;
 }
 
 esp_err_t fridge_camera_capture_hardware_jpeg_diag(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t err = ESP_OK;
     if (s_initialized) {
         // 硬件 JPEG 诊断和软件 JPEG/RGB565 诊断使用不同的传感器输出格式；
         // 切换前完整释放 DMA、SCCB 和 LEDC 状态，避免前一模式残留影响判断。
@@ -873,12 +1135,13 @@ esp_err_t fridge_camera_capture_hardware_jpeg_diag(void)
     if (!esp_psram_is_initialized()) {
         set_last_error("PSRAM 未初始化，不能安全启动 OV3660 硬件 JPEG 帧缓冲");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_ERR_INVALID_STATE;
+        err = ESP_ERR_INVALID_STATE;
+        goto finish;
     }
 
-    esp_err_t err = init_hardware_jpeg_camera();
+    err = init_hardware_jpeg_camera();
     if (err != ESP_OK) {
-        return err;
+        goto finish;
     }
 
     int64_t start_us = esp_timer_get_time();
@@ -886,13 +1149,15 @@ esp_err_t fridge_camera_capture_hardware_jpeg_diag(void)
     if (!fb) {
         set_last_error("hardware jpeg esp_camera_fb_get returned NULL");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto finish;
     }
     if (fb->format != PIXFORMAT_JPEG || fb->len < 4 || fb->buf[0] != 0xff || fb->buf[1] != 0xd8) {
         esp_camera_fb_return(fb);
         set_last_error("hardware jpeg frame missing SOI marker");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto finish;
     }
 
     uint8_t *jpeg = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -903,7 +1168,8 @@ esp_err_t fridge_camera_capture_hardware_jpeg_diag(void)
         esp_camera_fb_return(fb);
         set_last_error("hardware jpeg copy allocation failed");
         ESP_LOGE(TAG, "%s", s_last_error);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NO_MEM;
+        goto finish;
     }
     memcpy(jpeg, fb->buf, fb->len);
 
@@ -925,7 +1191,9 @@ esp_err_t fridge_camera_capture_hardware_jpeg_diag(void)
              (unsigned)s_jpeg_len,
              (unsigned long)s_capture_ms,
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
-    return ESP_OK;
+finish:
+    camera_unlock();
+    return err;
 }
 
 esp_err_t fridge_camera_capture_rgb565_diag(fridge_camera_diag_result_t *out)
@@ -933,6 +1201,11 @@ esp_err_t fridge_camera_capture_rgb565_diag(fridge_camera_diag_result_t *out)
     if (!out) {
         return ESP_ERR_INVALID_ARG;
     }
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t err = ESP_OK;
     memset(out, 0, sizeof(*out));
 
     // RGB565 诊断需要用不同像素格式重新初始化 esp32-camera。
@@ -941,16 +1214,17 @@ esp_err_t fridge_camera_capture_rgb565_diag(fridge_camera_diag_result_t *out)
     if (!esp_psram_is_initialized()) {
         strlcpy(out->last_error, "PSRAM 未初始化，不能安全启动 RGB565 诊断帧缓冲", sizeof(out->last_error));
         set_last_error(out->last_error);
-        return ESP_ERR_INVALID_STATE;
+        err = ESP_ERR_INVALID_STATE;
+        goto finish;
     }
 
     // 诊断帧使用 QQVGA + RGB565，数据量小且不依赖 JPEG SOI 标记，适合判断 DVP 同步是否基本可用。
-    esp_err_t err = init_raw_camera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, true, "rgb565 diag");
+    err = init_raw_camera(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, true, "rgb565 diag");
     if (err != ESP_OK) {
         snprintf(out->last_error, sizeof(out->last_error), "rgb565 esp_camera_init failed: %s", esp_err_to_name(err));
         set_last_error(out->last_error);
         ESP_LOGE(TAG, "%s", out->last_error);
-        return err;
+        goto finish;
     }
 
     int64_t start_us = esp_timer_get_time();
@@ -959,7 +1233,8 @@ esp_err_t fridge_camera_capture_rgb565_diag(fridge_camera_diag_result_t *out)
         strlcpy(out->last_error, "rgb565 esp_camera_fb_get returned NULL", sizeof(out->last_error));
         set_last_error(out->last_error);
         ESP_LOGE(TAG, "%s", out->last_error);
-        return ESP_FAIL;
+        err = ESP_FAIL;
+        goto finish;
     }
 
     out->ok = true;
@@ -980,7 +1255,9 @@ esp_err_t fridge_camera_capture_rgb565_diag(fridge_camera_diag_result_t *out)
              (unsigned)out->bytes,
              (unsigned long)out->checksum,
              (unsigned long)out->capture_ms);
-    return ESP_OK;
+finish:
+    camera_unlock();
+    return err;
 }
 
 void fridge_camera_get_status(fridge_camera_status_t *out)
@@ -989,6 +1266,13 @@ void fridge_camera_get_status(fridge_camera_status_t *out)
         return;
     }
     memset(out, 0, sizeof(*out));
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(200));
+    if (lock_err != ESP_OK) {
+        out->free_heap_kb = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024);
+        out->free_psram_kb = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+        strlcpy(out->last_error, "camera busy", sizeof(out->last_error));
+        return;
+    }
     out->initialized = s_initialized;
     out->has_frame = s_jpeg != NULL && s_jpeg_len > 0;
     out->width = s_width;
@@ -1003,6 +1287,7 @@ void fridge_camera_get_status(fridge_camera_status_t *out)
             sizeof(out->pixel_format));
     strlcpy(out->frame_size, frame_size_label_from_dimensions(s_width, s_height), sizeof(out->frame_size));
     strlcpy(out->last_error, s_last_error, sizeof(out->last_error));
+    camera_unlock();
 }
 
 esp_err_t fridge_camera_get_frame(fridge_camera_frame_view_t *out)
@@ -1010,9 +1295,15 @@ esp_err_t fridge_camera_get_frame(fridge_camera_frame_view_t *out)
     if (!out) {
         return ESP_ERR_INVALID_ARG;
     }
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
+    esp_err_t err = ESP_OK;
     if (!s_jpeg || s_jpeg_len == 0) {
         set_last_error("没有最近照片，请先执行 camera_capture");
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto finish;
     }
     memset(out, 0, sizeof(*out));
     out->data = s_jpeg;
@@ -1021,18 +1312,29 @@ esp_err_t fridge_camera_get_frame(fridge_camera_frame_view_t *out)
     out->height = s_height;
     out->capture_ms = s_capture_ms;
     out->frame_id = s_frame_id;
-    return ESP_OK;
+finish:
+    camera_unlock();
+    return err;
 }
 
 esp_err_t fridge_camera_clear_frame(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
     release_frame();
     set_last_error("");
+    camera_unlock();
     return ESP_OK;
 }
 
 esp_err_t fridge_camera_reset(void)
 {
+    esp_err_t lock_err = camera_lock(pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS));
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
     release_frame();
     if (s_initialized) {
         esp_camera_deinit();
@@ -1043,5 +1345,6 @@ esp_err_t fridge_camera_reset(void)
     s_hardware_jpeg_diag_mode = false;
     s_preview_source_format = 0;
     set_last_error("");
+    camera_unlock();
     return ESP_OK;
 }

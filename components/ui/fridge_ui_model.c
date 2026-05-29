@@ -10,8 +10,11 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "fridge_display.h"
+#include "fridge_mqtt_protocol.h"
 #include "fridge_network.h"
 #include "fridge_sensors.h"
+#include "fridge_speaker.h"
+#include "fridge_state_machine.h"
 #include "fridge_storage.h"
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
@@ -102,6 +105,16 @@ static void model_fill_default_zones(fridge_ui_zone_summary_t *zones)
         zones[i].width = 1;
         zones[i].height = 1;
     }
+    // 默认四区使用固定冰箱拓扑的 span 初始值：
+    // 上层冷冻横跨左/中两列，左右冷藏各占下方一列两行，门架占右侧整列。
+    zones[0].width = 2;
+    zones[0].height = 1;
+    zones[1].width = 1;
+    zones[1].height = 2;
+    zones[2].width = 1;
+    zones[2].height = 2;
+    zones[3].width = 1;
+    zones[3].height = 3;
     zones[4].custom = true;
     zones[5].custom = true;
 }
@@ -111,6 +124,22 @@ static void model_lock_copy(fridge_ui_model_t *out)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *out = s_model;
     xSemaphoreGive(s_lock);
+}
+
+static void model_recount_zone_items(fridge_ui_model_t *model)
+{
+    if (!model) {
+        return;
+    }
+    for (uint8_t i = 0; i < FRIDGE_UI_ZONE_COUNT; i++) {
+        model->zones[i].count = 0;
+    }
+    for (size_t i = 0; i < model->food_count && i < FRIDGE_UI_MAX_FOODS; i++) {
+        uint8_t zone = model->foods[i].zone;
+        if (zone < FRIDGE_UI_ZONE_COUNT && model->foods[i].name[0] != '\0') {
+            model->zones[zone].count++;
+        }
+    }
 }
 
 static void parse_inventory_json(const char *json)
@@ -272,6 +301,12 @@ static void model_persist_snapshot(const fridge_ui_model_t *model)
     esp_err_t ret = fridge_storage_set_ui_inventory_snapshot(json);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "persist ui inventory failed: %s", esp_err_to_name(ret));
+    } else {
+        // 用户确认修改后立即尝试上报完整库存快照；离线时保留 dirty 标记，等待下次同步刷新。
+        esp_err_t publish_ret = fridge_mqtt_publish_inventory_snapshot(false);
+        if (publish_ret != ESP_OK && publish_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "publish ui inventory snapshot failed: %s", esp_err_to_name(publish_ret));
+        }
     }
     cJSON_free(json);
 }
@@ -334,6 +369,7 @@ void fridge_ui_model_init(void)
     s_model.active_zone = 1;
     s_model.active_cell = 4;
     s_model.brightness = fridge_display_get_brightness();
+    s_model.speaker_volume = fridge_speaker_get_volume();
     strlcpy(s_model.wifi_status, "点击刷新扫描热点", sizeof(s_model.wifi_status));
 }
 
@@ -350,6 +386,25 @@ void fridge_ui_model_poll(void)
         xSemaphoreGive(s_lock);
     }
 
+    fridge_sm_snapshot_t sm = {0};
+    fridge_sm_config_t sm_config = {0};
+    if (fridge_state_machine_get_snapshot(&sm) == ESP_OK) {
+        (void)fridge_state_machine_get_config(&sm_config);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        strlcpy(s_model.sensors.state_machine_state,
+                fridge_state_machine_state_to_string(sm.state),
+                sizeof(s_model.sensors.state_machine_state));
+        strlcpy(s_model.sensors.door_state,
+                fridge_state_machine_door_to_string(sm.door_state),
+                sizeof(s_model.sensors.door_state));
+        s_model.sensors.state_offline = sm.offline;
+        s_model.sensors.state_is_night = sm.is_night;
+        s_model.sensors.radar_within_2m = sm.radar_within_2m;
+        s_model.sensors.auto_voice_after_close = sm_config.auto_voice_after_close;
+        s_model.sensors.updated_at_ms = sm.updated_at_ms;
+        xSemaphoreGive(s_lock);
+    }
+
     fridge_network_status_t net = {0};
     if (fridge_network_get_status(&net) == ESP_OK) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -362,6 +417,11 @@ void fridge_ui_model_poll(void)
         strlcpy(s_model.network.last_error, net.last_error, sizeof(s_model.network.last_error));
         xSemaphoreGive(s_lock);
     }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_model.brightness = fridge_display_get_brightness();
+    s_model.speaker_volume = fridge_speaker_get_volume();
+    xSemaphoreGive(s_lock);
 
     if (fridge_storage_get_ui_inventory_snapshot(s_inventory_buf, sizeof(s_inventory_buf)) == ESP_OK) {
         parse_inventory_json(s_inventory_buf);
@@ -509,6 +569,7 @@ bool fridge_ui_model_apply_place_pick(uint8_t zone, uint8_t cell)
     }
     s_model.editing_valid = s_model.editing_food.name[0] != '\0';
     s_place_picking = false;
+    model_recount_zone_items(&s_model);
     snapshot = s_model;
     xSemaphoreGive(s_lock);
     model_persist_snapshot(&snapshot);
@@ -535,6 +596,7 @@ void fridge_ui_model_update_editing_food(const fridge_ui_food_t *food)
     }
     s_model.editing_food = *food;
     s_model.editing_valid = food->name[0] != '\0';
+    model_recount_zone_items(&s_model);
     snapshot = s_model;
     xSemaphoreGive(s_lock);
     model_persist_snapshot(&snapshot);
@@ -559,6 +621,7 @@ void fridge_ui_model_delete_editing_food(void)
     }
     memset(&s_model.editing_food, 0, sizeof(s_model.editing_food));
     s_model.editing_valid = false;
+    model_recount_zone_items(&s_model);
     snapshot = s_model;
     xSemaphoreGive(s_lock);
     model_persist_snapshot(&snapshot);
@@ -581,6 +644,23 @@ void fridge_ui_model_add_camera_food(const char *name, const char *quantity, uin
     fridge_ui_model_get(&model);
     snprintf(food.location, sizeof(food.location), "%s %s", model.zones[zone].name, CELL_NAMES[cell]);
     fridge_ui_model_update_editing_food(&food);
+}
+
+void fridge_ui_model_set_camera_result(const fridge_ui_camera_result_t *result)
+{
+    if (!result) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_model.camera_result = *result;
+    xSemaphoreGive(s_lock);
+}
+
+void fridge_ui_model_clear_camera_result(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memset(&s_model.camera_result, 0, sizeof(s_model.camera_result));
+    xSemaphoreGive(s_lock);
 }
 
 bool fridge_ui_model_add_custom_zone(void)

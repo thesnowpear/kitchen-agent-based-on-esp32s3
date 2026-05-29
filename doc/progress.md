@@ -357,3 +357,107 @@ pm run build 和 idf.py build。- 2026-05-21 02:06:48 补充：USB JSON Lines �
 - 未改动已验证稳定的屏幕刷新参数，继续保持 `pclk=40000000Hz`、`LCD_FLUSH_CHUNK_ROWS=20`、`UI_BUFFER_ROWS=120`，避免回到此前黑屏/花屏风险。
 - 验证：三轮 `idf.py build` 均通过，最终 `fridge_spirit.bin` 大小 `0x1fd580`，最小 OTA app 分区剩余 `0x42a80`（约 12%）；`idf.py -p COM16 flash` 成功。复位日志确认 `TR230S display ready, pclk=40000000Hz chunk_rows=20 brightness=96%`、`FT6336U ready addr=0x48`、`LVGL draw buffers ready, rows=120 bytes_each=259200`、`LVGL UI started`，未见 brownout/watchdog/Guru。
 - 日志保存：`tmp/logs/20260528-135741_ui_reference_batch3_boot.log`。当前仍可见 MPU6050 未应答、SNTP 偶发超时、MQTT 未配置警告，不影响本次屏幕 UI 移植验收。
+----
+完成时间：2026-05-28 18:18:40 +08:00
+
+- 完成 OTA 分区策略从等大小双 OTA 调整为 `ota_0` 大主固件 + `ota_1` 小型本地 recovery 的方案落地，避免把云端备份作为唯一兜底。
+- 新增 `partitions_recovery.csv`，当前 active 分区表为 `ota_0 3584 KB`、`ota_1 1024 KB`、`assets 1536 KB`、`cache 704 KB`、`model 768 KB`、`coredump 64 KB`。
+- 新增 recovery 构建 profile：`CONFIG_FRIDGE_RECOVERY_APP=y` 与 CMake 参数 `FRIDGE_RECOVERY_BUILD=ON`，recovery 模式只启动 NVS、诊断、Wi-Fi 和 JSON Lines 兜底命令。
+- recovery 支持 `get_status`、`set_network`、`boot_main`、`restore_main`，其中 `restore_main` 通过 HTTPS OTA 覆盖 `ota_0` 并切回主固件启动；当前只依赖 HTTPS 证书校验，后续生产前必须补固件签名/哈希校验。
+- 已同步 `AGENTS.md`、`CLAUDE.md`、`doc/项目架构与工作流设计.md`、诊断信息和 Web Mock 文案；`partitions.csv` 当前被系统锁定，实际构建以 `partitions_recovery.csv` 为准。
+- 验证结果：主固件 `idf.py build` 通过，主镜像约 `0x201900`，预期提示 `ota_1` 小分区无法容纳完整主固件；recovery profile 构建通过，recovery 镜像约 `0xf62e0`，能放入 1 MB `ota_1`，但仅剩约 4% 空间，后续新增 recovery 功能前需要先做体积裁剪或重新评估分区。
+
+----
+## 2026-05-28 19:05 设置页与 Wi-Fi 配网页重构
+
+- 按 `ui-reference/WLW` 的设置页结构重新移植开发板 LVGL 设置页：保留“设备与画面设置 / 小精灵偏好”层级，设置项改为可滚动列表，包含屏幕亮度、Wi-Fi 网络入口、设备运维、开门提醒、语音唤醒和临期提前提醒。
+- 重新移植 Wi-Fi 配网页：页面改为“设备网络 / 选择 Wi-Fi”，扫描结果不再放在白色整块容器中，而是按参考稿使用独立网络卡片；列表区域支持纵向滚动，长 SSID 和状态文案使用裁剪，避免扫描完成后白框、显示不全或挤压 Dock。
+- Wi-Fi 交互保持现有后台模型和连接流程不变：点击刷新仍调用 `fridge_ui_model_start_wifi_scan()`；加密网络继续打开原有密码键盘；开放网络可直接调用 `fridge_ui_model_connect_wifi_async()` 连接。
+- 未改动 TR230S/QSPI 刷新参数、Wi-Fi 驱动、NVS 保存逻辑和硬件引脚配置，继续保持已验证稳定的屏幕刷新路线。
+- 编辑前备份：`tmp/backups/manual/20260528-185514_ui_settings_wifi/`；构建前备份：`tmp/backups/before_run/20260528-190209_before_ui_build/`。
+- 验证：`idf.py build` 通过，生成 `build/fridge_spirit.bin`；构建仍提示主固件大于 1 MB `ota_1` recovery 小分区，这是当前大主固件 + 小 recovery 分区策略下的既有预期提示。本次尚未烧录实机验证触摸和扫描后的视觉效果。
+
+----
+## 2026-05-29 00:08 登记页摄像头预览卡死修复
+
+- 修复登记页预览失败后反复自动重启 `esp_camera_init/reset` 的问题：页面进入后只自动尝试一次实时预览，失败后停止预览任务并释放摄像头驱动，避免系统卡顿到无法切换页面。
+- 快门按钮改为始终可见：预览失败时仍显示“拍照”，用户可直接触发高清抓拍上传 AI；取景框支持点击手动重试预览，不再出现 disabled 的“等待/重试”导致无入口恢复。
+- 摄像头组件新增递归互斥锁，串行化 UI 预览、AI 抓拍、USB 诊断和 reset/get/clear 状态访问，避免多个任务并发 `esp_camera_deinit()`、`esp_camera_fb_get()` 导致驱动状态错乱。
+- `init_raw_camera()` 与硬件 JPEG 初始化在 warmup 失败时会主动反初始化并清理模式标志，避免保留 `s_initialized=true` 的半初始化状态，被下一次预览误复用。
+- 编辑前备份：`tmp/backups/manual/20260528-235249_camera_page_freeze_fix/`、`tmp/backups/manual/20260528-235615_camera_mutex_fix/`；构建前备份：`tmp/backups/before_run/20260528-235456_camera_page_build/`；进度文件备份：`tmp/backups/manual/20260529-000728_progress_camera_page_fix/`。
+- 验证：`idf.py build` 通过并生成 `fridge_spirit.bin`；`idf.py -p COM16 flash` 成功；复位日志确认 PSRAM memory test OK、`TR230S display ready`、`FT6336U ready`、`LVGL UI started`，未见 brownout/watchdog/Guru。USB `get_status` 与 `get_sensors` 可正常响应。仍需实屏触摸确认登记页失败态下可切回首页/设置、快门按钮可见且可点击。
+
+### 追加修复 00:35：完整接线后 OV3660 预览初始化失败修复
+
+- 复现用户反馈的完整接线后错误：登记页/USB 摄像头链路报 `yuv422 qvga software jpeg esp_camera_init failed: ESP_FAIL`。安全探测仍能读到 OV3660 `PID=0x3660`，说明电源、XCLK 和 SCCB 短读基本正常，问题出在完整初始化阶段。
+- 第一处根因是正常 UI 固件里 GPIO4/GPIO5 已由 FT6336U/MPU6050 使用 I2C0，而摄像头完整初始化仍尝试用 I2C1 驱动同一组 SCCB 物理线。已改为：正常 UI 固件复用已安装的 `I2C_NUM_0`，`pin_sccb_sda/scl=-1`，摄像头专用测试固件继续保留 I2C1 独占 bring-up 路径。
+- 第二处根因是完整 UI 启动后内部 SRAM 碎片较多，esp32-camera 默认 32KB 级 DMA buffer 申请失败，日志曾显示 `DMA buffer 30720 Byte malloc failed, largest free block 22528 Byte`。已将 `CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX` 收敛到 `16384`，实测 DMA buffer 变为 `15360`，能在当前屏幕、触摸、USB、网络框架已加载后完成初始化。
+- 额外保持摄像头互斥锁和失败态清理：UI 预览、Web 拍照测试、RGB565 诊断和 AI 高清抓拍串行访问 esp32-camera；初始化/warmup 失败会反初始化并清理模式标志，避免留下半初始化状态导致页面卡死。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功；COM16 串口回归 `camera_probe` 返回 `PID=0x3660`，`camera_capture` 返回 `320x240` JPEG 约 `8119 bytes`，`get_camera_status` 显示 `initialized=true`、`lastError=""`，`camera_rgb565_diag` 返回 `160x120`、`38400 bytes`、`ESP_OK`。这覆盖了 Web 面板摄像头测试的 QVGA JPEG 路径和登记页实时预览的 RGB565 底层路径。
+- 编辑前备份：`tmp/backups/manual/20260529-002141_camera_i2c_guard/`、`tmp/backups/manual/20260529-002744_camera_dma_size/`、`tmp/backups/manual/20260529-003531_progress_camera_dma_i2c_fix/`；构建前备份：`tmp/backups/before_run/20260529-002325_camera_i2c_guard_build/`、`tmp/backups/before_run/20260529-002822_camera_dma_build/`。后续仍建议用户在实屏登记页确认实时画面连续刷新、点击快门能进入 AI 识别结果页。
+
+### 追加修复 00:43：登记页预览改用稳定 YUV422 初始化路径
+
+- 用户实屏反馈 Web 面板摄像头已可用，但固件登记页仍显示 `rgb565 ui preview esp_camera_init failed: ESP_FAIL`。复核确认 Web 路径使用 `YUV422/QVGA + 软件 JPEG`，登记页预览使用 `RGB565/QQVGA` 传感器输出，两者走不同 OV3660 寄存器表和 esp32-camera 原始帧路径。
+- 已将 `fridge_camera_capture_preview_rgb565()` 改为复用当前已验证稳定的 `YUV422/QVGA` 初始化路径，再在固件中把 YUYV 软件转换为 LVGL 可显示的 RGB565 帧；这样登记页不再触发 `rgb565 ui preview esp_camera_init`，避免完整 UI 环境下 RGB565 传感器模式初始化失败。
+- 新增轻量整数 YUV->RGB565 转换函数，输出帧优先放 PSRAM，单帧约 `320x240x2=153600 bytes`；不新增第三方依赖，不改变摄像头引脚、XCLK、SCCB/I2C 和 AI 高清抓拍路径。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功；COM16 回归 `get_status` 正常，`camera_capture` 返回 `320x240` JPEG 约 `8485 bytes`，`get_camera_status` 显示 `YUV422->JPEG`、`lastError=""`，`camera_rgb565_diag` 仍返回 `160x120`、`ESP_OK`。后续需用户在实屏登记页确认取景画面显示方向和颜色是否符合预期。
+- 编辑前备份：`tmp/backups/manual/20260529-004016_camera_preview_yuv_path/`、`tmp/backups/manual/20260529-004334_progress_camera_preview_yuv/`；构建前备份：`tmp/backups/before_run/20260529-004108_camera_preview_yuv_build/`。
+
+### 追加修复 00:48：登记页预览任务创建失败修复
+
+- 用户实屏反馈登记页一直停在“正在打开摄像头”，右上角显示“预览任务创建失败”，点击拍照无反应；同时浏览器实时预览可用。判断摄像头底层已正常，问题在 LVGL 登记页 `xTaskCreate()` 为预览/识别任务分配内部 SRAM 栈失败。
+- 已将登记页预览任务和 AI 图片识别任务改为优先使用 `xTaskCreateWithCaps(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)` 创建 PSRAM 栈，并保留内部 SRAM 创建兜底；预览栈从 `8192` 降到 `6144`，识别栈从 `32768` 降到 `24576`，减少内部内存压力。
+- 任务创建失败时会写入更明确状态，并设置 `s_preview_failed=true`、清理 `s_preview_task`，允许用户点取景框重试；避免之前“已经尝试但未标失败”的状态让重试入口失效。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功；COM16 回归 `get_status` 正常，`camera_capture` 返回 `320x240` JPEG 约 `6527 bytes`，`get_camera_status` 显示 `YUV422->JPEG`、`lastError=""`。仍需用户实屏确认登记页预览任务可创建、快门按钮点击后能进入识别流程。
+- 编辑前备份：`tmp/backups/manual/20260529-004532_camera_page_task_caps/`、`tmp/backups/manual/20260529-004829_progress_camera_task_caps/`；构建前备份：`tmp/backups/before_run/20260529-004602_camera_task_caps_build/`。
+
+### 追加修复 01:10：拍照后 AI 失败反馈与抓拍降级
+
+- 用户反馈登记页预览已成功，但点击快门后 AI 没反应并回到预览页。复核确认这不是预期体验：普通抓拍、上传、HTTP、API Key 或网络失败都应进入结果页显示原因，不能静默回预览。
+- 已修复登记页 AI 任务创建失败分支：即使 `ui_cam_ai` worker 因内存/PSRAM 栈不可用创建失败，也会写入 `camera_result` 并跳转识别结果页显示“识别任务创建失败”，不再自动回预览造成误判。
+- `lv_async_call(analyze_done_async)` 失败时补充状态复位和错误日志，避免极端情况下卡在“识别中”；AI/上传失败仍统一进入结果页展示失败原因。
+- USB/AI worker 已优先使用 PSRAM 栈，串口回归确认 `camera_analyze` 不再返回 `camera analyze worker create failed`，说明任务创建压力已缓解。
+- AI 抓拍新增 XGA -> VGA -> QVGA 降级策略：完整 UI 场景下 XGA 失败时继续尝试低一档分辨率，优先保证“能拍照上传给 AI”，后续再单独优化高分辨率稳定性。
+- USB `camera_analyze` 失败前会先保存摄像头 `last_error` 到 AI 结果，避免 `fridge_camera_clear_frame()` 清空错误后 Web/串口只看到裸 `ESP_FAIL`。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功；COM16 回归 `camera_analyze` 已推进到真实 AI 上传前置校验，当前失败原因变为“网络未校时或外网不可用，请确认 SNTP/互联网连接”，且 `get_camera_status` 显示 `frameId` 增加、`pixelFormat=YUV422->JPEG`，说明拍照链路已启动并完成抓拍。下一步应排查 Wi-Fi 虽 connected 但 `internet_ready=false` 的 SNTP/外网验证问题。
+- 编辑前备份：`tmp/backups/manual/20260529-010116_camera_ai_failure_feedback/`、`tmp/backups/manual/20260529-010255_camera_ai_capture_fallback/`、`tmp/backups/manual/20260529-011009_progress_camera_ai_feedback/`；构建前备份：`tmp/backups/before_run/20260529-010138_camera_ai_feedback_build/`、`tmp/backups/before_run/20260529-010322_camera_ai_fallback_build/`。
+
+----
+完成时间：2026-05-29 10:38:42 +08:00
+
+- 完成三端数据备份与双向同步第一版，覆盖库存、冰箱分区、AI/ASR/TTS 配置、提醒确认、购物清单、菜谱缓存和 AI 对话历史。
+- 后端新增同步层：`/api/v1/sync/status`、`/api/v1/sync/snapshot`、`/api/v1/sync/pull`、`/api/v1/sync/push`，并补了可重复执行迁移脚本 `backend/scripts/migrate_sync.py`；同步事件使用 `clientEventId` 幂等，`serverRevision` 单调递增。
+- 固件侧 `components/storage` 新增库存同步元数据，`ui_inventory.json` 现在持有 `snapshotVersion`、`serverRevision`、`updatedAtMs`、`lastSyncAtMs`、`dirty`、`homeId`、`deviceId`；`components/mqtt_protocol` 现在支持 `inventory_refresh`、`inventory_replace`、`fridge_zones_update`、`ai_config_update`、`asr_config_update`、`tts_config_update`，并把 `cmd_ack` 扩展为 `received/completed` 两阶段语义。
+- 小程序侧补齐同步队列与离线回放：库存、提醒、分区、设置、购物清单、菜谱和 AI 历史入口已接入 `syncQueue` / `dirtyDomains` / `syncNow`，离线后再恢复网络会先推本地变更再拉云端快照。
+- 验证：`python -m compileall backend/app backend/scripts` 通过；`web/node_modules/.bin/tsc.cmd --noEmit -p miniapp/tsconfig.json` 通过；`$env:IDF_TOOLS_PATH='D:\esp-IDF\.espressif'; . D:\esp-IDF\.espressif\v6.0.1\esp-idf\export.ps1; idf.py build` 通过。
+- 风险与下一步：当前 `ota_1` 仍有分区过小警告，说明主固件体积继续超过 recovery 分区；这次未做实机 COM16 联调，`inventory_refresh` / `inventory_replace` / `cmd_ack completed` 语义还需要结合真实 MQTT 路径再确认一轮。
+
+----
+完成时间：2026-05-29 12:00:44 +08:00
+
+- 新增 `components/ai_actions` 白名单动作层，统一解析 AI 回复里的 UI 页面切换和已有厨房工具 JSON；当前只允许低风险页面跳转、定时器、秒表和闹钟，不开放拍照、亮度、音量、Wi-Fi 连接、库存写入、OTA 或 GPIO。
+- UI 组件新增 `fridge_ui_set_page_async()` 和页面 key 映射，AI/USB/语音后台任务只投递页面切换请求，实际 LVGL 操作仍回到 UI 线程执行，避免跨线程触碰 LVGL 对象。
+- USB `ai_assistant_chat`、屏幕 AI 语音页和公共语音会话都改为调用统一动作执行入口；`MEMORY_OP` 先处理，AI 动作 JSON 再执行并从用户可见回复中剥离。
+- AI 提示词和 `ai_context` 新增 `ui_control` 任务说明，明确 `camera` 页面暂不允许自动进入，避免未确认硬件状态时启动 OV3660 预览。
+- 文档已同步 `doc/AI运行逻辑与记忆策略.md` 和 `doc/AI系统设计架构.md`。后续需要通过 Web Serial 和实屏语音各验证一次“打开菜谱页/回主页/打开 Wi-Fi 设置/拒绝拍照页”。
+
+----
+完成时间：2026-05-29 12:47:02 +08:00
+
+- 修复状态机休眠开关后屏幕仍黑的问题。根因不是 `sleepEnabled` 配置，而是状态机/音频/唤醒词等组件先于 UI 启动后挤压并碎片化内部 DMA SRAM，导致 `fridge_display_init()` 申请 TR230S QSPI 刷新缓冲失败；同时排查过程中临时显示参数偏离了 2026-05-28 已验证的稳定版本。
+- `components/display/fridge_display.c` 恢复到已验证屏幕参数：`LCD_PCLK_HZ=40000000`、`LCD_FLUSH_CHUNK_ROWS=20`，TR230S 初始化命令恢复为 `0x20=0 -> 0x21=0x64 -> 0x29 -> 0x20=brightness`，移除 WAIT# 低电平时强发命令的实验路径；保留初始化失败后的 SPI device / buffer 清理，避免 UI 重试时卡在半初始化状态。
+- `main/main.c` 调整正常启动顺序：网络/AI/MQTT 后先初始化传感器，再尽早启动 LVGL UI，并等待显示 ready 后再启动 ASR、雷达、音频、状态机、扬声器、厨房工具和唤醒词。这样屏幕先占住连续 DMA 内存，同时避免触摸初始化与主线程并发二次初始化 ADC。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功。启动日志确认 `TR230S display ready, pclk=40000000Hz chunk_rows=20 brightness=96%`、`FT6336U ready addr=0x48`、`LVGL draw buffers ready, rows=120 bytes_each=259200`、`LVGL UI started`、`usb_protocol: USB JSON Lines protocol task started`，未见 Guru/abort/brownout/watchdog。USB 回归 `get_state_machine_config` 返回 `sleepEnabled:false`，`get_state_machine_status` 当前为 `SLEEP` 且不会黑屏休眠。
+- 仍需注意：当前 MPU6050 未连接时日志会提示 `mpu6050 init failed: ESP_FAIL`，不影响屏幕点亮；扬声器和麦克风仍共用 GPIO40/41/I2S，日志会出现 I2S 占用提示，后续音频双向同时使用前需要单独梳理。构建仍保留主固件超过 1 MB `ota_1` recovery 小分区的既有警告。
+
+### 追加修复 13:56：黑屏休眠与颜文字待机的 2 分钟策略
+
+- UI 策略层新增 `UI_IDLE_SLEEP_MS=120000`，分别记录最近用户互动时间和最近雷达人体上下文时间。触摸、用户页面切换和 AI/USB 页面指令仍会刷新互动时间；系统自动退颜文字页不再刷新互动时间，避免自动切页反复重置 idle 计时。
+- 当“黑屏休眠”开启时，只有同时满足“用户 2 分钟无互动”和“雷达 2 分钟无可靠人体/接近/2m/1m 上下文”，且当前处于 `SLEEP/NIGHT_SAVE/OFFLINE` 这类静默状态，才进入亮度 0 的黑屏休眠。
+- 当“黑屏休眠”关闭时，只要用户 2 分钟无互动或雷达 2 分钟无人体上下文，就自动退回待机颜文字页，并保持屏幕亮度 65，触摸仍可唤醒到主页。
+- `SLEEP/NIGHT_SAVE` 状态不再立即抢占当前页面，改由上述 2 分钟 idle 策略决定是否黑屏或退颜文字；`APPROACH/INTERACTIVE/DOOR_* /OFFLINE` 仍保留状态机页面联动。
+- 验证：`idf.py build` 通过；`idf.py -p COM16 flash` 成功；启动日志确认 `TR230S display ready`、`FT6336U ready`、`LVGL UI started`、`usb_protocol: USB JSON Lines protocol task started`，未见 Guru/abort/brownout/watchdog。尚未实机等待满 2 分钟做完整 idle 长测。
+- 追加修复 14:09：重启/重新烧录后默认页改为首页，离线状态只作为 `offline` 标志和状态栏/USB/Web 上报信息，不再把 UI 自动切到离线整页；离线页仍可从“更多”页面手动进入。状态机在网络未连接且本地传感无事件时保持 `SLEEP` 主状态，避免 Wi-Fi 尚未连上时抢占本地首页流程。
+- 追加修复 14:17：修复 2 分钟退到颜文字页后，点击唤醒到首页又被立即拉回颜文字的问题。触摸/页面操作现在会同步刷新雷达人体上下文计时，并把触摸唤醒保护窗口扩展到一个完整 idle 周期，避免雷达缺席或旧的“无人已超时”状态抢占用户操作。
+- 追加修复 14:34：网络组件新增已保存 Wi-Fi 自动恢复任务。设备未连接且不在手动连接中时，会每 45 秒定向扫描 NVS 中保存的 SSID，扫描到后复用现有 `fridge_network_connect()` 自动连接；同时新增扫描互斥，避免 UI/USB 扫描、后台扫描和连接流程抢占 Wi-Fi driver。`idf.py build` 通过并已烧录 COM16；`ota_1` 小 recovery 分区过小提示仍为当前分区策略下的既有预期。

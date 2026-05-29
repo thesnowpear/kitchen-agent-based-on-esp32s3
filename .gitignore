@@ -20,6 +20,13 @@ tmp/
 # Build artifacts and directories
 **/build/
 build/
+# 项目特定的多套构建输出目录（AI字体检查/相机测试/恢复镜像等）
+build_ai_font_check/
+build_camera_test/
+build_recovery/
+build_recovery_profile/
+# 本地聊天记录目录，不纳入版本管理
+chat_history/
 example/
 *.o
 *.a

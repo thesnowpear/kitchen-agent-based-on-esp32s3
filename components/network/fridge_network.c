@@ -29,6 +29,10 @@
 #define WIFI_MAXIMUM_RETRY 5
 #define WIFI_SNTP_TASK_STACK 4096
 #define WIFI_SAVED_CONNECT_TASK_STACK 4096
+#define WIFI_AUTO_RECONNECT_TASK_STACK 4096
+#define WIFI_AUTO_RECONNECT_INITIAL_DELAY_MS 8000
+#define WIFI_AUTO_RECONNECT_INTERVAL_MS 45000
+#define WIFI_AUTO_SCAN_MUTEX_WAIT_MS 500
 #define WIFI_NVS_NAMESPACE "fridge_net"
 #define WIFI_NVS_KEY_SSID "ssid"
 #define WIFI_NVS_KEY_PASSWORD "password"
@@ -37,9 +41,11 @@ static const char *TAG = "fridge_network";
 
 static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_connect_mutex;
+static SemaphoreHandle_t s_scan_mutex;
 static SemaphoreHandle_t s_sntp_mutex;
 static TaskHandle_t s_sntp_task;
 static TaskHandle_t s_saved_connect_task;
+static TaskHandle_t s_auto_reconnect_task;
 static esp_netif_t *s_sta_netif;
 static bool s_initialized;
 static bool s_connected;
@@ -55,6 +61,15 @@ static char s_current_ssid[FRIDGE_WIFI_MAX_SSID_LEN + 1];
 static char s_current_ip[FRIDGE_WIFI_MAX_IP_LEN];
 static char s_last_error[FRIDGE_WIFI_MAX_ERROR_LEN];
 static char s_ntp_server[64] = FRIDGE_WIFI_DEFAULT_NTP;
+
+static esp_err_t read_saved_config(fridge_wifi_config_t *config);
+
+static void configure_timezone_utc8(void)
+{
+    // ESP-IDF 的 localtime_r 依赖 POSIX TZ；CST-8 表示 UTC+8，无夏令时。
+    setenv("TZ", "CST-8", 1);
+    tzset();
+}
 
 static const char *wifi_authmode_to_string(wifi_auth_mode_t authmode)
 {
@@ -212,6 +227,137 @@ static void saved_connect_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static esp_err_t scan_saved_ssid_visible(const char *ssid, bool *visible, int8_t *rssi)
+{
+    // 后台自动重连只做定向扫描：减少扫描时间，也避免频繁刷新 UI 可见热点列表。
+    ESP_RETURN_ON_FALSE(ssid && ssid[0] != '\0' && visible, ESP_ERR_INVALID_ARG, TAG, "invalid saved SSID scan args");
+    *visible = false;
+    if (rssi) {
+        *rssi = -127;
+    }
+
+    if (s_scan_mutex && xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(WIFI_AUTO_SCAN_MUTEX_WAIT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    wifi_scan_config_t scan_config = {
+        .ssid = (uint8_t *)ssid,
+        .bssid = NULL,
+        .channel = 0,
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 120,
+        .scan_time.active.max = 300,
+    };
+
+    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+    if (err != ESP_OK) {
+        if (s_scan_mutex) {
+            xSemaphoreGive(s_scan_mutex);
+        }
+        return err;
+    }
+
+    uint16_t ap_num = 0;
+    err = esp_wifi_scan_get_ap_num(&ap_num);
+    if (err != ESP_OK || ap_num == 0) {
+        if (s_scan_mutex) {
+            xSemaphoreGive(s_scan_mutex);
+        }
+        return err == ESP_OK ? ESP_OK : err;
+    }
+
+    uint16_t record_count = ap_num > 8 ? 8 : ap_num;
+    wifi_ap_record_t *records = calloc(record_count, sizeof(wifi_ap_record_t));
+    if (!records) {
+        if (s_scan_mutex) {
+            xSemaphoreGive(s_scan_mutex);
+        }
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = esp_wifi_scan_get_ap_records(&record_count, records);
+    if (err == ESP_OK) {
+        int8_t best_rssi = -127;
+        for (uint16_t i = 0; i < record_count; i++) {
+            if (strncmp((const char *)records[i].ssid, ssid, FRIDGE_WIFI_MAX_SSID_LEN) == 0) {
+                *visible = true;
+                if (records[i].rssi > best_rssi) {
+                    best_rssi = records[i].rssi;
+                }
+            }
+        }
+        if (rssi && *visible) {
+            *rssi = best_rssi;
+        }
+    }
+
+    free(records);
+    if (s_scan_mutex) {
+        xSemaphoreGive(s_scan_mutex);
+    }
+    return err;
+}
+
+static void auto_saved_reconnect_task(void *arg)
+{
+    (void)arg;
+    // 常驻离线恢复任务：只有在未连接、未手动连接中的空闲状态下，才扫描并尝试已保存 Wi-Fi。
+    // 该任务复用 fridge_network_connect()，因此不会新增一套密码保存或 Wi-Fi 事件处理路径。
+    vTaskDelay(pdMS_TO_TICKS(WIFI_AUTO_RECONNECT_INITIAL_DELAY_MS));
+
+    while (true) {
+        if (s_initialized && !s_connected && !s_connecting && !s_manual_disconnect) {
+            fridge_wifi_config_t config = {0};
+            esp_err_t err = read_saved_config(&config);
+            if (err == ESP_OK) {
+                bool visible = false;
+                int8_t rssi = -127;
+                err = scan_saved_ssid_visible(config.ssid, &visible, &rssi);
+                if (err == ESP_OK && visible) {
+                    ESP_LOGI(TAG, "saved Wi-Fi \"%s\" found (rssi=%d), reconnecting", config.ssid, rssi);
+                    err = fridge_network_connect(&config, false);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "auto reconnect to saved Wi-Fi succeeded");
+                    } else {
+                        ESP_LOGW(TAG, "auto reconnect to saved Wi-Fi failed: %s", esp_err_to_name(err));
+                    }
+                } else if (err == ESP_OK) {
+                    snprintf(s_last_error,
+                             sizeof(s_last_error),
+                             "未扫描到已保存 Wi-Fi：%s，后台会继续重试",
+                             config.ssid);
+                    ESP_LOGI(TAG, "saved Wi-Fi \"%s\" not visible, will retry later", config.ssid);
+                } else if (err != ESP_ERR_TIMEOUT && err != ESP_ERR_WIFI_STATE) {
+                    ESP_LOGW(TAG, "saved Wi-Fi scan failed: %s", esp_err_to_name(err));
+                }
+            } else {
+                s_saved = false;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WIFI_AUTO_RECONNECT_INTERVAL_MS));
+    }
+}
+
+static void start_auto_saved_reconnect_task(void)
+{
+    if (s_auto_reconnect_task) {
+        return;
+    }
+
+    BaseType_t ok = xTaskCreate(auto_saved_reconnect_task,
+                                "wifi_auto_reconn",
+                                WIFI_AUTO_RECONNECT_TASK_STACK,
+                                NULL,
+                                2,
+                                &s_auto_reconnect_task);
+    if (ok != pdPASS) {
+        s_auto_reconnect_task = NULL;
+        ESP_LOGW(TAG, "create Wi-Fi auto reconnect task failed");
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
@@ -330,6 +476,8 @@ static esp_err_t save_config(const fridge_wifi_config_t *config)
 
 esp_err_t fridge_network_init(void)
 {
+    configure_timezone_utc8();
+
     if (s_initialized) {
         return ESP_OK;
     }
@@ -338,6 +486,8 @@ esp_err_t fridge_network_init(void)
     ESP_RETURN_ON_FALSE(s_wifi_event_group, ESP_ERR_NO_MEM, TAG, "create event group failed");
     s_connect_mutex = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_connect_mutex, ESP_ERR_NO_MEM, TAG, "create Wi-Fi connect mutex failed");
+    s_scan_mutex = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_scan_mutex, ESP_ERR_NO_MEM, TAG, "create Wi-Fi scan mutex failed");
     s_sntp_mutex = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_sntp_mutex, ESP_ERR_NO_MEM, TAG, "create SNTP mutex failed");
 
@@ -365,6 +515,7 @@ esp_err_t fridge_network_init(void)
     fridge_wifi_config_t saved = {0};
     s_saved = (read_saved_config(&saved) == ESP_OK);
     s_initialized = true;
+    start_auto_saved_reconnect_task();
     ESP_LOGI(TAG, "network initialized, saved credential=%s", s_saved ? "yes" : "no");
     return ESP_OK;
 }
@@ -374,6 +525,7 @@ esp_err_t fridge_network_scan(fridge_wifi_ap_t *aps, size_t max_count, size_t *o
     ESP_RETURN_ON_FALSE(aps && out_count, ESP_ERR_INVALID_ARG, TAG, "invalid scan args");
     ESP_RETURN_ON_FALSE(max_count > 0, ESP_ERR_INVALID_ARG, TAG, "max_count is zero");
     ESP_RETURN_ON_ERROR(fridge_network_init(), TAG, "network init failed before scan");
+    ESP_RETURN_ON_FALSE(s_scan_mutex, ESP_ERR_INVALID_STATE, TAG, "scan mutex is NULL");
 
     *out_count = 0;
     wifi_scan_config_t scan_config = {
@@ -387,25 +539,39 @@ esp_err_t fridge_network_scan(fridge_wifi_ap_t *aps, size_t max_count, size_t *o
     };
 
     ESP_LOGI(TAG, "starting Wi-Fi scan");
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS)) != pdTRUE) {
+        set_last_error("Wi-Fi 扫描忙，请稍后再试");
+        return ESP_ERR_TIMEOUT;
+    }
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_scan_mutex);
         set_last_error("wifi scan failed");
         return err;
     }
 
     uint16_t ap_num = 0;
-    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&ap_num), TAG, "get AP num failed");
+    esp_err_t ap_num_err = esp_wifi_scan_get_ap_num(&ap_num);
+    if (ap_num_err != ESP_OK) {
+        xSemaphoreGive(s_scan_mutex);
+        ESP_RETURN_ON_ERROR(ap_num_err, TAG, "get AP num failed");
+    }
     if (ap_num == 0) {
+        xSemaphoreGive(s_scan_mutex);
         ESP_LOGW(TAG, "no Wi-Fi AP found");
         return ESP_OK;
     }
 
     uint16_t record_count = (ap_num > max_count) ? (uint16_t)max_count : ap_num;
     wifi_ap_record_t *records = calloc(record_count, sizeof(wifi_ap_record_t));
-    ESP_RETURN_ON_FALSE(records, ESP_ERR_NO_MEM, TAG, "allocate AP records failed");
+    if (!records) {
+        xSemaphoreGive(s_scan_mutex);
+        ESP_RETURN_ON_FALSE(records, ESP_ERR_NO_MEM, TAG, "allocate AP records failed");
+    }
     esp_err_t records_err = esp_wifi_scan_get_ap_records(&record_count, records);
     if (records_err != ESP_OK) {
         free(records);
+        xSemaphoreGive(s_scan_mutex);
         ESP_RETURN_ON_ERROR(records_err, TAG, "get AP records failed");
     }
 
@@ -441,6 +607,7 @@ esp_err_t fridge_network_scan(fridge_wifi_ap_t *aps, size_t max_count, size_t *o
     }
 
     free(records);
+    xSemaphoreGive(s_scan_mutex);
     ESP_LOGI(TAG, "Wi-Fi scan done, visible AP count=%u", (unsigned)*out_count);
     return ESP_OK;
 }
@@ -454,6 +621,11 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
 
     if (xSemaphoreTake(s_connect_mutex, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS + WIFI_DISCONNECT_TIMEOUT_MS + 2000)) != pdTRUE) {
         set_last_error("已有 Wi-Fi 连接请求正在进行，请稍后再试");
+        return ESP_ERR_TIMEOUT;
+    }
+    if (xSemaphoreTake(s_scan_mutex, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS)) != pdTRUE) {
+        xSemaphoreGive(s_connect_mutex);
+        set_last_error("Wi-Fi 正在扫描，请稍后再连接");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -482,6 +654,7 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
     esp_err_t disconnect_err = esp_wifi_disconnect();
     if (disconnect_err != ESP_OK && disconnect_err != ESP_ERR_WIFI_NOT_CONNECT) {
         s_manual_disconnect = false;
+        xSemaphoreGive(s_scan_mutex);
         xSemaphoreGive(s_connect_mutex);
         ESP_RETURN_ON_ERROR(disconnect_err, TAG, "disconnect before connect failed");
     }
@@ -496,6 +669,7 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     if (err != ESP_OK) {
+        xSemaphoreGive(s_scan_mutex);
         xSemaphoreGive(s_connect_mutex);
         ESP_RETURN_ON_ERROR(err, TAG, "set Wi-Fi config failed");
     }
@@ -505,6 +679,7 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         stop_wifi_connecting();
+        xSemaphoreGive(s_scan_mutex);
         xSemaphoreGive(s_connect_mutex);
         ESP_RETURN_ON_ERROR(err, TAG, "esp_wifi_connect failed");
     }
@@ -524,10 +699,12 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
         if (save) {
             err = save_config(config);
             if (err != ESP_OK) {
+                xSemaphoreGive(s_scan_mutex);
                 xSemaphoreGive(s_connect_mutex);
                 ESP_RETURN_ON_ERROR(err, TAG, "save Wi-Fi credential failed");
             }
         }
+        xSemaphoreGive(s_scan_mutex);
         xSemaphoreGive(s_connect_mutex);
         return ESP_OK;
     }
@@ -544,6 +721,7 @@ esp_err_t fridge_network_connect(const fridge_wifi_config_t *config, bool save)
         set_last_error("Wi-Fi 连接超时：请检查密码、热点是否为 2.4GHz、信号强度和开发板供电");
     }
     stop_wifi_connecting();
+    xSemaphoreGive(s_scan_mutex);
     xSemaphoreGive(s_connect_mutex);
     return ESP_ERR_TIMEOUT;
 }

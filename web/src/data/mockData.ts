@@ -337,7 +337,28 @@ export function createMockSensors(): SensorSnapshot {
     touch: "FT6336U idle / addr 0x38",
     display: "TR230S QSPI planned / line buffer",
     buzzer: "LEDC idle",
-    doorState: "IDLE",
+    doorState: "CLOSED",
+    stateMachine: {
+      state: brightness10 < 250 ? "NIGHT_SAVE" : "SLEEP",
+      doorState: "CLOSED",
+      offline: false,
+      isNight: brightness10 < 250,
+      radarSoftwarePaused: brightness10 < 250,
+      radarPresenceReliable: false,
+      radarWithin2m: false,
+      radarWithin1m: false,
+      radarApproaching: false,
+      imuMotionStrength: 0.08,
+      lightValue10bit: brightness10,
+      lightDelta: 12,
+      radarDistanceRaw: 0,
+      radarGate: 0,
+      lastReason: "Mock 状态机：光照亮、雷达无人、IMU 静止",
+      autoVoiceState: "IDLE",
+      autoVoiceError: "",
+      updatedAtMs: Date.now(),
+      stateSinceMs: Date.now() - 5000,
+    },
     updatedAt: now(),
   };
 }
@@ -345,9 +366,9 @@ export function createMockSensors(): SensorSnapshot {
 export function createMockDiagnostics(): DiagnosticSnapshot {
   return {
     psram: "OK / 8MB / alloc tested",
-    flashPartition: "当前 sdkconfig 仍需调整为 8MB + OTA + LittleFS",
+    flashPartition: "8MB: ota_0 大主固件 + ota_1 小 recovery + assets/cache/model",
     littlefs: "planned: assets + cache",
-    otaSlot: "未启用，等待分区表修正",
+    otaSlot: "ota_0 主固件运行，ota_1 作为本地 recovery 兜底",
     brownoutCount: 0,
     watchdogCount: 0,
     lastError: "无硬件错误，当前为 Mock 数据",
@@ -362,7 +383,7 @@ export function createMockDiagnostics(): DiagnosticSnapshot {
 export function createMockLogs(): DeviceLog[] {
   return [
     { id: crypto.randomUUID(), at: now(), level: "info", source: "boot", message: "Fridge Spirit console mock boot complete" },
-    { id: crypto.randomUUID(), at: now(), level: "warn", source: "partition", message: "sdkconfig still reports single app partition" },
+    { id: crypto.randomUUID(), at: now(), level: "info", source: "partition", message: "main app uses large ota_0; ota_1 is reserved for local recovery" },
     { id: crypto.randomUUID(), at: now(), level: "info", source: "sensor_task", message: "brightness=642 delta=12 angle_delta=2.1 pir=0" },
     { id: crypto.randomUUID(), at: now(), level: "debug", source: "mqtt", message: "heartbeat queued because broker is not connected" },
   ];

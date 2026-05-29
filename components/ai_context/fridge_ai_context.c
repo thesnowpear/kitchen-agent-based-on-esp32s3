@@ -24,6 +24,8 @@ static const char *supported_tasks[] = {
     "shopping_list_generate",
     "reminder_explain",
     "voice_intent_parse",
+    "kitchen_tool_control",
+    "ui_control",
 };
 
 typedef struct {
@@ -82,7 +84,13 @@ static const char *task_template_for(const char *task_type)
         return "解释临期和过期提醒，说明食材、剩余天数、位置和保守处理建议。";
     }
     if (strcmp(task_type, "voice_intent_parse") == 0) {
-        return "把语音文本解析成意图和槽位；信息不足时返回需要确认的字段。";
+        return "把语音文本解析成意图和槽位；如果是定时器、秒表、闹钟或页面切换指令，输出紧凑 JSON：{\"tool\":\"timer|stopwatch|alarm|ui\",\"action\":\"start|pause|resume|cancel|reset|set|dismiss|switch_page\",\"page\":\"home|standby|zone|door|recipe|nutrition|shopping|settings|wifi|more|offline|ai|timer|stopwatch|alarm\",\"duration_seconds\":秒数,\"hour\":0-23,\"minute\":0-59,\"label\":\"简短标签\"}；信息不足时返回需要确认的字段。不要输出 camera 页面。";
+    }
+    if (strcmp(task_type, "kitchen_tool_control") == 0) {
+        return "把用户的厨房计时工具指令转换为紧凑 JSON：定时器使用 tool=timer 和 duration_seconds；秒表使用 tool=stopwatch；闹钟使用 tool=alarm、hour、minute、label。只输出 JSON，不要编造缺失时间。";
+    }
+    if (strcmp(task_type, "ui_control") == 0) {
+        return "把用户页面切换请求转换为紧凑 JSON：{\"tool\":\"ui\",\"action\":\"switch_page\",\"page\":\"home|standby|zone|door|recipe|nutrition|shopping|settings|wifi|more|offline|ai|timer|stopwatch|alarm\"}。不要输出 camera 或 camera_result；不要控制亮度、音量、拍照、配网、库存、OTA 或 GPIO。";
     }
     return "作为家庭厨房助手回答用户问题；必须优先依据系统提供的结构化数据。";
 }
@@ -366,6 +374,12 @@ esp_err_t fridge_ai_context_test_task(const fridge_ai_task_request_t *request, f
         strlcpy(out->result_json,
                 "{\"schema_version\":1,\"type\":\"recognize_ingredients\",\"candidates\":[{\"name\":\"番茄\",\"quantity\":\"约2-3个\",\"confidence\":0.82,\"doubt\":\"Mock 未接入真实图片\"}],\"needs_confirmation\":true,\"confirm_fields\":[\"名称\",\"数量\",\"保质期\",\"位置\"]}",
                 sizeof(out->result_json));
+    } else if (strcmp(task_type, "kitchen_tool_control") == 0) {
+        strlcpy(out->result_json,
+                "{\"schema_version\":1,\"type\":\"kitchen_tool_control\",\"tool\":\"timer\",\"action\":\"start\",\"duration_seconds\":480,\"label\":\"煮蛋\",\"needs_confirmation\":false}",
+                sizeof(out->result_json));
+        out->needs_confirmation = false;
+        out->confidence_percent = 90;
     } else if (strcmp(task_type, "inventory_parse") == 0 || strcmp(task_type, "voice_intent_parse") == 0) {
         strlcpy(out->result_json,
                 "{\"schema_version\":1,\"type\":\"inventory_change_suggestion\",\"intent\":\"consume_or_add\",\"slots\":{\"item_name\":\"待确认\",\"quantity\":\"待确认\",\"location\":\"待确认\"},\"needs_confirmation\":true,\"note\":\"信息不足时只生成建议，不直接修改库存\"}",

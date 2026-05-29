@@ -219,6 +219,7 @@ async def upsert_ai_config(
     update: AiConfigUpdateRequest,
     source: str = "miniapp",
     config_updated_at: datetime | None = None,
+    commit: bool = True,
 ) -> AiConfigData:
     """小程序 / 设备同步入口共用。
 
@@ -260,8 +261,11 @@ async def upsert_ai_config(
         row.value = merged
         row.config_updated_at = final_updated_at
 
-    await db.commit()
-    await db.refresh(row)
+    if commit:
+        await db.commit()
+        await db.refresh(row)
+    else:
+        await db.flush()
     logger.info(
         "ai_config upserted: home=%s source=%s updated_at=%s has_key=%s",
         home_id,
@@ -293,8 +297,10 @@ async def merge_from_device(
         device_ts_ms = 0
 
     row = await _load_row(db, home_id)
+    if row is None:
+        return True
     backend_ts_ms = (
-        int(row.config_updated_at.timestamp() * 1000) if row is not None else 0
+        int(row.config_updated_at.timestamp() * 1000)
     )
 
     # ---- 设备时间戳更大：用设备的覆盖 backend ----
@@ -334,11 +340,33 @@ async def merge_from_device(
     return ("noop", None)
 
 
+async def should_accept_device_config(
+    db: AsyncSession,
+    home_id: UUID,
+    device_payload: dict[str, Any],
+) -> bool:
+    """普通 sync 通道里的设备 AI 配置也按 configUpdatedAt 做后写覆盖。"""
+    device_ts_raw = device_payload.get("configUpdatedAt") or device_payload.get(
+        "config_updated_at"
+    )
+    try:
+        device_ts_ms = int(device_ts_raw) if device_ts_raw is not None else 0
+    except (TypeError, ValueError):
+        device_ts_ms = 0
+
+    row = await _load_row(db, home_id)
+    backend_ts_ms = (
+        int(row.config_updated_at.timestamp() * 1000) if row is not None else 0
+    )
+    return device_ts_ms > backend_ts_ms
+
+
 __all__ = [
     "AI_CONFIG_KEY",
     "build_device_payload",
     "get_ai_config",
     "get_ai_config_full",
     "merge_from_device",
+    "should_accept_device_config",
     "upsert_ai_config",
 ]

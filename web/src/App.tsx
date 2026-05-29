@@ -62,6 +62,8 @@ import type {
   RadarSnapshot,
   SectionDefinition,
   SensorSnapshot,
+  StateMachineConfig,
+  StateMachineStatus,
   TransportMode,
   TTSConfig,
   TTSStatus,
@@ -185,6 +187,7 @@ const projectAiTaskLabels: Record<ProjectAITaskType, string> = {
   shopping_list_generate: "购物清单",
   reminder_explain: "临期提醒解释",
   voice_intent_parse: "语音意图解析",
+  kitchen_tool_control: "厨房工具控制",
 };
 
 const defaultProjectAiRequest: ProjectAITaskRequest = {
@@ -323,6 +326,8 @@ function App() {
   const [networkBusy, setNetworkBusy] = useState(false);
   const [pins, setPins] = useState<PinInfo[]>([]);
   const [sensors, setSensors] = useState<SensorSnapshot | null>(null);
+  const [stateMachineConfig, setStateMachineConfig] = useState<StateMachineConfig | null>(null);
+  const [stateMachineStatus, setStateMachineStatus] = useState<StateMachineStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticSnapshot | null>(null);
   const [logs, setLogs] = useState<DeviceLog[]>([]);
   const [logFilter, setLogFilter] = useState<LogLevel | "all">("all");
@@ -339,6 +344,7 @@ function App() {
   const aiConfigDirtyRef = useRef(false);
   const asrConfigDirtyRef = useRef(false);
   const ttsConfigDirtyRef = useRef(false);
+  const stateMachineConfigDirtyRef = useRef(false);
   const micPlaybackUrlRef = useRef<string | null>(null);
 
   const appendLog = useCallback((level: LogLevel, message: string, source = "web") => {
@@ -460,6 +466,8 @@ function App() {
     setNetworkBusy(false);
     setPins([]);
     setSensors(null);
+    setStateMachineConfig(null);
+    setStateMachineStatus(null);
     setDiagnostics(null);
     setLogs([]);
     setBusy(false);
@@ -471,6 +479,7 @@ function App() {
     aiConfigDirtyRef.current = false;
     asrConfigDirtyRef.current = false;
     ttsConfigDirtyRef.current = false;
+    stateMachineConfigDirtyRef.current = false;
     setSearchTerm("");
     setLogFilter("all");
   }, [clearMicPlayback]);
@@ -493,6 +502,11 @@ function App() {
   const setTtsConfigDraft = useCallback((next: TTSConfig) => {
     ttsConfigDirtyRef.current = true;
     setTtsConfig(next);
+  }, []);
+
+  const setStateMachineConfigDraft = useCallback((next: StateMachineConfig) => {
+    stateMachineConfigDirtyRef.current = true;
+    setStateMachineConfig(next);
   }, []);
 
   const changeTransportMode = useCallback(
@@ -549,6 +563,10 @@ function App() {
         setAiConfig((current) => (aiConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
       });
       await optionalRead<SensorSnapshot>("get_sensors", "传感器状态", setSensors);
+      await optionalRead<StateMachineStatus>("get_state_machine_status", "状态机状态", setStateMachineStatus);
+      await optionalRead<StateMachineConfig>("get_state_machine_config", "状态机配置", (payload) => {
+        setStateMachineConfig((current) => (stateMachineConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
+      });
 
       await optionalRead<ASRConfig>("get_asr_config", "ASR API config", (payload) => {
         setAsrConfig((current) => (asrConfigDirtyRef.current && current ? { ...payload, ...current } : payload));
@@ -1032,6 +1050,34 @@ function App() {
       appendLog("warn", "TTS Key 已清除。", "tts");
     } catch (error) {
       appendLog("error", String(error), "tts");
+    } finally {
+      commandInFlightRef.current = false;
+    }
+  };
+
+  const saveStateMachineConfig = async () => {
+    const transport = transportRef.current;
+    const current = stateMachineConfig;
+    if (!transport || connection !== "connected") {
+      appendLog("warn", "请先连接设备，再保存状态机配置。", "state");
+      return;
+    }
+    if (!current) {
+      appendLog("warn", "状态机配置尚未读取。", "state");
+      return;
+    }
+    try {
+      commandInFlightRef.current = true;
+      const response = await transport.sendCommand<StateMachineConfig>("set_state_machine_config", current);
+      stateMachineConfigDirtyRef.current = false;
+      setStateMachineConfig(response.payload);
+      appendLog("info", "状态机阈值已保存到设备。", "state");
+      const statusResponse = await transport.sendCommand<StateMachineStatus>("get_state_machine_status").catch(() => null);
+      if (statusResponse) {
+        setStateMachineStatus(statusResponse.payload);
+      }
+    } catch (error) {
+      appendLog("error", String(error), "state");
     } finally {
       commandInFlightRef.current = false;
     }
@@ -2360,6 +2406,11 @@ function App() {
             setTimeoutMs={setTimeoutMs}
             refreshSeconds={refreshSeconds}
             setRefreshSeconds={setRefreshSeconds}
+            stateMachineConfig={stateMachineConfig}
+            setStateMachineConfig={setStateMachineConfigDraft}
+            stateMachineStatus={stateMachineStatus ?? sensors?.stateMachine ?? null}
+            saveStateMachineConfig={saveStateMachineConfig}
+            connected={connection === "connected"}
           />
         );
     }
@@ -4330,12 +4381,36 @@ function SettingsPanel({
   setTimeoutMs,
   refreshSeconds,
   setRefreshSeconds,
+  stateMachineConfig,
+  setStateMachineConfig,
+  stateMachineStatus,
+  saveStateMachineConfig,
+  connected,
 }: {
   timeoutMs: number;
   setTimeoutMs: (value: number) => void;
   refreshSeconds: number;
   setRefreshSeconds: (value: number) => void;
+  stateMachineConfig: StateMachineConfig | null;
+  setStateMachineConfig: (value: StateMachineConfig) => void;
+  stateMachineStatus: StateMachineStatus | null;
+  saveStateMachineConfig: () => Promise<void>;
+  connected: boolean;
 }) {
+  const config = stateMachineConfig ?? {
+    nightLightThreshold: 250,
+    dayLightThreshold: 450,
+    radarTwoMeterRaw: 200,
+    radarTwoMeterGate: 8,
+    sleepEnabled: false,
+    autoVoiceAfterClose: true,
+    autoVoiceRecordSeconds: 6,
+    closeStableMs: 2500,
+  };
+  const updateConfig = (patch: Partial<StateMachineConfig>) => {
+    setStateMachineConfig({ ...config, ...patch });
+  };
+
   return (
     <div className="section-flow">
       <div className="section-heading">
@@ -4354,6 +4429,55 @@ function SettingsPanel({
           <input type="number" min={10} max={120} value={refreshSeconds} onChange={(event) => setRefreshSeconds(Number(event.target.value))} />
         </label>
       </div>
+      <div className="data-table">
+        <h3>状态机阈值</h3>
+        <div className="form-grid">
+          <label>
+            <span>夜间阈值</span>
+            <input type="number" min={0} max={1023} value={config.nightLightThreshold} onChange={(event) => updateConfig({ nightLightThreshold: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>白天阈值</span>
+            <input type="number" min={0} max={1023} value={config.dayLightThreshold} onChange={(event) => updateConfig({ dayLightThreshold: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>雷达 2m raw</span>
+            <input type="number" min={1} max={5000} value={config.radarTwoMeterRaw} onChange={(event) => updateConfig({ radarTwoMeterRaw: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>雷达 2m gate</span>
+            <input type="number" min={0} max={15} value={config.radarTwoMeterGate} onChange={(event) => updateConfig({ radarTwoMeterGate: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>关门后录音秒数</span>
+            <input type="number" min={1} max={6} value={config.autoVoiceRecordSeconds ?? 6} onChange={(event) => updateConfig({ autoVoiceRecordSeconds: Number(event.target.value) })} />
+          </label>
+          <label>
+            <span>关门稳定 ms</span>
+            <input type="number" min={800} max={10000} value={config.closeStableMs ?? 2500} onChange={(event) => updateConfig({ closeStableMs: Number(event.target.value) })} />
+          </label>
+        </div>
+        <label className="checkbox-line">
+          <input type="checkbox" checked={config.sleepEnabled ?? false} onChange={(event) => updateConfig({ sleepEnabled: event.target.checked })} />
+          <span>启用黑屏休眠省电</span>
+        </label>
+        <label className="checkbox-line">
+          <input type="checkbox" checked={config.autoVoiceAfterClose} onChange={(event) => updateConfig({ autoVoiceAfterClose: event.target.checked })} />
+          <span>关门稳定后自动开启语音对话</span>
+        </label>
+        <button className="action-button" type="button" disabled={!connected} onClick={() => void saveStateMachineConfig()}>
+          <Check size={16} />
+          保存状态机配置
+        </button>
+      </div>
+      <KeyValue title="当前状态机" rows={[
+        ["状态", stateMachineStatus?.state ?? "--"],
+        ["门状态", stateMachineStatus?.doorState ?? "--"],
+        ["昼夜", stateMachineStatus?.isNight ? "夜间" : "白天"],
+        ["雷达 2m", stateMachineStatus?.radarWithin2m ? "是" : "否"],
+        ["自动语音", stateMachineStatus?.autoVoiceState ?? "--"],
+        ["原因", stateMachineStatus?.lastReason ?? "--"],
+      ]} />
       <div className="warning-line">
         <Info size={16} />
         修改 Web Serial 超时只影响新建连接；已连接串口会保持当前参数。

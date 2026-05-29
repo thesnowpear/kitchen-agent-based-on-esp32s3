@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_active_home, get_current_user
 from app.db.session import get_db
 from app.models.home import Home
+from app.models.device import Device, DeviceBinding
 from app.models.inventory import InventoryEvent, InventoryItem
 from app.models.user import User
 from app.schemas.common import ApiResponse
@@ -39,6 +40,8 @@ from app.schemas.inventory import (
     InventoryUpdateResponse,
     RefreshData,
 )
+from app.services.sync_device_bridge import push_cloud_snapshot_to_devices
+from app.services.sync_service import get_status, record_server_event
 
 router = APIRouter()
 
@@ -96,8 +99,23 @@ async def inventory_create_v2(
     """新增或更新库存条目；home_id 优先用 token 推断的活跃家庭，请求体里的 home_id 仅作老兼容。"""
     home_id = home.id  # 始终以 token 推断的活跃家庭为准，避免越权写入别的家庭。
     item = await _upsert_item(db, payload, home_id=home_id)
+    await record_server_event(
+        db,
+        home_id=home_id,
+        user_id=_user.id,
+        domain="inventory",
+        op="upsert",
+        payload=payload.model_dump(mode="json", by_alias=True),
+    )
     await db.commit()
     await db.refresh(item)
+    await push_cloud_snapshot_to_devices(
+        db,
+        home_id=home_id,
+        server_revision=(await get_status(db, home_id)).server_revision,
+        domains={"inventory", "fridge_zones"},
+        request_device_inventory=False,
+    )
     return ApiResponse[InventoryItemSchema](data=_item_to_schema(item))
 
 
@@ -131,9 +149,24 @@ async def inventory_patch_v2(
             payload=patch_data,
         )
     )
+    await record_server_event(
+        db,
+        home_id=home.id,
+        user_id=_user.id,
+        domain="inventory",
+        op="patch",
+        payload={"id": str(item.id), **payload.model_dump(mode="json", exclude_unset=True, by_alias=True)},
+    )
 
     await db.commit()
     await db.refresh(item)
+    await push_cloud_snapshot_to_devices(
+        db,
+        home_id=home.id,
+        server_revision=(await get_status(db, home.id)).server_revision,
+        domains={"inventory", "fridge_zones"},
+        request_device_inventory=False,
+    )
     return ApiResponse[InventoryItemSchema](data=_item_to_schema(item))
 
 
@@ -159,7 +192,22 @@ async def inventory_delete_v2(
             payload={"status": "deleted"},
         )
     )
+    await record_server_event(
+        db,
+        home_id=home.id,
+        user_id=_user.id,
+        domain="inventory",
+        op="delete",
+        payload={"id": str(item.id), "status": "deleted"},
+    )
     await db.commit()
+    await push_cloud_snapshot_to_devices(
+        db,
+        home_id=home.id,
+        server_revision=(await get_status(db, home.id)).server_revision,
+        domains={"inventory", "fridge_zones"},
+        request_device_inventory=False,
+    )
     return ApiResponse[None](message="item deleted")
 
 
@@ -171,10 +219,8 @@ async def inventory_refresh_v2(
 ) -> ApiResponse[RefreshData]:
     """触发设备重新上报库存。
 
-    本期 MQTT 客户端尚未接入（task #7），故走 placeholder：
-    - 尝试 import app.services.mqtt_client.publish_command 并调用；
-    - 任意 ImportError / 调用异常都吞掉，仅日志记录，返回 queued=false。
-    - 同时建议下次刷新时刻 = now + 60s，让小程序避免无效轮询。
+    若 MQTT 在线，会向当前家庭第一台 active 设备发送 inventory_refresh。
+    设备端尚未实现该命令时只会通用 ACK；这里仅表示“云端已尝试下发”。
     """
     queued = False
     # 写一条事件以备审计；即便 MQTT 失败也保留请求轨迹。
@@ -189,11 +235,27 @@ async def inventory_refresh_v2(
         )
     )
     try:
-        # 延迟 import，避免在 task #7 之前因模块不存在直接导致路由不可用。
-        from app.services.mqtt_client import publish_command  # type: ignore
+        from app.services.mqtt_client import mqtt_client
 
-        await publish_command(home_id=home.id, command="inventory.refresh")
-        queued = True
+        device = (
+            await db.execute(
+                select(Device)
+                .join(DeviceBinding, DeviceBinding.device_id == Device.id)
+                .where(
+                    DeviceBinding.home_id == home.id,
+                    DeviceBinding.status == "active",
+                )
+                .order_by(DeviceBinding.created_at.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if device is not None and mqtt_client.is_connected():
+            await mqtt_client.publish_command(
+                device.device_sn,
+                command="inventory_refresh",
+                payload={"homeId": str(home.id)},
+            )
+            queued = True
     except Exception as exc:  # noqa: BLE001  本期就是要吃掉一切异常并降级
         # 用 print 避免引入额外 logger 依赖；正式接入 MQTT 时再换 logging。
         print(f"[inventory_refresh] mqtt placeholder skipped: {exc!r}")

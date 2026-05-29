@@ -49,6 +49,7 @@ typedef struct {
     char model[FRIDGE_AI_MAX_MODEL_LEN + 1];
     char system_prompt[FRIDGE_AI_MAX_SYSTEM_PROMPT_LEN + 1];
     uint32_t timeout_ms;
+    int64_t config_updated_at_ms;
     bool update_api_key;
 } fridge_ai_config_update_t;
 
@@ -125,6 +126,9 @@ esp_err_t fridge_ai_client_get_config(fridge_ai_config_view_t *out);
 
 // 保存 AI 配置；API Key 只有在 update_api_key 为 true 时写入 NVS。
 esp_err_t fridge_ai_client_set_config(const fridge_ai_config_update_t *config);
+
+// 生成设备本地 AI 配置同步文档；比赛演示版会包含明文 API Key，只能走受控同步通道。
+esp_err_t fridge_ai_client_get_sync_payload(char *out, size_t out_size);
 
 // 读取 AI 配置槽列表；不会返回 API Key 明文。
 esp_err_t fridge_ai_client_get_profiles(fridge_ai_profile_list_t *out);

@@ -134,6 +134,9 @@ async def chat_via_device(
 
     if not isinstance(ack, dict):
         return None
+    if ack.get("message") == "command received by device":
+        logger.info("device returned generic ai_chat ack; falling back to cloud")
+        return None
     if not ack.get("ok", True):
         # 设备明确 ack 失败：把 message 当 reply 透传，让前端展示设备反馈。
         return {

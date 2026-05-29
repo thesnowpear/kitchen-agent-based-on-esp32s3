@@ -74,8 +74,24 @@ esp_err_t fridge_mqtt_publish_state(bool online);
 // 发布简短传感器聚合事件；v1 不发布原始高频 IMU/雷达流。
 esp_err_t fridge_mqtt_publish_sensor_snapshot(void);
 
+// 发布当前 UI 库存同步快照。
+// 仅在用户确认保存、云端请求刷新或调试命令触发时调用；未连接时返回 ESP_ERR_INVALID_STATE。
+esp_err_t fridge_mqtt_publish_inventory_snapshot(bool force_import);
+
 // 发布命令回执；request_id 必须来自云端命令，便于后端幂等处理。
 esp_err_t fridge_mqtt_publish_command_ack(const char *request_id, const char *command, bool ok, const char *message);
+
+// 发布带执行阶段语义的命令回执。
+// stage=received 表示设备已收到命令；stage=completed 表示本地执行已完成并携带版本结果。
+esp_err_t fridge_mqtt_publish_command_ack_ex(const char *request_id,
+                                             const char *command,
+                                             const char *stage,
+                                             bool ok,
+                                             const char *error_code,
+                                             uint32_t local_revision,
+                                             uint32_t server_revision,
+                                             bool applied,
+                                             const char *message);
 
 #ifdef __cplusplus
 }

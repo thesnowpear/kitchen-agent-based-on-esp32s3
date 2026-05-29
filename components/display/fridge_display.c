@@ -259,6 +259,19 @@ static uint8_t load_saved_brightness(void)
     return value;
 }
 
+static void display_cleanup_after_failed_init(void)
+{
+    if (s_lcd) {
+        spi_bus_remove_device(s_lcd);
+        s_lcd = NULL;
+    }
+    if (s_tx_buf) {
+        heap_caps_free(s_tx_buf);
+        s_tx_buf = NULL;
+    }
+    s_ready = false;
+}
+
 static esp_err_t save_brightness(uint8_t value)
 {
     nvs_handle_t handle;
@@ -295,7 +308,12 @@ esp_err_t fridge_display_init(void)
     configure_safe_start_levels();
     lcd_hard_reset();
     ESP_RETURN_ON_ERROR(lcd_wait_ready("after hardware reset"), TAG, "LCD WAIT# not ready");
-    ESP_RETURN_ON_ERROR(qspi_bus_init(), TAG, "QSPI bus init failed");
+    esp_err_t ret = qspi_bus_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "QSPI bus init failed: %s", esp_err_to_name(ret));
+        display_cleanup_after_failed_init();
+        return ret;
+    }
 
     spi_device_interface_config_t dev_conf = {
         .clock_speed_hz = LCD_PCLK_HZ,
@@ -304,14 +322,25 @@ esp_err_t fridge_display_init(void)
         .queue_size = 8,
         .flags = SPI_DEVICE_HALFDUPLEX,
     };
-    ESP_RETURN_ON_ERROR(spi_bus_add_device(LCD_SPI_HOST, &dev_conf, &s_lcd), TAG, "add LCD SPI device failed");
-    ESP_RETURN_ON_ERROR(lcd_init_commands(), TAG, "LCD init commands failed");
+    ret = spi_bus_add_device(LCD_SPI_HOST, &dev_conf, &s_lcd);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "add LCD SPI device failed: %s", esp_err_to_name(ret));
+        display_cleanup_after_failed_init();
+        return ret;
+    }
+    ret = lcd_init_commands();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LCD init commands failed: %s", esp_err_to_name(ret));
+        display_cleanup_after_failed_init();
+        return ret;
+    }
 
     s_tx_buf = heap_caps_malloc(LCD_FLUSH_CHUNK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     if (!s_tx_buf) {
         s_tx_buf = heap_caps_malloc(LCD_FLUSH_CHUNK_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     }
     if (!s_tx_buf) {
+        display_cleanup_after_failed_init();
         return ESP_ERR_NO_MEM;
     }
 

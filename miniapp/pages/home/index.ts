@@ -134,14 +134,19 @@ Page({
       clearInterval(this.clockTimer);
       this.clockTimer = 0;
     }
+    this.setTabBarHidden(false);
+  },
+
+  onHide() {
+    this.setTabBarHidden(false);
   },
 
   onShow() {
     const app = getApp<MiniAppInstance["globalData"]>() as unknown as MiniAppInstance;
 
     // 同步自定义 tabBar 高亮（首页 = 索引 0）
-    const tabBar = (this.getTabBar?.() as unknown) as { setData: (d: { selected: number }) => void } | undefined;
-    if (tabBar) tabBar.setData({ selected: 0 });
+    const tabBar = (this.getTabBar?.() as unknown) as { setData: (d: { selected: number; hidden: boolean }) => void } | undefined;
+    if (tabBar) tabBar.setData({ selected: 0, hidden: false });
 
     // 1) 立刻用 globalData 缓存渲染（避免冷启动空白）
     if (app.globalData.lastOverview) {
@@ -355,15 +360,29 @@ Page({
 
   /** ---------- 交互 ---------- */
 
+  setTabBarHidden(hidden: boolean) {
+    const tabBar = (this.getTabBar?.() as unknown) as { setData: (d: { hidden: boolean }) => void } | undefined;
+    if (tabBar) tabBar.setData({ hidden });
+    const tabBarApi = wx as WechatMiniprogram.Wx & {
+      hideTabBar?: (option?: { animation?: boolean; fail?: () => void }) => void;
+      showTabBar?: (option?: { animation?: boolean; fail?: () => void }) => void;
+    };
+    const toggle = hidden ? tabBarApi.hideTabBar : tabBarApi.showTabBar;
+    if (!toggle) return;
+    toggle({ animation: false, fail: () => undefined });
+  },
+
   onTapStatus() {
     if (!this.data.hasDevice) {
       this.onTapBindManual();
       return;
     }
+    this.setTabBarHidden(true);
     this.setData({ statusPanelOpen: true });
   },
 
   onTapStatusClose() {
+    this.setTabBarHidden(false);
     this.setData({ statusPanelOpen: false });
   },
 
@@ -566,11 +585,13 @@ Page({
   },
 
   onTapOffline() {
+    this.setTabBarHidden(false);
     this.setData({ statusPanelOpen: false });
     wx.navigateTo({ url: "/pages/offline/index" });
   },
 
   onTapBindManual() {
+    this.setTabBarHidden(false);
     this.setData({ statusPanelOpen: false });
     wx.navigateTo({ url: "/pages/bind/index" });
   },

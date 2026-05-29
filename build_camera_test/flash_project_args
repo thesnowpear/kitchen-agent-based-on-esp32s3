@@ -1,6 +1,0 @@
---flash-mode dio --flash-freq 80m --flash-size 8MB
-0x0 bootloader/bootloader.bin
-0x8000 partition_table/partition-table.bin
-0x19000 ota_data_initial.bin
-0x6e0000 srmodels/srmodels.bin
-0x30000 fridge_spirit.bin

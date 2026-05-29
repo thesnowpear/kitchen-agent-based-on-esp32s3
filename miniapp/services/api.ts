@@ -15,11 +15,15 @@
 
 import { LONG_REQUEST_TIMEOUT_MS } from "../config/env";
 import type {
+  AiChatHistoryClearData,
+  AiChatHistoryData,
   AiChatResponseData,
   AiConfigData,
   AiConfigUpdateRequest,
   BindDevicePayload,
   DeviceSummary,
+  FridgeZoneListData,
+  FridgeZoneUpdateRequest,
   HomeOverview,
   InventoryListData,
   InventoryItem,
@@ -32,6 +36,13 @@ import type {
   ReminderListData,
   ScanResult,
   SettingsUpdateRequest,
+  SyncPullData,
+  SyncDevicePushData,
+  SyncDevicePushRequest,
+  SyncPushData,
+  SyncPushRequest,
+  SyncSnapshotData,
+  SyncStatusData,
   UserSettingsData,
 } from "../types/models";
 import { request, uploadFile } from "../utils/request";
@@ -196,6 +207,27 @@ export function sendAiChat(
   });
 }
 
+/** 读取云端 AI 对话历史；未传 sessionId 时使用后端默认会话。 */
+export function getAiChatHistory(
+  sessionId?: string,
+): Promise<AiChatHistoryData> {
+  const suffix = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<AiChatHistoryData>({
+    path: `/ai/history${suffix}`,
+  });
+}
+
+/** 清空云端 AI 对话历史；未传 sessionId 时清默认会话。 */
+export function clearAiChatHistory(
+  sessionId?: string,
+): Promise<AiChatHistoryClearData> {
+  const suffix = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  return request<AiChatHistoryClearData>({
+    path: `/ai/history${suffix}`,
+    method: "DELETE",
+  });
+}
+
 /** 读 AI 配置（不含明文 apiKey）。 */
 export function getAiConfig(): Promise<AiConfigData> {
   return request<AiConfigData>({
@@ -209,6 +241,64 @@ export function updateAiConfig(
 ): Promise<AiConfigData> {
   return request<AiConfigData, AiConfigUpdateRequest>({
     path: "/ai/config",
+    method: "POST",
+    data: payload,
+  });
+}
+
+// ---------- 7.5 冰箱分区 ----------
+
+/** 读取家庭级冰箱分区配置；失败时调用方可回退本地缓存。 */
+export function getFridgeZonesRemote(): Promise<FridgeZoneListData> {
+  return request<FridgeZoneListData>({
+    path: "/fridge/zones",
+  });
+}
+
+/** 写入家庭级冰箱分区配置。 */
+export function updateFridgeZonesRemote(
+  payload: FridgeZoneUpdateRequest,
+): Promise<FridgeZoneListData> {
+  return request<FridgeZoneListData, FridgeZoneUpdateRequest>({
+    path: "/fridge/zones",
+    method: "PUT",
+    data: payload,
+  });
+}
+
+// ---------- 7.6 三端同步 ----------
+
+export function getSyncStatus(): Promise<SyncStatusData> {
+  return request<SyncStatusData>({
+    path: "/sync/status",
+  });
+}
+
+export function getSyncSnapshot(): Promise<SyncSnapshotData> {
+  return request<SyncSnapshotData>({
+    path: "/sync/snapshot",
+  });
+}
+
+export function pullSyncChanges(sinceRevision: number): Promise<SyncPullData> {
+  return request<SyncPullData>({
+    path: `/sync/pull?sinceRevision=${encodeURIComponent(String(sinceRevision || 0))}`,
+  });
+}
+
+export function pushSyncChanges(payload: SyncPushRequest): Promise<SyncPushData> {
+  return request<SyncPushData, SyncPushRequest>({
+    path: "/sync/push",
+    method: "POST",
+    data: payload,
+  });
+}
+
+export function pushSyncSnapshotToDevice(
+  payload: SyncDevicePushRequest = {},
+): Promise<SyncDevicePushData> {
+  return request<SyncDevicePushData, SyncDevicePushRequest>({
+    path: "/sync/device-push",
     method: "POST",
     data: payload,
   });

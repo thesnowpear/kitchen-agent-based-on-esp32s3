@@ -12,7 +12,7 @@ class AiChatRequest(CamelModel):
     """`/api/v1/ai/chat` 请求体。
 
     - prompt：用户输入的对话内容，必填；
-    - session_id：预留字段，本期 backend 不持久化对话，所有上下文由设备/云端各自维护。
+    - session_id：云端历史分组；不传时使用 miniapp-default。
     """
 
     prompt: str = Field(min_length=1, max_length=2000)
@@ -35,6 +35,7 @@ class AiChatResponseData(CamelModel):
     fallback_reason: str | None = None
     model_used: str | None = None
     device_sn: str | None = None
+    session_id: str | None = None
 
 
 __all__ = ["AiChatRequest", "AiChatResponseData"]

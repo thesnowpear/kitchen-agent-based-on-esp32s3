@@ -50,11 +50,25 @@ export type DeviceCommand =
   | "get_tts_config"
   | "set_tts_config"
   | "clear_tts_key"
+  | "get_state_machine_config"
+  | "set_state_machine_config"
+  | "get_state_machine_status"
   | "create_ai_profile"
   | "select_ai_profile"
   | "delete_ai_profile"
   | "test_ai_chat"
   | "ai_assistant_chat"
+  | "get_kitchen_tools"
+  | "timer_start"
+  | "timer_pause"
+  | "timer_resume"
+  | "timer_cancel"
+  | "stopwatch_start"
+  | "stopwatch_pause"
+  | "stopwatch_reset"
+  | "alarm_set"
+  | "alarm_cancel"
+  | "alarm_dismiss"
   | "wake_start"
   | "wake_stop"
   | "wake_status"
@@ -260,6 +274,39 @@ export interface TTSStatus {
   error: string;
 }
 
+export type KitchenTimerState = "idle" | "running" | "paused" | "ringing";
+export type KitchenStopwatchState = "idle" | "running" | "paused";
+
+export interface KitchenTimerStatus {
+  state: KitchenTimerState | string;
+  durationSeconds: number;
+  remainingSeconds: number;
+  label: string;
+}
+
+export interface KitchenStopwatchStatus {
+  state: KitchenStopwatchState | string;
+  elapsedSeconds: number;
+}
+
+export interface KitchenAlarmStatus {
+  id: number;
+  enabled: boolean;
+  ringing: boolean;
+  hour: number;
+  minute: number;
+  label: string;
+}
+
+export interface KitchenToolsStatus {
+  timeReady: boolean;
+  timer: KitchenTimerStatus;
+  stopwatch: KitchenStopwatchStatus;
+  alarms: KitchenAlarmStatus[];
+  lastAlert: string;
+  lastError: string;
+}
+
 export interface CameraStatus {
   initialized: boolean;
   hasFrame: boolean;
@@ -352,7 +399,8 @@ export type ProjectAITaskType =
   | "recipe_generate"
   | "shopping_list_generate"
   | "reminder_explain"
-  | "voice_intent_parse";
+  | "voice_intent_parse"
+  | "kitchen_tool_control";
 
 export interface ProjectAITaskRequest {
   taskType: ProjectAITaskType;
@@ -381,6 +429,8 @@ export interface AIAssistantChatResponse extends AIChatResponse {
   historyCount: number;
   historyPersisted: boolean;
   historyPrunedCount: number;
+  toolExecuted?: boolean;
+  toolMessage?: string;
 }
 
 export interface AIContextPreview {
@@ -475,7 +525,41 @@ export interface SensorSnapshot {
   display: string;
   buzzer: string;
   doorState: string;
+  stateMachine?: StateMachineStatus | null;
   updatedAt: string;
+}
+
+export interface StateMachineConfig {
+  nightLightThreshold: number;
+  dayLightThreshold: number;
+  radarTwoMeterRaw: number;
+  radarTwoMeterGate: number;
+  sleepEnabled?: boolean;
+  autoVoiceAfterClose: boolean;
+  autoVoiceRecordSeconds?: number;
+  closeStableMs?: number;
+}
+
+export interface StateMachineStatus {
+  state: string;
+  doorState: string;
+  offline: boolean;
+  isNight: boolean;
+  radarSoftwarePaused: boolean;
+  radarPresenceReliable: boolean;
+  radarWithin2m: boolean;
+  radarWithin1m: boolean;
+  radarApproaching: boolean;
+  imuMotionStrength: number;
+  lightValue10bit: number;
+  lightDelta: number;
+  radarDistanceRaw: number;
+  radarGate: number;
+  lastReason: string;
+  autoVoiceState: string;
+  autoVoiceError?: string;
+  updatedAtMs: number;
+  stateSinceMs: number;
 }
 
 export interface RadarSnapshot {

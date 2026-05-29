@@ -16,19 +16,24 @@
 #include "esp_log.h"
 #include "fridge_ai_client.h"
 #include "fridge_ai_context.h"
+#include "fridge_ai_actions.h"
 #include "fridge_asr.h"
 #include "fridge_audio.h"
 #include "fridge_camera.h"
 #include "fridge_diagnostics.h"
+#include "fridge_kitchen_tools.h"
 #include "fridge_mqtt_protocol.h"
 #include "fridge_network.h"
 #include "fridge_radar.h"
 #include "fridge_sensors.h"
 #include "fridge_speaker.h"
+#include "fridge_state_machine.h"
 #include "fridge_storage.h"
 #include "fridge_touch.h"
+#include "fridge_voice_session.h"
 #include "fridge_wake_word.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -57,24 +62,16 @@ typedef struct {
 } usb_ai_assistant_job_t;
 
 typedef struct {
-    fridge_asr_result_t *asr;
-    fridge_ai_assistant_result_t *ai;
-    fridge_ai_assistant_request_t *request;
-    fridge_ai_chat_history_item_t *history;
-    fridge_storage_chat_history_t *storage_history;
-    fridge_storage_chat_message_t *persisted_messages;
-    size_t *history_pruned_count;
+    fridge_voice_session_result_t *result;
     esp_err_t err;
     SemaphoreHandle_t done;
 } usb_voice_chat_job_t;
 
-#if CONFIG_FRIDGE_CAMERA_TEST
 typedef struct {
     fridge_ai_image_result_t *result;
     esp_err_t err;
     SemaphoreHandle_t done;
 } usb_camera_analyze_job_t;
-#endif
 
 static void *usb_large_alloc(size_t size)
 {
@@ -83,6 +80,34 @@ static void *usb_large_alloc(size_t size)
         ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
     }
     return ptr;
+}
+
+static BaseType_t usb_create_worker_task(TaskFunction_t task,
+                                         const char *name,
+                                         uint32_t stack_bytes,
+                                         void *arg,
+                                         UBaseType_t priority,
+                                         TaskHandle_t *handle)
+{
+    // AI、语音和图片识别 worker 栈较大，优先放 PSRAM，避免完整 UI 运行时内部 SRAM 不足导致任务创建失败。
+    BaseType_t ok = xTaskCreateWithCaps(task,
+                                        name,
+                                        stack_bytes,
+                                        arg,
+                                        priority,
+                                        handle,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok == pdPASS) {
+        return ok;
+    }
+    ESP_LOGW(TAG,
+             "%s PSRAM stack create failed, retry internal stack=%lu, free_heap=%u KB, largest_internal=%u bytes, free_psram=%u KB",
+             name,
+             (unsigned long)stack_bytes,
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    return xTaskCreate(task, name, stack_bytes, arg, priority, handle);
 }
 
 static char *base64_encode_alloc(const uint8_t *data, size_t len)
@@ -432,7 +457,7 @@ static size_t convert_storage_history_to_ai_history(const fridge_storage_chat_hi
         source_count = FRIDGE_STORAGE_MAX_CHAT_MESSAGES;
     }
     if (source_count > 0 && strcmp(storage_history->messages[source_count - 1].role, "user") == 0) {
-        // 历史注入只使用已经完成的 user/assistant 轮次；最后一条 user 可能是上次异常中断遗留，不能再次发送给模型。
+        // 历史注入只使用已经完成的 user/assistant 轮次；最后一条 user 可能是上次异常中断遗留。
         source_count--;
     }
     if (source_count % 2 != 0) {
@@ -446,8 +471,8 @@ static size_t convert_storage_history_to_ai_history(const fridge_storage_chat_hi
     if (start % 2 != 0) {
         start++;
     }
-    size_t count = 0;
 
+    size_t count = 0;
     for (size_t i = start; i < source_count && count < max_history; i++) {
         const fridge_storage_chat_message_t *message = &storage_history->messages[i];
         if (message->content[0] == '\0') {
@@ -456,7 +481,7 @@ static size_t convert_storage_history_to_ai_history(const fridge_storage_chat_hi
         bool expect_user = (count % 2) == 0;
         if ((expect_user && strcmp(message->role, "user") != 0) ||
             (!expect_user && strcmp(message->role, "assistant") != 0)) {
-            // OpenAI-compatible 服务对 history 顺序更严格，遇到坏轮次时宁可不注入，避免拖垮真实 API 请求。
+            // OpenAI-compatible 服务对 history 顺序更严格，遇到坏轮次时宁可重新截断。
             count = 0;
             continue;
         }
@@ -508,6 +533,58 @@ static void send_error(const char *request_id, const char *command, const char *
     json_print_escaped(error);
     fputs(",\"payload\":{}", stdout);
     response_end();
+}
+
+static void print_state_machine_config_payload(const fridge_sm_config_t *config)
+{
+    fputs("{", stdout);
+    printf("\"nightLightThreshold\":%u,\"dayLightThreshold\":%u,"
+           "\"radarTwoMeterRaw\":%u,\"radarTwoMeterGate\":%u,"
+           "\"sleepEnabled\":%s,\"autoVoiceAfterClose\":%s,"
+           "\"autoVoiceRecordSeconds\":%lu,\"closeStableMs\":%lu",
+           (unsigned)config->night_light_threshold,
+           (unsigned)config->day_light_threshold,
+           (unsigned)config->radar_two_meter_raw,
+           (unsigned)config->radar_two_meter_gate,
+           config->sleep_enabled ? "true" : "false",
+           config->auto_voice_after_close ? "true" : "false",
+           (unsigned long)config->auto_voice_record_seconds,
+           (unsigned long)config->close_stable_ms);
+    fputs("}", stdout);
+}
+
+static void print_state_machine_payload(const fridge_sm_snapshot_t *snapshot)
+{
+    fputs("{\"state\":", stdout);
+    json_print_escaped(fridge_state_machine_state_to_string(snapshot->state));
+    fputs(",\"doorState\":", stdout);
+    json_print_escaped(fridge_state_machine_door_to_string(snapshot->door_state));
+    printf(",\"offline\":%s,\"isNight\":%s,\"radarSoftwarePaused\":%s,"
+           "\"radarPresenceReliable\":%s,\"radarWithin2m\":%s,\"radarWithin1m\":%s,"
+           "\"radarApproaching\":%s,\"imuMotionStrength\":%.3f,"
+           "\"lightValue10bit\":%u,\"lightDelta\":%d,"
+           "\"radarDistanceRaw\":%u,\"radarGate\":%u,",
+           snapshot->offline ? "true" : "false",
+           snapshot->is_night ? "true" : "false",
+           snapshot->radar_software_paused ? "true" : "false",
+           snapshot->radar_presence_reliable ? "true" : "false",
+           snapshot->radar_within_2m ? "true" : "false",
+           snapshot->radar_within_1m ? "true" : "false",
+           snapshot->radar_approaching ? "true" : "false",
+           (double)snapshot->imu_motion_strength,
+           (unsigned)snapshot->light_value_10bit,
+           (int)snapshot->light_delta,
+           (unsigned)snapshot->radar_distance_raw,
+           (unsigned)snapshot->radar_gate);
+    fputs("\"lastReason\":", stdout);
+    json_print_escaped(snapshot->last_reason);
+    fputs(",\"autoVoiceState\":", stdout);
+    json_print_escaped(fridge_state_machine_auto_voice_to_string(snapshot->auto_voice_state));
+    fputs(",\"autoVoiceError\":", stdout);
+    json_print_escaped(snapshot->auto_voice_error);
+    printf(",\"updatedAtMs\":%lld,\"stateSinceMs\":%lld}",
+           (long long)snapshot->updated_at_ms,
+           (long long)snapshot->state_since_ms);
 }
 
 static void print_network_payload(void)
@@ -856,6 +933,123 @@ static void handle_test_ai_task(const char *line, const char *request_id, const 
     free(result);
 }
 
+static void print_kitchen_tools_payload(const fridge_kitchen_tools_snapshot_t *snap)
+{
+    fputs("{\"timeReady\":", stdout);
+    fputs(snap->time_ready ? "true" : "false", stdout);
+    fputs(",\"timer\":{\"state\":", stdout);
+    json_print_escaped(fridge_kitchen_timer_state_text(snap->timer.state));
+    printf(",\"durationSeconds\":%lu,\"remainingSeconds\":%lu,\"label\":",
+           (unsigned long)snap->timer.duration_seconds,
+           (unsigned long)snap->timer.remaining_seconds);
+    json_print_escaped(snap->timer.label);
+    fputs("},\"stopwatch\":{\"state\":", stdout);
+    json_print_escaped(fridge_kitchen_stopwatch_state_text(snap->stopwatch.state));
+    printf(",\"elapsedSeconds\":%lu}", (unsigned long)snap->stopwatch.elapsed_seconds);
+    fputs(",\"alarms\":[", stdout);
+    for (size_t i = 0; i < snap->alarm_count; i++) {
+        const fridge_kitchen_alarm_t *alarm = &snap->alarms[i];
+        if (i > 0) {
+            putchar(',');
+        }
+        printf("{\"id\":%u,\"enabled\":%s,\"ringing\":%s,\"hour\":%u,\"minute\":%u,\"label\":",
+               (unsigned)alarm->id,
+               alarm->enabled ? "true" : "false",
+               alarm->ringing ? "true" : "false",
+               (unsigned)alarm->hour,
+               (unsigned)alarm->minute);
+        json_print_escaped(alarm->label);
+        fputs("}", stdout);
+    }
+    fputs("],\"lastAlert\":", stdout);
+    json_print_escaped(snap->last_alert);
+    fputs(",\"lastError\":", stdout);
+    json_print_escaped(snap->last_error);
+    fputs("}", stdout);
+}
+
+static void handle_get_kitchen_tools(const char *request_id, const char *command)
+{
+    fridge_kitchen_tools_snapshot_t snap = {0};
+    esp_err_t err = fridge_kitchen_tools_get_snapshot(&snap);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_kitchen_tools_payload(&snap);
+    response_end();
+}
+
+static void handle_timer_start(const char *line, const char *request_id, const char *command)
+{
+    char payload[256] = {0};
+    const char *src = line;
+    if (json_get_object_raw(line, "payload", payload, sizeof(payload))) {
+        src = payload;
+    }
+    uint32_t seconds = json_get_u32(src, "durationSeconds", json_get_u32(src, "duration_seconds", 0));
+    char label[FRIDGE_KITCHEN_TOOL_MAX_LABEL_LEN + 1] = {0};
+    json_get_string(src, "label", label, sizeof(label));
+    esp_err_t err = fridge_kitchen_tools_timer_start(seconds, label);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_kitchen_tools(request_id, command);
+}
+
+static void handle_kitchen_simple(const char *request_id, const char *command, esp_err_t (*fn)(void))
+{
+    esp_err_t err = fn();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_kitchen_tools(request_id, command);
+}
+
+static void handle_alarm_set(const char *line, const char *request_id, const char *command)
+{
+    char payload[256] = {0};
+    const char *src = line;
+    if (json_get_object_raw(line, "payload", payload, sizeof(payload))) {
+        src = payload;
+    }
+    uint32_t hour = json_get_u32(src, "hour", UINT32_MAX);
+    uint32_t minute = json_get_u32(src, "minute", UINT32_MAX);
+    char label[FRIDGE_KITCHEN_TOOL_MAX_LABEL_LEN + 1] = {0};
+    json_get_string(src, "label", label, sizeof(label));
+    if (hour > 23 || minute > 59) {
+        send_error(request_id, command, esp_err_to_name(ESP_ERR_INVALID_ARG));
+        return;
+    }
+    uint8_t id = 0;
+    esp_err_t err = fridge_kitchen_tools_alarm_set((uint8_t)hour, (uint8_t)minute, label, &id);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_kitchen_tools(request_id, command);
+}
+
+static void handle_alarm_id_action(const char *line, const char *request_id, const char *command, esp_err_t (*fn)(uint8_t))
+{
+    char payload[128] = {0};
+    const char *src = line;
+    if (json_get_object_raw(line, "payload", payload, sizeof(payload))) {
+        src = payload;
+    }
+    uint32_t id = json_get_u32(src, "id", 0);
+    esp_err_t err = fn((uint8_t)id);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_kitchen_tools(request_id, command);
+}
+
 static void handle_get_memory_summary(const char *request_id, const char *command)
 {
     char *memory = calloc(1, FRIDGE_STORAGE_MAX_MEMORY_LEN + 1);
@@ -973,6 +1167,20 @@ static void handle_clear_chat_history(const char *request_id, const char *comman
         return;
     }
     handle_get_chat_history(request_id, command);
+}
+
+static void handle_restore_seed_inventory(const char *request_id, const char *command)
+{
+    esp_err_t err = fridge_storage_restore_seed_inventory();
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    // 恢复后立即尝试上报；若 MQTT 暂离线，dirty 标记会保留到下次重连。
+    esp_err_t publish_err = fridge_mqtt_publish_inventory_snapshot(true);
+    response_begin(request_id, command, publish_err == ESP_OK || publish_err == ESP_ERR_INVALID_STATE);
+    printf(",\"payload\":{\"restored\":true,\"publishAttempt\":\"%s\"}", esp_err_to_name(publish_err));
+    response_end();
 }
 
 static void handle_get_ai_config(const char *request_id, const char *command)
@@ -1186,6 +1394,59 @@ static void handle_clear_tts_key(const char *request_id, const char *command)
     handle_get_tts_config(request_id, command);
 }
 
+static void handle_get_state_machine_config(const char *request_id, const char *command)
+{
+    fridge_sm_config_t config = {0};
+    esp_err_t err = fridge_state_machine_get_config(&config);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_state_machine_config_payload(&config);
+    response_end();
+}
+
+static void handle_set_state_machine_config(const char *line, const char *request_id, const char *command)
+{
+    fridge_sm_config_t config = {0};
+    esp_err_t err = fridge_state_machine_get_config(&config);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    config.night_light_threshold = (uint16_t)json_get_u32(line, "nightLightThreshold", config.night_light_threshold);
+    config.day_light_threshold = (uint16_t)json_get_u32(line, "dayLightThreshold", config.day_light_threshold);
+    config.radar_two_meter_raw = (uint16_t)json_get_u32(line, "radarTwoMeterRaw", config.radar_two_meter_raw);
+    config.radar_two_meter_gate = (uint8_t)json_get_u32(line, "radarTwoMeterGate", config.radar_two_meter_gate);
+    config.sleep_enabled = json_get_bool(line, "sleepEnabled", config.sleep_enabled);
+    config.auto_voice_after_close = json_get_bool(line, "autoVoiceAfterClose", config.auto_voice_after_close);
+    config.auto_voice_record_seconds = json_get_u32(line, "autoVoiceRecordSeconds", config.auto_voice_record_seconds);
+    config.close_stable_ms = json_get_u32(line, "closeStableMs", config.close_stable_ms);
+
+    err = fridge_state_machine_set_config(&config);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    handle_get_state_machine_config(request_id, command);
+}
+
+static void handle_get_state_machine_status(const char *request_id, const char *command)
+{
+    fridge_sm_snapshot_t snapshot = {0};
+    esp_err_t err = fridge_state_machine_get_snapshot(&snapshot);
+    if (err != ESP_OK) {
+        send_error(request_id, command, esp_err_to_name(err));
+        return;
+    }
+    response_begin(request_id, command, true);
+    fputs(",\"payload\":", stdout);
+    print_state_machine_payload(&snapshot);
+    response_end();
+}
+
 static void handle_create_ai_profile(const char *line, const char *request_id, const char *command)
 {
     char profile_name[FRIDGE_AI_MAX_PROFILE_NAME_LEN + 1] = {0};
@@ -1263,67 +1524,14 @@ static void ai_assistant_worker_task(void *arg)
 static void voice_chat_worker_task(void *arg)
 {
     usb_voice_chat_job_t *job = (usb_voice_chat_job_t *)arg;
-    job->err = fridge_asr_transcribe_latest_recording(job->asr);
-    if (job->err == ESP_OK) {
-        if (job->asr->text[0] == '\0' || strlen(job->asr->text) < 2) {
-            // ASR 偶发返回空文本或极短噪声时不要继续请求 AI，避免兼容服务因为空 user content 返回 HTTP 400。
-            strlcpy(job->asr->error, "ASR 转写为空或过短，请重新录音", sizeof(job->asr->error));
-            job->err = ESP_ERR_INVALID_RESPONSE;
-        }
-    }
-    if (job->err == ESP_OK) {
-        fridge_ai_task_request_t context_request = {
-            .include_inventory = true,
-            .include_memory = true,
-            .include_reminders = true,
-            .include_preferences = true,
-        };
-        strlcpy(context_request.task_type, "voice_intent_parse", sizeof(context_request.task_type));
-        strlcpy(context_request.user_text, job->asr->text, sizeof(context_request.user_text));
-
-        fridge_ai_context_preview_t *preview = calloc(1, sizeof(*preview));
-        if (!preview) {
-            job->err = ESP_ERR_NO_MEM;
-        } else {
-            if (job->storage_history && job->history && job->history_pruned_count) {
-                job->err = fridge_storage_get_chat_history(job->storage_history, job->history_pruned_count);
-            }
-            if (job->err == ESP_OK) {
-                job->err = fridge_ai_context_build_preview(&context_request, preview);
-            }
-            if (job->err == ESP_OK) {
-                strlcpy(job->request->message, job->asr->text, sizeof(job->request->message));
-                strlcpy(job->request->task_type, "voice_intent_parse", sizeof(job->request->task_type));
-                strlcpy(job->request->context_json, preview->preview_json, sizeof(job->request->context_json));
-                job->request->history = job->history;
-                job->request->history_count = convert_storage_history_to_ai_history(job->storage_history, job->history, FRIDGE_AI_MAX_CHAT_HISTORY);
-                job->request->context_injected = true;
-                job->request->needs_confirmation = preview->needs_confirmation;
-                job->request->local_snapshot_version = preview->local_snapshot_version;
-                job->err = fridge_ai_client_assistant_chat(job->request, job->ai);
-            }
-            free(preview);
-        }
-    }
-
-    if (job->err == ESP_OK && job->persisted_messages && job->history_pruned_count) {
-        snprintf(job->persisted_messages[0].id, sizeof(job->persisted_messages[0].id), "msg_%" PRIu32 "_u", (uint32_t)(xTaskGetTickCount() & 0xFFFFFF));
-        strlcpy(job->persisted_messages[0].role, "user", sizeof(job->persisted_messages[0].role));
-        strlcpy(job->persisted_messages[0].content, job->asr->text, sizeof(job->persisted_messages[0].content));
-        strlcpy(job->persisted_messages[0].task_type, "voice_intent_parse", sizeof(job->persisted_messages[0].task_type));
-        snprintf(job->persisted_messages[1].id, sizeof(job->persisted_messages[1].id), "msg_%" PRIu32 "_a", (uint32_t)((xTaskGetTickCount() + 1) & 0xFFFFFF));
-        strlcpy(job->persisted_messages[1].role, "assistant", sizeof(job->persisted_messages[1].role));
-        strlcpy(job->persisted_messages[1].content, job->ai->chat.reply, sizeof(job->persisted_messages[1].content));
-        strlcpy(job->persisted_messages[1].task_type, "voice_intent_parse", sizeof(job->persisted_messages[1].task_type));
-        (void)fridge_storage_append_chat_messages(job->persisted_messages, 2, job->history_pruned_count);
-    }
+    // 完整语音链路已抽到公共组件，USB 与状态机共享同一套 ASR/AI/历史保存逻辑。
+    job->err = fridge_voice_session_run_latest_recording(job->result);
 
     ESP_LOGI(TAG, "voice chat worker done, stack high watermark=%u words", (unsigned)uxTaskGetStackHighWaterMark(NULL));
     xSemaphoreGive(job->done);
     vTaskDelete(NULL);
 }
 
-#if CONFIG_FRIDGE_CAMERA_TEST
 static void camera_analyze_worker_task(void *arg)
 {
     usb_camera_analyze_job_t *job = (usb_camera_analyze_job_t *)arg;
@@ -1342,12 +1550,19 @@ static void camera_analyze_worker_task(void *arg)
         strlcpy(request.task_type, "recognize_ingredients", sizeof(request.task_type));
         err = fridge_ai_client_analyze_image(&request, job->result);
     }
+    if (err != ESP_OK && job->result->chat.error[0] == '\0') {
+        // 清理帧缓存会重置 camera last_error；先把硬件侧失败原因转存到 AI 结果，便于 Web/串口显示。
+        fridge_camera_status_t status = {0};
+        fridge_camera_get_status(&status);
+        strlcpy(job->result->chat.error,
+                status.last_error[0] ? status.last_error : esp_err_to_name(err),
+                sizeof(job->result->chat.error));
+    }
     job->err = err;
     (void)fridge_camera_clear_frame();
     xSemaphoreGive(job->done);
     vTaskDelete(NULL);
 }
-#endif
 
 static void handle_test_ai_chat(const char *line, const char *request_id, const char *command)
 {
@@ -1382,7 +1597,7 @@ static void handle_test_ai_chat(const char *line, const char *request_id, const 
         .err = ESP_FAIL,
         .done = done,
     };
-    BaseType_t task_ok = xTaskCreate(ai_chat_worker_task, "ai_chat_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
+    BaseType_t task_ok = usb_create_worker_task(ai_chat_worker_task, "ai_chat_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
     if (task_ok != pdPASS) {
         vSemaphoreDelete(done);
         free(message);
@@ -1506,7 +1721,7 @@ static void handle_ai_assistant_chat(const char *line, const char *request_id, c
         .err = ESP_FAIL,
         .done = done,
     };
-    BaseType_t task_ok = xTaskCreate(ai_assistant_worker_task, "ai_assist_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
+    BaseType_t task_ok = usb_create_worker_task(ai_assistant_worker_task, "ai_assist_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
     if (task_ok != pdPASS) {
         vSemaphoreDelete(done);
         free(assistant_request);
@@ -1535,12 +1750,31 @@ static void handle_ai_assistant_chat(const char *line, const char *request_id, c
         return;
     }
 
+    fridge_ai_action_result_t action_result = {0};
+    char clean_ai_reply[FRIDGE_AI_MAX_REPLY_LEN + 1] = {0};
+    char visible_reply[FRIDGE_AI_MAX_REPLY_LEN + 1] = {0};
+    bool memory_updated = false;
+    err = fridge_storage_apply_memory_directive(result->chat.reply, clean_ai_reply, sizeof(clean_ai_reply), &memory_updated);
+    if (err == ESP_OK && clean_ai_reply[0] != '\0') {
+        strlcpy(result->chat.reply, clean_ai_reply, sizeof(result->chat.reply));
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "apply AI memory directive failed: %s", esp_err_to_name(err));
+    }
+
+    esp_err_t action_err = fridge_ai_actions_strip_directives(result->chat.reply,
+                                                              visible_reply,
+                                                              sizeof(visible_reply),
+                                                              &action_result);
+    bool tool_handled = (action_err == ESP_OK && action_result.executed);
+    bool tool_feedback = action_result.tool[0] != '\0' && action_result.message[0] != '\0';
+    const char *reply_text = (tool_handled || tool_feedback) ? action_result.message : (visible_reply[0] ? visible_reply : result->chat.reply);
+
     strlcpy(persisted_messages[0].role, "user", sizeof(persisted_messages[0].role));
     strlcpy(persisted_messages[0].content, assistant_request->message, sizeof(persisted_messages[0].content));
     strlcpy(persisted_messages[0].task_type, assistant_request->task_type, sizeof(persisted_messages[0].task_type));
 
     strlcpy(persisted_messages[1].role, "assistant", sizeof(persisted_messages[1].role));
-    strlcpy(persisted_messages[1].content, result->chat.reply, sizeof(persisted_messages[1].content));
+    strlcpy(persisted_messages[1].content, reply_text, sizeof(persisted_messages[1].content));
     strlcpy(persisted_messages[1].task_type, assistant_request->task_type, sizeof(persisted_messages[1].task_type));
     err = fridge_storage_append_chat_messages(persisted_messages, 2, &write_pruned_count);
     if (err == ESP_OK) {
@@ -1554,7 +1788,7 @@ static void handle_ai_assistant_chat(const char *line, const char *request_id, c
 
     response_begin(request_id, command, true);
     fputs(",\"payload\":{\"reply\":", stdout);
-    json_print_escaped(result->chat.reply);
+    json_print_escaped(reply_text);
     fputs(",\"model\":", stdout);
     json_print_escaped(result->chat.model);
     printf(",\"latencyMs\":%lu", (unsigned long)result->chat.latency_ms);
@@ -1574,6 +1808,12 @@ static void handle_ai_assistant_chat(const char *line, const char *request_id, c
     fputs(",\"historyPersisted\":", stdout);
     fputs(history_persisted ? "true" : "false", stdout);
     printf(",\"historyPrunedCount\":%u", (unsigned)(history_pruned_count + write_pruned_count));
+    fputs(",\"memoryUpdated\":", stdout);
+    fputs(memory_updated ? "true" : "false", stdout);
+    fputs(",\"toolExecuted\":", stdout);
+    fputs(tool_handled ? "true" : "false", stdout);
+    fputs(",\"toolMessage\":", stdout);
+    json_print_escaped(tool_feedback ? action_result.message : "");
     fputs("}", stdout);
     response_end();
 
@@ -1880,56 +2120,28 @@ static void handle_voice_chat_stop(const char *request_id, const char *command)
         return;
     }
 
-    fridge_asr_result_t *asr = calloc(1, sizeof(*asr));
-    fridge_ai_assistant_result_t *ai = calloc(1, sizeof(*ai));
-    fridge_ai_assistant_request_t *assistant_request = calloc(1, sizeof(*assistant_request));
-    fridge_ai_chat_history_item_t *history = calloc(FRIDGE_AI_MAX_CHAT_HISTORY, sizeof(*history));
-    fridge_storage_chat_history_t *storage_history = calloc(1, sizeof(*storage_history));
-    fridge_storage_chat_message_t *persisted_messages = calloc(2, sizeof(*persisted_messages));
-    size_t history_pruned_count = 0;
-    if (!asr || !ai || !assistant_request || !history || !storage_history || !persisted_messages) {
-        free(asr);
-        free(ai);
-        free(assistant_request);
-        free(history);
-        free(storage_history);
-        free(persisted_messages);
+    fridge_voice_session_result_t *result = calloc(1, sizeof(*result));
+    if (!result) {
         send_error(request_id, command, "voice chat allocation failed");
         return;
     }
 
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     if (!done) {
-        free(asr);
-        free(ai);
-        free(assistant_request);
-        free(history);
-        free(storage_history);
-        free(persisted_messages);
+        free(result);
         send_error(request_id, command, "voice chat sync object failed");
         return;
     }
 
     usb_voice_chat_job_t job = {
-        .asr = asr,
-        .ai = ai,
-        .request = assistant_request,
-        .history = history,
-        .storage_history = storage_history,
-        .persisted_messages = persisted_messages,
-        .history_pruned_count = &history_pruned_count,
+        .result = result,
         .err = ESP_FAIL,
         .done = done,
     };
-    BaseType_t task_ok = xTaskCreate(voice_chat_worker_task, "voice_chat_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
+    BaseType_t task_ok = usb_create_worker_task(voice_chat_worker_task, "voice_chat_worker", USB_AI_WORKER_TASK_STACK, &job, 4, NULL);
     if (task_ok != pdPASS) {
         vSemaphoreDelete(done);
-        free(asr);
-        free(ai);
-        free(assistant_request);
-        free(history);
-        free(storage_history);
-        free(persisted_messages);
+        free(result);
         send_error(request_id, command, "voice chat worker create failed");
         return;
     }
@@ -1937,44 +2149,33 @@ static void handle_voice_chat_stop(const char *request_id, const char *command)
     xSemaphoreTake(done, portMAX_DELAY);
     vSemaphoreDelete(done);
     if (job.err != ESP_OK) {
-        const char *message = asr->error[0] ? asr->error : (ai->chat.error[0] ? ai->chat.error : esp_err_to_name(job.err));
-        free(asr);
-        free(ai);
-        free(assistant_request);
-        free(history);
-        free(storage_history);
-        free(persisted_messages);
+        const char *message = result->error[0] ? result->error : esp_err_to_name(job.err);
+        free(result);
         send_error(request_id, command, message);
         return;
     }
 
     response_begin(request_id, command, true);
     fputs(",\"payload\":{\"transcript\":", stdout);
-    json_print_escaped(asr->text);
+    json_print_escaped(result->transcript);
     fputs(",\"reply\":", stdout);
-    json_print_escaped(ai->chat.reply);
+    json_print_escaped(result->reply);
     fputs(",\"asrModel\":", stdout);
-    json_print_escaped(asr->model);
+    json_print_escaped(result->asr_model);
     fputs(",\"aiModel\":", stdout);
-    json_print_escaped(ai->chat.model);
+    json_print_escaped(result->ai_model);
     printf(",\"asrLatencyMs\":%lu,\"aiLatencyMs\":%lu,\"asrHttpStatus\":%d,\"aiHttpStatus\":%d,\"audioBytes\":%u,\"historyPrunedCount\":%u}",
-           (unsigned long)asr->latency_ms,
-           (unsigned long)ai->chat.latency_ms,
-           asr->http_status,
-           ai->chat.http_status,
-           (unsigned)asr->audio_bytes,
-           (unsigned)history_pruned_count);
+           (unsigned long)result->asr_latency_ms,
+           (unsigned long)result->ai_latency_ms,
+           result->asr_http_status,
+           result->ai_http_status,
+           (unsigned)result->audio_bytes,
+           (unsigned)result->history_pruned_count);
     response_end();
 
-    free(asr);
-    free(ai);
-    free(assistant_request);
-    free(history);
-    free(storage_history);
-    free(persisted_messages);
+    free(result);
 }
 
-#if CONFIG_FRIDGE_CAMERA_TEST
 static void print_camera_status_payload(const fridge_camera_status_t *status)
 {
     fputs("{\"initialized\":", stdout);
@@ -1998,14 +2199,9 @@ static void print_camera_status_payload(const fridge_camera_status_t *status)
     json_print_escaped(status->last_error);
     fputs("}", stdout);
 }
-#endif
 
 static void handle_get_camera_status(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera commands require CONFIG_FRIDGE_CAMERA_TEST=y");
-    return;
-#else
     fridge_camera_status_t status = {0};
     fridge_camera_get_status(&status);
 
@@ -2013,15 +2209,10 @@ static void handle_get_camera_status(const char *request_id, const char *command
     fputs(",\"payload\":", stdout);
     print_camera_status_payload(&status);
     response_end();
-#endif
 }
 
 static void handle_camera_probe(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_probe is disabled outside camera-only mode");
-    return;
-#else
     fridge_camera_probe_result_t result = {0};
     esp_err_t err = fridge_camera_probe(&result);
 
@@ -2046,15 +2237,10 @@ static void handle_camera_probe(const char *request_id, const char *command)
     json_print_escaped(result.last_error);
     fputs("}", stdout);
     response_end();
-#endif
 }
 
 static void handle_camera_capture(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_capture is disabled outside camera-only mode");
-    return;
-#else
     esp_err_t err = fridge_camera_capture();
     fridge_camera_status_t status = {0};
     fridge_camera_get_status(&status);
@@ -2099,15 +2285,10 @@ static void handle_camera_capture(const char *request_id, const char *command)
     fputs("}", stdout);
     response_end();
     free(image_b64);
-#endif
 }
 
 static void handle_camera_jpeg_diag(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_jpeg_diag is disabled outside camera-only mode");
-    return;
-#else
     esp_err_t err = fridge_camera_capture_hardware_jpeg_diag();
     fridge_camera_status_t status = {0};
     fridge_camera_get_status(&status);
@@ -2152,15 +2333,10 @@ static void handle_camera_jpeg_diag(const char *request_id, const char *command)
     fputs("}", stdout);
     response_end();
     free(image_b64);
-#endif
 }
 
 static void handle_camera_rgb565_diag(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_rgb565_diag is disabled outside camera-only mode");
-    return;
-#else
     fridge_camera_diag_result_t result = {0};
     esp_err_t err = fridge_camera_capture_rgb565_diag(&result);
 
@@ -2186,15 +2362,10 @@ static void handle_camera_rgb565_diag(const char *request_id, const char *comman
     json_print_escaped(result.last_error);
     fputs("}", stdout);
     response_end();
-#endif
 }
 
 static void handle_camera_analyze(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_analyze is disabled outside camera-only mode");
-    return;
-#else
     fridge_ai_image_result_t *result = calloc(1, sizeof(*result));
     if (!result) {
         send_error(request_id, command, "camera analyze allocation failed");
@@ -2213,7 +2384,7 @@ static void handle_camera_analyze(const char *request_id, const char *command)
         .err = ESP_FAIL,
         .done = done,
     };
-    BaseType_t task_ok = xTaskCreate(camera_analyze_worker_task, "camera_ai_worker", USB_CAMERA_WORKER_TASK_STACK, &job, 4, NULL);
+    BaseType_t task_ok = usb_create_worker_task(camera_analyze_worker_task, "camera_ai_worker", USB_CAMERA_WORKER_TASK_STACK, &job, 4, NULL);
     if (task_ok != pdPASS) {
         vSemaphoreDelete(done);
         free(result);
@@ -2248,37 +2419,26 @@ static void handle_camera_analyze(const char *request_id, const char *command)
            result->needs_confirmation ? "true" : "false");
     response_end();
     free(result);
-#endif
 }
 
 static void handle_clear_camera_frame(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "clear_camera_frame is disabled outside camera-only mode");
-    return;
-#else
     esp_err_t err = fridge_camera_clear_frame();
     if (err != ESP_OK) {
         send_error(request_id, command, esp_err_to_name(err));
         return;
     }
     handle_get_camera_status(request_id, command);
-#endif
 }
 
 static void handle_camera_reset(const char *request_id, const char *command)
 {
-#if !CONFIG_FRIDGE_CAMERA_TEST
-    send_error(request_id, command, "camera_reset is disabled outside camera-only mode");
-    return;
-#else
     esp_err_t err = fridge_camera_reset();
     if (err != ESP_OK) {
         send_error(request_id, command, esp_err_to_name(err));
         return;
     }
     handle_get_camera_status(request_id, command);
-#endif
 }
 
 static void handle_get_status(const char *request_id, const char *command)
@@ -2657,7 +2817,9 @@ static void handle_radar_test_status(const char *request_id, const char *command
 static void handle_get_sensors(const char *request_id, const char *command)
 {
     fridge_sensor_snapshot_t sensors = {0};
+    fridge_sm_snapshot_t sm = {0};
     (void)fridge_sensors_get_snapshot(&sensors);
+    bool has_sm = fridge_state_machine_get_snapshot(&sm) == ESP_OK;
 
     response_begin(request_id, command, true);
     // lux 字段为旧 Web 面板兼容值，实际不是 BH1750 物理 lux；当前按反向光敏 AO 换算后的亮度 0-1023 返回。
@@ -2691,7 +2853,15 @@ static void handle_get_sensors(const char *request_id, const char *command)
     fputs("\"radar\":", stdout);
     print_radar_payload(&sensors.radar);
     putchar(',');
-    fputs("\"touch\":\"not_connected\",\"display\":\"not_connected\",\"buzzer\":\"not_connected\",\"doorState\":\"IDLE\",\"updatedAt\":", stdout);
+    fputs("\"touch\":\"not_connected\",\"display\":\"not_connected\",\"buzzer\":\"not_connected\",\"doorState\":", stdout);
+    json_print_escaped(has_sm ? fridge_state_machine_door_to_string(sm.door_state) : "UNKNOWN");
+    fputs(",\"stateMachine\":", stdout);
+    if (has_sm) {
+        print_state_machine_payload(&sm);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs(",\"updatedAt\":", stdout);
     if (sensors.ready) {
         printf("\"%lld ms\"", (long long)sensors.updated_at_ms);
     } else {
@@ -2791,6 +2961,12 @@ static void handle_line(const char *line)
         handle_set_tts_config(line, request_id, command);
     } else if (strcmp(command, "clear_tts_key") == 0) {
         handle_clear_tts_key(request_id, command);
+    } else if (strcmp(command, "get_state_machine_config") == 0) {
+        handle_get_state_machine_config(request_id, command);
+    } else if (strcmp(command, "set_state_machine_config") == 0) {
+        handle_set_state_machine_config(line, request_id, command);
+    } else if (strcmp(command, "get_state_machine_status") == 0) {
+        handle_get_state_machine_status(request_id, command);
     } else if (strcmp(command, "create_ai_profile") == 0) {
         handle_create_ai_profile(line, request_id, command);
     } else if (strcmp(command, "select_ai_profile") == 0) {
@@ -2801,6 +2977,28 @@ static void handle_line(const char *line)
         handle_test_ai_chat(line, request_id, command);
     } else if (strcmp(command, "ai_assistant_chat") == 0) {
         handle_ai_assistant_chat(line, request_id, command);
+    } else if (strcmp(command, "get_kitchen_tools") == 0) {
+        handle_get_kitchen_tools(request_id, command);
+    } else if (strcmp(command, "timer_start") == 0) {
+        handle_timer_start(line, request_id, command);
+    } else if (strcmp(command, "timer_pause") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_timer_pause);
+    } else if (strcmp(command, "timer_resume") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_timer_resume);
+    } else if (strcmp(command, "timer_cancel") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_timer_cancel);
+    } else if (strcmp(command, "stopwatch_start") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_stopwatch_start);
+    } else if (strcmp(command, "stopwatch_pause") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_stopwatch_pause);
+    } else if (strcmp(command, "stopwatch_reset") == 0) {
+        handle_kitchen_simple(request_id, command, fridge_kitchen_tools_stopwatch_reset);
+    } else if (strcmp(command, "alarm_set") == 0) {
+        handle_alarm_set(line, request_id, command);
+    } else if (strcmp(command, "alarm_cancel") == 0) {
+        handle_alarm_id_action(line, request_id, command, fridge_kitchen_tools_alarm_cancel);
+    } else if (strcmp(command, "alarm_dismiss") == 0) {
+        handle_alarm_id_action(line, request_id, command, fridge_kitchen_tools_alarm_dismiss);
     } else if (strcmp(command, "wake_start") == 0) {
         handle_wake_start(request_id, command);
     } else if (strcmp(command, "wake_stop") == 0) {
@@ -2865,6 +3063,8 @@ static void handle_line(const char *line)
         handle_get_chat_history(request_id, command);
     } else if (strcmp(command, "clear_chat_history") == 0) {
         handle_clear_chat_history(request_id, command);
+    } else if (strcmp(command, "restore_seed_inventory") == 0) {
+        handle_restore_seed_inventory(request_id, command);
     } else if (strcmp(command, "get_pins") == 0) {
         handle_get_pins(request_id, command);
     } else if (strcmp(command, "touch_i2c_diag") == 0) {

@@ -45,7 +45,8 @@ idf.py -p COM16 monitor
 - Target chip: `esp32s3`. The board is at **COM16**.
 - COM16 may be held by `idf_monitor`, VS Code Serial Monitor, Web Serial in the browser, or another terminal. If `Access to the port 'COM16' is denied` appears, close the holding process — do **not** retry-flash in a loop. When killing leftover monitor processes, only kill those whose command line contains `COM16` and `idf_monitor`/`idf.py monitor`.
 - After toggling Kconfig options (notably `CONFIG_FRIDGE_SCREEN_TEST` / `CONFIG_FRIDGE_CAMERA_TEST`), run `idf.py reconfigure build` and check `build/config/sdkconfig.h` before reflashing.
-- The image must fit ~2304 KB OTA slots (see `partitions.csv`). Use `idf.py size` / `idf.py size-components` to debug overflow.
+- The main image must fit the large `ota_0` slot, while the small recovery image must fit `ota_1` (see `partitions_recovery.csv`). Use `idf.py size` / `idf.py size-components` to debug overflow.
+- Recovery builds must be configured with `-DFRIDGE_RECOVERY_BUILD=ON -DSDKCONFIG="sdkconfig.recovery" -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.recovery.defaults"`. Do not use the default `idf.py flash` output from the recovery build directory as-is: ESP-IDF flashes the app image to `ota_0` by default, while the recovery image belongs at the `ota_1` offset from `partitions_recovery.csv`.
 
 ### Web operator panel (`web/`)
 
@@ -69,6 +70,7 @@ There is no test runner configured for either firmware or web — validation is 
 - `main/main.c` is **only** startup orchestration. It picks one of three modes from Kconfig and wires component init in a fixed order:
   - `CONFIG_FRIDGE_SCREEN_TEST=y` — standalone QSPI screen test task, **no** NVS / Wi-Fi / USB protocol. If this stays on by accident, Web Serial appears to time out on every command (see `doc/memory.md` 2026-05-23 entry).
   - `CONFIG_FRIDGE_CAMERA_TEST=y` — camera-only USB console; skips screen/sensors/audio. Mutually exclusive with screen test (enforced by `#error`).
+  - `CONFIG_FRIDGE_RECOVERY_APP=y` — small local recovery shell for `ota_1`; starts NVS, diagnostics, Wi-Fi, and JSON Lines commands (`get_status`, `set_network`, `restore_main`, `boot_main`) only.
   - Default — full stack: `nvs → diagnostics → network → ai_client → mqtt_protocol → asr → sensors → radar → audio → speaker → wake_word → camera → usb_protocol`.
 - Each subsystem under `components/` owns its own `CMakeLists.txt`, `include/`, NVS namespace, and FreeRTOS tasks. Cross-component access goes through the published `include/` header, never via internal statics. Hardware-touching components must document GPIO / voltage / clock / DMA / PSRAM constraints in their headers.
 - Component map (kept in sync with `main/CMakeLists.txt` `REQUIRES`):
@@ -94,7 +96,7 @@ There is no test runner configured for either firmware or web — validation is 
 
 ### Flash layout & sdkconfig
 
-- `sdkconfig.defaults` is the source of truth for the N8R8 target. `partitions.csv` defines: `nvs(64K) | otadata | phy_init | ota_0(2304K) | ota_1(2304K) | assets(0x83, 1536K) | cache(0x83, 704K) | model(0x40, 768K) | coredump(64K)`. PSRAM is **octal** at 80 MHz, brownout and flash coredump are on.
+- `sdkconfig.defaults` is the source of truth for the N8R8 target. `partitions_recovery.csv` defines: `nvs(64K) | otadata | phy_init | ota_0(3584K main) | ota_1(1024K recovery) | assets(0x83, 1536K) | cache(0x83, 704K) | model(0x40, 768K) | coredump(64K)`. PSRAM is **octal** at 80 MHz, brownout and flash coredump are on.
 - Custom `0x83` subtypes are project-defined data partitions (LittleFS / cache). `0x40` is the ESP-SR model image.
 - `mbedtls` uses the bundled certificate store (`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y`); do **not** hard-code per-vendor certs in firmware.
 

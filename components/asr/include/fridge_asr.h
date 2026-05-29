@@ -32,6 +32,7 @@ typedef struct {
     char model[FRIDGE_ASR_MAX_MODEL_LEN + 1];
     char api_key[FRIDGE_ASR_MAX_API_KEY_LEN + 1];
     uint32_t timeout_ms;
+    int64_t config_updated_at_ms;
     bool update_api_key;
 } fridge_asr_config_update_t;
 
@@ -49,6 +50,8 @@ esp_err_t fridge_asr_init(void);
 esp_err_t fridge_asr_get_config(fridge_asr_config_view_t *out);
 esp_err_t fridge_asr_set_config(const fridge_asr_config_update_t *config);
 esp_err_t fridge_asr_clear_key(void);
+// 生成设备本地 ASR 同步文档；比赛演示版会包含明文 API Key，只能走受控同步通道。
+esp_err_t fridge_asr_get_sync_payload(char *out, size_t out_size);
 
 // 将 audio 组件中最近一次录音封装为 16k/16bit/mono WAV，并上传到 ASR API。
 esp_err_t fridge_asr_transcribe_latest_recording(fridge_asr_result_t *out);

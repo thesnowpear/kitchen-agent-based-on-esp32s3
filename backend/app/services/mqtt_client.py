@@ -55,37 +55,55 @@ class FridgeMqttClient:
         # request_id → Future(ack payload dict)；ai_service.chat_via_device 用它等设备回复。
         self._ack_waiters: dict[str, asyncio.Future[dict]] = {}
         self._connected: bool = False
+        self._connect_lock: asyncio.Lock | None = None
 
     # ---------- 生命周期 ----------
 
     async def connect(self) -> None:
         """启动 MQTT 客户端并订阅设备上行主题。"""
-        if self._client is not None:
+        if self._client is not None and self._connected:
             return
+        if self._connect_lock is None:
+            self._connect_lock = asyncio.Lock()
+        async with self._connect_lock:
+            if self._client is not None and self._connected:
+                return
+            if self._client is not None:
+                with contextlib.suppress(Exception):
+                    await self._client.disconnect()
+                self._client = None
+                self._connected = False
 
-        client = GmqttClient(settings.mqtt_client_id)
-        if settings.mqtt_username:
-            # gmqtt 在 connect 前调用 set_auth_credentials，password 可为 None。
-            client.set_auth_credentials(
-                settings.mqtt_username, settings.mqtt_password or None
-            )
+            client = GmqttClient(settings.mqtt_client_id)
+            if settings.mqtt_username:
+                # gmqtt 在 connect 前调用 set_auth_credentials，password 可为 None。
+                client.set_auth_credentials(
+                    settings.mqtt_username, settings.mqtt_password or None
+                )
 
-        client.on_connect = self._on_connect
-        client.on_message = self._on_message
-        client.on_disconnect = self._on_disconnect
+            client.on_connect = self._on_connect
+            client.on_message = self._on_message
+            client.on_disconnect = self._on_disconnect
 
-        try:
-            await client.connect(
-                settings.mqtt_broker_host,
-                settings.mqtt_broker_port,
-                keepalive=settings.mqtt_keepalive_seconds,
-            )
-        except Exception as exc:  # noqa: BLE001 - 让 lifespan 决定要不要重试
-            logger.warning("MQTT connect failed: %s", exc)
-            self._client = None
-            raise
+            try:
+                await client.connect(
+                    settings.mqtt_broker_host,
+                    settings.mqtt_broker_port,
+                    keepalive=settings.mqtt_keepalive_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - 让 lifespan 决定要不要重试
+                logger.warning(
+                    "MQTT connect failed: host=%s port=%s client_id=%s error=%s",
+                    settings.mqtt_broker_host,
+                    settings.mqtt_broker_port,
+                    settings.mqtt_client_id,
+                    exc,
+                )
+                self._client = None
+                self._connected = False
+                raise
 
-        self._client = client
+            self._client = client
 
     async def disconnect(self) -> None:
         """优雅关闭客户端，取消所有 pending future。"""
@@ -112,6 +130,8 @@ class FridgeMqttClient:
             (f"{prefix}/+/+/sensor", 1),
             (f"{prefix}/+/+/cmd_ack", 1),
             (f"{prefix}/+/+/error", 1),
+            (f"{prefix}/+/+/inventory", 1),
+            (f"{prefix}/+/+/sync", 1),
             # 设备 retained 上报当前 AI 配置；backend 用 last-write-wins 与 SystemConfig 协调。
             (f"{prefix}/+/+/ai_config", 1),
         ]
@@ -157,9 +177,13 @@ class FridgeMqttClient:
 
         try:
             if kind == "state":
-                await self._handle_state(data)
+                await self._handle_state(home_id_str, device_sn_from_topic, data)
             elif kind == "cmd_ack":
                 self._handle_cmd_ack(data)
+            elif kind == "inventory":
+                await self._handle_inventory(home_id_str, device_sn_from_topic, data)
+            elif kind == "sync":
+                await self._handle_device_sync(home_id_str, device_sn_from_topic, data)
             elif kind == "ai_config":
                 await self._handle_ai_config(home_id_str, device_sn_from_topic, data)
             else:
@@ -171,11 +195,25 @@ class FridgeMqttClient:
 
     # ---------- 业务分发 ----------
 
-    async def _handle_state(self, data: dict) -> None:
-        """state 上报：更新 Device.status / last_seen_at / firmware，并写一条事件。"""
-        device_sn = data.get("device_id") or ""
+    async def _handle_state(
+        self,
+        home_id_str: str,
+        device_sn_from_topic: str,
+        data: dict,
+    ) -> None:
+        """state 上报：更新 Device 状态；上线/重连时补发云端快照。"""
+        from uuid import UUID as _UUID
+
+        device_sn = data.get("device_id") or device_sn_from_topic or ""
         if not device_sn:
             return
+        next_status = "online" if data.get("online", True) else "offline"
+        was_online = False
+        has_active_binding = False
+        try:
+            home_id = _UUID(home_id_str)
+        except (ValueError, AttributeError):
+            home_id = None
         try:
             async with AsyncSessionLocal() as db:
                 result = await db.execute(
@@ -183,11 +221,23 @@ class FridgeMqttClient:
                 )
                 device = result.scalar_one_or_none()
                 if device is not None:
-                    device.status = "online" if data.get("online", True) else "offline"
+                    was_online = device.status == "online"
+                    device.status = next_status
                     device.last_seen_at = datetime.now(timezone.utc)
                     firmware = data.get("firmware")
                     if isinstance(firmware, str) and firmware:
                         device.firmware_version = firmware
+                    if home_id is not None:
+                        binding_result = await db.execute(
+                            select(DeviceBinding.id)
+                            .where(
+                                DeviceBinding.device_id == device.id,
+                                DeviceBinding.home_id == home_id,
+                                DeviceBinding.status == "active",
+                            )
+                            .limit(1)
+                        )
+                        has_active_binding = binding_result.scalar_one_or_none() is not None
 
                 db.add(
                     DeviceStatusEvent(
@@ -200,6 +250,51 @@ class FridgeMqttClient:
                 await db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("handle_state failed: device_sn=%s", device_sn)
+            return
+
+        is_reconnect = bool(
+            data.get("reconnect")
+            or data.get("reconnected")
+            or data.get("boot")
+            or data.get("reason") in {"reconnect", "mqtt_reconnect", "wifi_reconnect"}
+        )
+        should_push_snapshot = next_status == "online" and has_active_binding and (not was_online or is_reconnect)
+        if should_push_snapshot and home_id is not None:
+            await self._push_snapshot_after_device_online(home_id, device_sn)
+
+    async def _push_snapshot_after_device_online(self, home_id: UUID, device_sn: str) -> None:
+        """设备恢复在线后，先拉设备本地库存，再推送非库存配置。
+
+        初次绑定/演示现场经常是设备里已有库存而云端仍是测试数据；上线瞬间如果先
+        下发旧云端库存，会把设备的真实 20 条覆盖成 1 条。这里让设备 clean snapshot
+        也能作为种子导入，库存导入成功后 _handle_inventory 会再广播最新云端库存。
+        """
+        from app.services.sync_device_bridge import DEVICE_SYNC_DOMAINS, push_cloud_snapshot_to_devices
+        from app.services.sync_service import get_status
+
+        try:
+            async with AsyncSessionLocal() as db:
+                status = await get_status(db, home_id)
+                await push_cloud_snapshot_to_devices(
+                    db,
+                    home_id=home_id,
+                    server_revision=status.server_revision,
+                    domains=set(DEVICE_SYNC_DOMAINS) - {"inventory", "fridge_zones"},
+                    request_device_inventory=True,
+                    accept_clean_device_snapshot=True,
+                    )
+            logger.info(
+                "device inventory requested and config snapshot pushed after online: home=%s device=%s rev=%s",
+                home_id,
+                device_sn,
+                status.server_revision,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "cloud snapshot push after device online failed: home=%s device=%s",
+                home_id,
+                device_sn,
+            )
 
     def _handle_cmd_ack(self, data: dict) -> None:
         """cmd_ack：完成 publish_command 注册的 Future。"""
@@ -274,6 +369,208 @@ class FridgeMqttClient:
                     exc,
                 )
 
+    async def _handle_inventory(
+        self,
+        home_id_str: str,
+        device_sn: str,
+        data: dict,
+    ) -> None:
+        """处理设备上报的完整 UI 库存快照。
+
+        设备收到 inventory_refresh 后会发布 fridge/{home}/{device}/inventory。
+        这里把它转换成 sync event，复用同步服务的整快照导入逻辑，再把新的
+        serverRevision 回推到设备，清掉设备端 dirty 标志。
+        """
+        from uuid import UUID as _UUID
+
+        from app.models.home import Home
+        from app.schemas.sync import SyncPushEvent
+        from app.services.sync_device_bridge import push_cloud_snapshot_to_devices
+        from app.services.sync_service import push_events
+
+        try:
+            home_id = _UUID(home_id_str)
+        except (ValueError, AttributeError):
+            _log_throttled(
+                f"inventory_bad_home:{home_id_str}",
+                logging.WARNING,
+                "inventory msg with non-UUID home_id=%s device_sn=%s",
+                home_id_str,
+                device_sn,
+            )
+            return
+
+        snapshot_version = data.get("snapshotVersion") or data.get("snapshot_version") or 0
+        device_revision = int(data.get("serverRevision") or data.get("server_revision") or 0)
+        device_dirty = bool(data.get("dirty"))
+        force_import = bool(data.get("forceImport") or data.get("force_import") or data.get("acceptCleanSnapshot"))
+        updated_at = data.get("updatedAtMs") or data.get("updated_at_ms") or data.get("timestamp_ms") or int(time.time() * 1000)
+        client_event_id = f"device:{device_sn}:inventory:{snapshot_version}:{updated_at}"
+        items_count = len(data.get("items") or []) if isinstance(data.get("items"), list) else 0
+        zones_count = len(data.get("zones") or []) if isinstance(data.get("zones"), list) else 0
+        logger.info(
+            "inventory snapshot received: home=%s device=%s items=%s zones=%s snapshot=%s device_rev=%s dirty=%s force=%s",
+            home_id_str,
+            device_sn,
+            items_count,
+            zones_count,
+            snapshot_version,
+            device_revision,
+            device_dirty,
+            force_import,
+        )
+
+        try:
+            async with AsyncSessionLocal() as db:
+                home = await db.get(Home, home_id)
+                if home is None:
+                    _log_throttled(
+                        f"inventory_unknown_home:{home_id_str}",
+                        logging.WARNING,
+                        "inventory msg for unknown home=%s device_sn=%s",
+                        home_id_str,
+                        device_sn,
+                    )
+                    return
+                from app.services.sync_service import get_status
+
+                status = await get_status(db, home_id)
+                if not force_import and not device_dirty and device_revision <= status.server_revision:
+                    logger.info(
+                        "inventory snapshot ignored: home=%s device=%s dirty=false device_rev=%s server_rev=%s",
+                        home_id_str,
+                        device_sn,
+                        device_revision,
+                        status.server_revision,
+                    )
+                    return
+                result = await push_events(
+                    db,
+                    home=home,
+                    user=None,
+                    events=[
+                        SyncPushEvent(
+                            client_event_id=client_event_id,
+                            domain="inventory",
+                            op="snapshot",
+                            source="device",
+                            device_sn=device_sn,
+                            payload=data,
+                        )
+                    ],
+                )
+                logger.info(
+                    "inventory snapshot imported: home=%s device=%s accepted=%s duplicates=%s server_rev=%s items=%s",
+                    home_id_str,
+                    device_sn,
+                    result.accepted,
+                    result.duplicates,
+                    result.server_revision,
+                    items_count,
+                )
+                await push_cloud_snapshot_to_devices(
+                    db,
+                    home_id=home_id,
+                    server_revision=result.server_revision,
+                    domains={"inventory"},
+                    request_device_inventory=False,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "inventory snapshot import failed: home=%s device=%s",
+                home_id_str,
+                device_sn,
+            )
+
+    async def _handle_device_sync(
+        self,
+        home_id_str: str,
+        device_sn: str,
+        data: dict,
+    ) -> None:
+        """处理设备上报的非库存本地同步文档。
+
+        设备端只上报购物清单、菜谱缓存、提醒和偏好等普通 JSON 文档；
+        API Key 等敏感字段不走该普通事件通道。
+        """
+        from uuid import UUID as _UUID
+
+        from app.models.home import Home
+        from app.schemas.sync import SyncPushEvent
+        from app.services.sync_device_bridge import push_cloud_snapshot_to_devices
+        from app.services.sync_service import push_events
+
+        try:
+            home_id = _UUID(home_id_str)
+        except (ValueError, AttributeError):
+            _log_throttled(
+                f"sync_bad_home:{home_id_str}",
+                logging.WARNING,
+                "device sync msg with non-UUID home_id=%s device_sn=%s",
+                home_id_str,
+                device_sn,
+            )
+            return
+
+        raw_events = data.get("events") if isinstance(data.get("events"), list) else []
+        allowed_domains = {"shopping_list", "recipe_cache", "reminder", "settings", "ai_history", "ai_config"}
+        events: list[SyncPushEvent] = []
+        for raw in raw_events[:20]:
+            if not isinstance(raw, dict):
+                continue
+            domain = str(raw.get("domain") or "")
+            payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+            if domain not in allowed_domains or not payload:
+                continue
+            events.append(
+                SyncPushEvent(
+                    client_event_id=str(raw.get("clientEventId") or raw.get("client_event_id") or f"device:{device_sn}:{domain}:{time.time_ns()}")[:128],
+                    domain=domain,
+                    op=str(raw.get("op") or "replace")[:64],
+                    source="device",
+                    device_sn=device_sn,
+                    payload=payload,
+                )
+            )
+        if not events:
+            return
+
+        try:
+            async with AsyncSessionLocal() as db:
+                home = await db.get(Home, home_id)
+                if home is None:
+                    _log_throttled(
+                        f"sync_unknown_home:{home_id_str}",
+                        logging.WARNING,
+                        "device sync msg for unknown home=%s device_sn=%s",
+                        home_id_str,
+                        device_sn,
+                    )
+                    return
+                from app.services.ai_config_service import should_accept_device_config
+
+                filtered_events: list[SyncPushEvent] = []
+                for event in events:
+                    if event.domain == "ai_config" and not await should_accept_device_config(db, home_id, event.payload):
+                        continue
+                    filtered_events.append(event)
+                if not filtered_events:
+                    return
+                result = await push_events(db, home=home, user=None, events=filtered_events)
+                changed_domains = {event.domain for event in filtered_events}
+                device_domains = set(changed_domains)
+                if "ai_config" in changed_domains:
+                    device_domains.update({"asr_config", "tts_config"})
+                await push_cloud_snapshot_to_devices(
+                    db,
+                    home_id=home_id,
+                    server_revision=result.server_revision,
+                    domains=device_domains,
+                    request_device_inventory=False,
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("device sync import failed: home=%s device=%s", home_id_str, device_sn)
+
     async def _record_event(self, data: dict, kind: str) -> None:
         """sensor / error 留痕；DB 失败仅日志，不打断客户端。"""
         device_sn = data.get("device_id") or ""
@@ -302,6 +599,16 @@ class FridgeMqttClient:
     def is_connected(self) -> bool:
         return self._connected
 
+    async def ensure_connected(self) -> None:
+        """确保 MQTT 已连接；启动时失败后，下一次 API 调用会自动补连。"""
+        if self._client is not None and self._connected:
+            return
+        await self.connect()
+        if self._client is None or not self._connected:
+            raise RuntimeError(
+                f"mqtt client is not connected: broker={settings.mqtt_broker_host}:{settings.mqtt_broker_port}"
+            )
+
     def register_ack_waiter(self, request_id: str) -> asyncio.Future[dict]:
         """登记一个 future 等待设备 cmd_ack；调用方负责 unregister 或 await。"""
         loop = asyncio.get_running_loop()
@@ -326,8 +633,7 @@ class FridgeMqttClient:
         - body 加 schema_version=1 与 request_id（来自 payload 或自动 None），与设备端协议对齐。
         - 返回最终拼出的 topic 字符串，便于上层日志。
         """
-        if self._client is None or not self._connected:
-            raise RuntimeError("mqtt client is not connected")
+        await self.ensure_connected()
 
         home_id = await self._resolve_home_id(device_sn)
         topic = f"{settings.mqtt_topic_prefix}/{home_id}/{device_sn}/cmd"

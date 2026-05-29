@@ -6,6 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "cJSON.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -21,6 +23,7 @@
 #define ASR_NVS_KEY_MODEL "model"
 #define ASR_NVS_KEY_KEY "key"
 #define ASR_NVS_KEY_TIMEOUT "timeout"
+#define ASR_NVS_KEY_UPDATED_MS "updated_ms"
 #define ASR_RESPONSE_CAP 4096
 #define WAV_HEADER_BYTES 44
 
@@ -51,6 +54,15 @@ static uint32_t clamp_timeout_ms(uint32_t timeout_ms)
     return timeout_ms;
 }
 
+static int64_t asr_config_now_ms(void)
+{
+    time_t now = time(NULL);
+    if (now >= 1735689600LL) {
+        return (int64_t)now * 1000;
+    }
+    return esp_timer_get_time() / 1000;
+}
+
 static bool starts_with(const char *text, const char *prefix)
 {
     return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
@@ -60,6 +72,18 @@ static esp_err_t open_asr_nvs(nvs_open_mode_t mode, nvs_handle_t *handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "NVS handle is NULL");
     return nvs_open(ASR_NVS_NAMESPACE, mode, handle);
+}
+
+static int64_t load_asr_updated_ms(void)
+{
+    nvs_handle_t handle;
+    if (open_asr_nvs(NVS_READONLY, &handle) != ESP_OK) {
+        return 0;
+    }
+    int64_t updated_ms = 0;
+    (void)nvs_get_i64(handle, ASR_NVS_KEY_UPDATED_MS, &updated_ms);
+    nvs_close(handle);
+    return updated_ms > 0 ? updated_ms : 0;
 }
 
 static void read_nvs_string(nvs_handle_t handle, const char *key, char *out, size_t out_size, const char *fallback)
@@ -112,6 +136,10 @@ static esp_err_t load_config(fridge_asr_config_update_t *config)
     uint32_t timeout_ms = FRIDGE_ASR_DEFAULT_TIMEOUT_MS;
     if (nvs_get_u32(handle, ASR_NVS_KEY_TIMEOUT, &timeout_ms) == ESP_OK) {
         config->timeout_ms = clamp_timeout_ms(timeout_ms);
+    }
+    int64_t updated_ms = 0;
+    if (nvs_get_i64(handle, ASR_NVS_KEY_UPDATED_MS, &updated_ms) == ESP_OK && updated_ms > 0) {
+        config->config_updated_at_ms = updated_ms;
     }
     nvs_close(handle);
     return ESP_OK;
@@ -356,6 +384,14 @@ esp_err_t fridge_asr_set_config(const fridge_asr_config_update_t *config)
         err = nvs_set_str(handle, ASR_NVS_KEY_KEY, config->api_key);
     }
     if (err == ESP_OK) {
+        int64_t previous_ms = load_asr_updated_ms();
+        int64_t updated_ms = config->config_updated_at_ms > 0 ? config->config_updated_at_ms : asr_config_now_ms();
+        if (config->config_updated_at_ms <= 0 && updated_ms <= previous_ms) {
+            updated_ms = previous_ms + 1;
+        }
+        err = nvs_set_i64(handle, ASR_NVS_KEY_UPDATED_MS, updated_ms);
+    }
+    if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
@@ -381,6 +417,35 @@ esp_err_t fridge_asr_clear_key(void)
         set_last_error("ASR API Key cleared");
     }
     return err;
+}
+
+esp_err_t fridge_asr_get_sync_payload(char *out, size_t out_size)
+{
+    ESP_RETURN_ON_FALSE(out && out_size > 0, ESP_ERR_INVALID_ARG, TAG, "invalid ASR sync payload buffer");
+    out[0] = '\0';
+
+    fridge_asr_config_update_t config = {0};
+    ESP_RETURN_ON_ERROR(load_config(&config), TAG, "load ASR sync config failed");
+
+    cJSON *root = cJSON_CreateObject();
+    ESP_RETURN_ON_FALSE(root, ESP_ERR_NO_MEM, TAG, "create ASR sync payload failed");
+    cJSON_AddNumberToObject(root, "configUpdatedAt", (double)config.config_updated_at_ms);
+    cJSON_AddStringToObject(root, "asrApiBaseUrl", config.api_base_url);
+    cJSON_AddStringToObject(root, "asrModel", config.model);
+    cJSON_AddStringToObject(root, "asrApiKey", config.api_key);
+    cJSON_AddNumberToObject(root, "asrTimeoutMs", config.timeout_ms);
+
+    char *printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    ESP_RETURN_ON_FALSE(printed, ESP_ERR_NO_MEM, TAG, "print ASR sync payload failed");
+    size_t len = strlen(printed);
+    if (len >= out_size) {
+        cJSON_free(printed);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(out, printed, len + 1);
+    cJSON_free(printed);
+    return ESP_OK;
 }
 
 esp_err_t fridge_asr_transcribe_latest_recording(fridge_asr_result_t *out)

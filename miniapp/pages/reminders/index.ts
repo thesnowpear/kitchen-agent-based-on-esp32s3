@@ -8,6 +8,7 @@
  */
 
 import { confirmReminder, getReminders } from "../../services/api";
+import { enqueueSyncOp, syncNow } from "../../services/sync";
 import type { ReminderItem } from "../../types/models";
 import { RequestError } from "../../utils/request";
 import { updateOfflineSnapshot } from "../../utils/localFeatures";
@@ -94,15 +95,27 @@ Page({
     const id = event.currentTarget.dataset.id as string;
     this.markConfirming(id, true);
     try {
-      await confirmReminder(id, status);
+      const updated = await confirmReminder(id, status);
+      enqueueSyncOp("reminder", "set_status", {
+        reminder: updated,
+        reminderId: id,
+        status,
+      });
+      void syncNow().catch(() => {
+        // 提醒操作已提交；同步失败时保留队列。
+      });
       this.setData({ items: this.data.items.filter((x) => x.id !== id) });
       wx.showToast({
         title: status === "acked" ? "已确认" : "已忽略",
         icon: "success",
       });
     } catch (err) {
-      this.markConfirming(id, false);
-      wx.showToast({ title: "操作失败", icon: "none" });
+      enqueueSyncOp("reminder", "set_status_pending", {
+        reminderId: id,
+        status,
+      });
+      this.setData({ items: this.data.items.filter((x) => x.id !== id) });
+      wx.showToast({ title: "已加入待同步", icon: "none" });
     }
   },
 

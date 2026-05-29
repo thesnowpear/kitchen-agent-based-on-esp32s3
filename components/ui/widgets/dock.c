@@ -32,7 +32,7 @@ lv_obj_t *fridge_ui_dock_create(lv_obj_t *parent)
     const fridge_ui_theme_t *theme = fridge_ui_theme_get();
     static dock_item_t items[] = {
         {"首页", LV_SYMBOL_HOME, FRIDGE_UI_PAGE_HOME, true, false},
-        {"AI", "+", FRIDGE_UI_PAGE_RECIPE, true, false},
+        {"AI", "+", FRIDGE_UI_PAGE_AI, true, false},
         {"登记", LV_SYMBOL_IMAGE, FRIDGE_UI_PAGE_CAMERA, true, true},
         {"设置", LV_SYMBOL_SETTINGS, FRIDGE_UI_PAGE_SETTINGS, true, false},
         {"更多", LV_SYMBOL_BARS, FRIDGE_UI_PAGE_MORE, true, false},
@@ -102,10 +102,10 @@ void fridge_ui_dock_update(void)
         }
         bool active = (i == 0 && g_ui_page == FRIDGE_UI_PAGE_STANDBY) ||
                       (i == 0 && (g_ui_page == FRIDGE_UI_PAGE_HOME || g_ui_page == FRIDGE_UI_PAGE_ZONE || g_ui_page == FRIDGE_UI_PAGE_EDIT_FOOD || g_ui_page == FRIDGE_UI_PAGE_DOOR)) ||
-                      (i == 1 && g_ui_page == FRIDGE_UI_PAGE_RECIPE) ||
+                      (i == 1 && (g_ui_page == FRIDGE_UI_PAGE_AI || g_ui_page == FRIDGE_UI_PAGE_RECIPE)) ||
                       (i == 2 && (g_ui_page == FRIDGE_UI_PAGE_CAMERA || g_ui_page == FRIDGE_UI_PAGE_CAMERA_RESULT)) ||
                       (i == 3 && (g_ui_page == FRIDGE_UI_PAGE_SETTINGS || g_ui_page == FRIDGE_UI_PAGE_WIFI)) ||
-                      (i == 4 && (g_ui_page == FRIDGE_UI_PAGE_MORE || g_ui_page == FRIDGE_UI_PAGE_SHOPPING || g_ui_page == FRIDGE_UI_PAGE_OFFLINE));
+                      (i == 4 && (g_ui_page == FRIDGE_UI_PAGE_MORE || g_ui_page == FRIDGE_UI_PAGE_SHOPPING || g_ui_page == FRIDGE_UI_PAGE_OFFLINE || g_ui_page == FRIDGE_UI_PAGE_NUTRITION || g_ui_page == FRIDGE_UI_PAGE_TIMER || g_ui_page == FRIDGE_UI_PAGE_STOPWATCH || g_ui_page == FRIDGE_UI_PAGE_ALARM));
         if (s_last_active[i] == active) {
             continue;
         }

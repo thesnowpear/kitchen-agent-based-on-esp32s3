@@ -13,6 +13,7 @@ from app.api.v1.routes import (
     auth,
     device,
     devices_alias,
+    fridge_zone,
     home,
     inventory,
     mqtt,
@@ -21,6 +22,7 @@ from app.api.v1.routes import (
     reminders_alias,
     scan,
     settings_route,
+    sync,
     wx,
 )
 
@@ -49,6 +51,12 @@ api_router.include_router(reminders_alias.router, prefix="/reminders", tags=["re
 
 # 设置（用户级隐私 / 偏好）。
 api_router.include_router(settings_route.router, prefix="/settings", tags=["settings"])
+
+# 冰箱分区：家庭级配置，云端保存，小程序本地缓存。
+api_router.include_router(fridge_zone.router, prefix="/fridge", tags=["fridge"])
+
+# 三端同步：服务器备份、小程序离线队列和固件 MQTT 快照的统一入口。
+api_router.include_router(sync.router, prefix="/sync", tags=["sync"])
 
 # AI 对话：设备转发为主，云端 SiliconFlow 降级。
 api_router.include_router(ai.router, prefix="/ai", tags=["ai"])

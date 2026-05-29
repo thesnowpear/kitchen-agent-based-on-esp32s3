@@ -1,0 +1,11 @@
+menu "Fridge Spirit build profile"
+
+config FRIDGE_RECOVERY_APP
+    bool "Build small local recovery firmware"
+    default n
+    help
+        构建本地恢复固件。该固件应烧录到 ota_1 小分区，只保留 NVS、
+        Wi-Fi、USB JSON Lines 和后续 OTA 恢复入口，不链接屏幕、摄像头、
+        AI、语音、雷达和 LVGL 主业务。
+
+endmenu
